@@ -1,14 +1,11 @@
-# macOS build. Push a tag like v0.1.0 (or start the workflow from the Codemagic UI / API)
-# and the universal .dmg is attached to the GitHub release with the same tag.
-# Needs an environment group "github" with GITHUB_TOKEN (a token with "contents: write" on this repo).
+# macOS build. Runs on tags like v0.1.0 (or start it from the Codemagic UI / API).
+# The universal .dmg is a build artifact; attach it to the GitHub release with `gh release upload`.
 workflows:
   macos:
     name: LOKA macOS
     instance_type: mac_mini_m2
     max_build_duration: 60
     environment:
-      groups:
-        - github
       node: 20
     triggering:
       events:
@@ -26,9 +23,5 @@ workflows:
         script: npm ci
       - name: Build universal dmg
         script: npx tauri build --target universal-apple-darwin --bundles dmg
-      - name: Attach to GitHub release
-        script: |
-          TAG=${CM_TAG:-v$(node -p "require('./package.json').version")}
-          GH_TOKEN=$GITHUB_TOKEN gh release upload "$TAG" src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg --repo fanrsd/LOKA --clobber
     artifacts:
       - src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
