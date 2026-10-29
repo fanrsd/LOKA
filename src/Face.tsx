@@ -1,8 +1,8 @@
 import { useEffect, useId } from "react";
 
 /**
- * Tuju, LOKA's mascot: a chubby cursor arrow, the thing that actually travels between screens.
- * Every device gets its own Tuju (hue from its fingerprint); the face carries state:
+ * Oka, LOKA's mascot: a chubby cursor arrow, the thing that actually travels between screens.
+ * Every device gets its own Oka (hue from its fingerprint); the face carries state:
  *   idle      blinks now and then, eyes follow the pointer, small smile
  *   waiting   eyes dart side to side, "o" mouth (a pairing request is out)
  *   happy     ^ ^ with an open smile (paired)
@@ -52,7 +52,7 @@ export function Face({
   seed: string;
   size?: number;
   mood?: Mood;
-  /** fixed gaze, overriding the pointer; "right" mirrors Tuju so two of them can face each other */
+  /** fixed gaze, overriding the pointer; "right" mirrors Oka so two of them can face each other */
   look?: "left" | "right";
   /** accessible name; omit when a visible name sits next to the mascot */
   label?: string;

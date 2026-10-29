@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/icon.png" width="96" alt="LOKA icon: Tuju, a cursor with a face, next to a glowing edge">
+<img src="docs/icon.png" width="96" alt="LOKA icon: Oka, a cursor with a face, next to a glowing edge">
 
 # LOKA
 
@@ -22,11 +22,11 @@ Push the cursor through a glowing edge of your screen and it lands on the device
 - **LocalSend-style pairing.** Devices on the same network find each other. Click one, then confirm on the other device.
 - **Make it yours.** Pick the glow colour, which also becomes the app's accent, and the crossing animation: Ripple, Pulse or Calm.
 
-Meet **Tuju**, the mascot: a cursor, the thing that actually travels between your screens. Every device gets its own colour, and its face shows what's going on: searching, waiting, paired or offline.
+Meet **Oka**, the little one from LOKA: a cursor, the thing that actually travels between your screens. Every device gets its own colour, and its face shows what's going on: searching, waiting, paired or offline.
 
 | | |
 |---|---|
-| <img src="docs/screenshots/home.webp" alt="Nearby devices, each shown as a Tuju"> | <img src="docs/screenshots/pairing.webp" alt="Pairing prompt with two Tujus facing each other"> |
+| <img src="docs/screenshots/home.webp" alt="Nearby devices, each shown as an Oka"> | <img src="docs/screenshots/pairing.webp" alt="Pairing prompt with two Okas facing each other"> |
 | <img src="docs/screenshots/client-waiting.webp" alt="A Client waiting for a Main"> | <img src="docs/screenshots/glow-violet.webp" alt="The same screen with a violet glow"> |
 
 ## Platforms
@@ -48,7 +48,7 @@ Download the installer from [Releases](https://github.com/fanrsd/LOKA/releases/l
 Then:
 
 1. Open LOKA on both computers and pick a role: **Main** on the computer with the mouse and keyboard, **Client** on the other.
-2. On the Main, click the Client's Tuju. Accept on the Client.
+2. On the Main, click the Client's Oka. Accept on the Client.
 3. Pick the edge and slide the glowing bar until it lines up with where the other device sits.
 
 Both devices must be on the same local network. LOKA uses UDP 53318 (discovery) and TCP 53319–53321 (telemetry, files, input). Allow them in your firewall.

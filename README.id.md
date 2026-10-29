@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/icon.png" width="96" alt="Ikon LOKA: Tuju, kursor berwajah, di samping tepi layar yang menyala">
+<img src="docs/icon.png" width="96" alt="Ikon LOKA: Oka, kursor berwajah, di samping tepi layar yang menyala">
 
 # LOKA
 
@@ -22,11 +22,11 @@ Dorong kursor melewati tepi layar yang menyala, dan kursor langsung pindah ke pe
 - **Pairing ala LocalSend.** Perangkat di jaringan yang sama saling menemukan. Klik salah satunya, lalu konfirmasi di perangkat itu.
 - **Sesuaikan sendiri.** Pilih warna glow (sekaligus jadi warna aksen aplikasi) dan animasi saat menyeberang: Ripple, Pulse, atau Calm.
 
-Kenalan dengan **Tuju**, maskot LOKA: sebuah kursor, benda yang memang berpindah antar layar. Setiap perangkat punya warna Tuju sendiri, dan wajahnya menunjukkan status: mencari, menunggu, terhubung, atau offline.
+Kenalan dengan **Oka**, si kecil dari LOKA: sebuah kursor, benda yang memang berpindah antar layar. Setiap perangkat punya warna Oka sendiri, dan wajahnya menunjukkan status: mencari, menunggu, terhubung, atau offline.
 
 | | |
 |---|---|
-| <img src="docs/screenshots/home.webp" alt="Perangkat di sekitar, masing-masing tampil sebagai Tuju"> | <img src="docs/screenshots/pairing.webp" alt="Permintaan pairing dengan dua Tuju saling berhadapan"> |
+| <img src="docs/screenshots/home.webp" alt="Perangkat di sekitar, masing-masing tampil sebagai Oka"> | <img src="docs/screenshots/pairing.webp" alt="Permintaan pairing dengan dua Oka saling berhadapan"> |
 | <img src="docs/screenshots/client-waiting.webp" alt="Client menunggu Main"> | <img src="docs/screenshots/glow-violet.webp" alt="Layar yang sama dengan glow ungu"> |
 
 ## Platform
@@ -48,7 +48,7 @@ Unduh installer dari [Releases](https://github.com/fanrsd/LOKA/releases/latest):
 Lalu:
 
 1. Buka LOKA di kedua komputer dan pilih peran: **Main** untuk komputer yang punya mouse dan keyboard, **Client** untuk yang lain.
-2. Di Main, klik Tuju milik Client. Terima di Client.
+2. Di Main, klik Oka milik Client. Terima di Client.
 3. Pilih tepi layar, lalu geser bar yang menyala sampai sejajar dengan letak perangkat lain.
 
 Kedua perangkat harus berada di jaringan lokal yang sama. LOKA memakai UDP 53318 (pencarian perangkat) dan TCP 53319–53321 (telemetri, file, input). Izinkan port tersebut di firewall.
