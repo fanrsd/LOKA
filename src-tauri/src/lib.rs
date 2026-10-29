@@ -218,6 +218,15 @@ pub fn run() {
             send_text,
             sim::start_sim
         ])
+        // closing the window keeps LOKA sharing from the tray; "Quit LOKA" there ends it
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == MAIN_WINDOW {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             let settings = Settings::load(&app.path().app_data_dir()?);
@@ -263,7 +272,10 @@ pub fn run() {
             });
 
             #[cfg(desktop)]
-            setup_overlay(app, state.clone())?;
+            {
+                setup_overlay(app, state.clone())?;
+                setup_tray(app)?;
+            }
             if std::env::args().any(|a| a == "--sim-mobile") {
                 sim::start(&handle, &state)?;
             }
@@ -303,6 +315,42 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState) -> tauri::Result<()> 
             eprintln!("transfer server stopped: {e}");
         }
     });
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::{
+        menu::{Menu, MenuItem},
+        tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    };
+    let open = MenuItem::with_id(app, "open", "Open LOKA", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit LOKA", true, None::<&str>)?;
+    let show = |app: &AppHandle| {
+        if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+    };
+    let mut tray = TrayIconBuilder::new()
+        .tooltip("LOKA")
+        .menu(&Menu::with_items(app, &[&open, &quit])?)
+        .show_menu_on_left_click(false)
+        .on_menu_event(move |app, e| match e.id.as_ref() {
+            "open" => show(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(move |tray, e| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+                show(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
     Ok(())
 }
 

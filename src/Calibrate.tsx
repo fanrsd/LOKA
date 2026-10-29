@@ -141,6 +141,23 @@ export function Calibrate({ target }: { target: string }) {
           </label>
         </div>
 
+        <label htmlFor="glow-opacity" className="text-muted">Opacity</label>
+        <div className="flex items-center gap-3">
+          <input
+            id="glow-opacity"
+            type="range"
+            min={0.1}
+            max={1}
+            step={0.05}
+            value={look.opacity}
+            onChange={(e) => restyle({ opacity: +e.target.value })}
+            aria-valuetext={`${Math.round(look.opacity * 100)}%`}
+            className="loka-range flex-1"
+            style={{ "--fill": `${((look.opacity - 0.1) / 0.9) * 100}%` } as React.CSSProperties}
+          />
+          <span className="w-10 text-right tabular-nums text-muted">{Math.round(look.opacity * 100)}%</span>
+        </div>
+
         <span id="motion-label" className="text-muted">Crossing</span>
         <div role="radiogroup" aria-labelledby="motion-label" className="flex flex-wrap gap-1.5">
           {MOTIONS.map((m) => (

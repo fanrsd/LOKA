@@ -20,7 +20,8 @@ Dorong kursor melewati tepi layar yang menyala, dan kursor langsung pindah ke pe
 - **Keyboard ikut kursor.** Ketikan selalu masuk ke perangkat tempat kursor berada.
 - **Lempar file ke tepi layar.** Seret file ke garis yang menyala lalu lepaskan. File masuk ke `Downloads/LOKA` di perangkat pasangan. File lama tidak pernah ditimpa.
 - **Pairing ala LocalSend.** Perangkat di jaringan yang sama saling menemukan. Klik salah satunya, lalu konfirmasi di perangkat itu.
-- **Sesuaikan sendiri.** Pilih warna glow (sekaligus jadi warna aksen aplikasi) dan animasi saat menyeberang: Ripple, Pulse, atau Calm.
+- **Sesuaikan sendiri.** Pilih warna glow (sekaligus jadi warna aksen aplikasi), seberapa transparan glow-nya, dan animasi saat menyeberang: Ripple, Pulse, atau Calm.
+- **Tinggal di tray.** Menutup jendela tidak menghentikan LOKA; berbagi tetap jalan di latar belakang. Klik ikon di tray untuk membukanya lagi, atau pilih **Quit LOKA** di sana untuk berhenti.
 
 Kenalan dengan **Oka**, si kecil dari LOKA: sebuah kursor, benda yang memang berpindah antar layar. Setiap perangkat punya warna Oka sendiri, dan wajahnya menunjukkan status: mencari, menunggu, terhubung, atau offline.
 

@@ -50,11 +50,14 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
       }),
       listen<{ active: boolean; y?: number }>("kvm", ({ payload }) => payload.active && splash(payload.y ?? cur.y)),
       listen<Look>("look", ({ payload }) => {
+        const opacityOnly = payload.color === look.color && payload.motion === look.motion;
         look = payload;
         motion = reduced ? "calm" : look.motion;
-        splash(cur.y); // preview the crossing in the new style
+        el.style.opacity = String(look.opacity);
+        if (!opacityOnly) splash(cur.y); // preview the crossing in the new style
       }),
     ];
+    el.style.opacity = String(look.opacity);
 
     const frame = (now: number) => {
       const dpr = devicePixelRatio || 1;

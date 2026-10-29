@@ -14,18 +14,19 @@ use windows_sys::Win32::{
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-            KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-            MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, VK_LBUTTON,
+            GetAsyncKeyState, SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+            KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
+            VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_MENU,
         },
         WindowsAndMessaging::{
             CallNextHookEx, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PeekMessageW,
-            PostThreadMessageW, SetCursorPos, SetWindowLongPtrW, SetWindowsHookExW, UnhookWindowsHookEx, GWL_EXSTYLE,
+            PostThreadMessageW, SetCursorPos, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, UnhookWindowsHookEx, GWL_EXSTYLE,
             HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SM_CXVIRTUALSCREEN,
             SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
             WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-            WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
+            WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_TIMER, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP,
             WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         },
     },
@@ -84,8 +85,8 @@ impl SpatialPlatformEngine for WindowsEngine {
             // park first: once our LL hook is in, it would swallow this move like any other
             SetCursorPos(park.x, park.y);
             let module = GetModuleHandleW(null());
-            let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
-            let keys = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_proc), module, 0);
+            let mut mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
+            let mut keys = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_proc), module, 0);
             if mouse.is_null() || keys.is_null() {
                 for h in [mouse, keys] {
                     if !h.is_null() {
@@ -97,7 +98,34 @@ impl SpatialPlatformEngine for WindowsEngine {
             }
             HOOK_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
             let _ = ready_tx.send(true);
-            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {}
+            // Another app's LL hook installed after ours runs first and may not pass input on (seen with
+            // input utilities running), so keys and moves leak to this machine. Watch for leaks and
+            // move our hooks back to the front; Ctrl+Alt+Esc also works from what leaked.
+            let mut was_down = keys_down();
+            SetTimer(null_mut(), 0, 15, None);
+            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                if msg.message != WM_TIMER {
+                    continue;
+                }
+                let down = keys_down();
+                if (0..256).any(|vk| down[vk] && !was_down[vk]) {
+                    UnhookWindowsHookEx(keys);
+                    keys = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_proc), module, 0);
+                    if let Some(c) = CAPTURE.lock().unwrap().as_ref() {
+                        let held = |vk: u16| down[vk as usize];
+                        if held(VK_ESCAPE) && (c.ctrl || held(VK_CONTROL)) && (c.alt || held(VK_MENU)) {
+                            let _ = c.out.send(Captured::Escape);
+                        }
+                    }
+                }
+                was_down = down;
+                let mut p = POINT { x: 0, y: 0 };
+                if GetCursorPos(&mut p) != 0 && (p.x != park.x || p.y != park.y) {
+                    SetCursorPos(park.x, park.y);
+                    UnhookWindowsHookEx(mouse);
+                    mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
+                }
+            }
             UnhookWindowsHookEx(mouse);
             UnhookWindowsHookEx(keys);
         });
@@ -115,6 +143,14 @@ impl SpatialPlatformEngine for WindowsEngine {
         unsafe {
             if thread != 0 {
                 PostThreadMessageW(thread, WM_QUIT, 0, 0);
+            }
+            // a key whose press leaked here but whose release was captured would stay stuck
+            let down = keys_down();
+            for vk in (0..256u16).filter(|&vk| down[vk as usize]) {
+                let mut input: INPUT = zeroed();
+                input.r#type = INPUT_KEYBOARD;
+                input.Anonymous.ki = KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: TAG };
+                SendInput(1, &input, size_of::<INPUT>() as i32);
             }
             SetCursorPos(warp_to.0 as i32, warp_to.1 as i32);
         }
@@ -218,6 +254,15 @@ unsafe extern "system" fn mouse_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT
         }
     }
     CallNextHookEx(null_mut(), code, w, l)
+}
+
+/// Keys this machine currently sees as held (mouse buttons, VK 1-6, excluded).
+fn keys_down() -> [bool; 256] {
+    let mut down = [false; 256];
+    for vk in 8..256 {
+        down[vk] = unsafe { GetAsyncKeyState(vk as i32) } < 0;
+    }
+    down
 }
 
 unsafe extern "system" fn key_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
