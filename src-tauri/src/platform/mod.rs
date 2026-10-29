@@ -74,6 +74,24 @@ pub fn engine() -> Box<dyn SpatialPlatformEngine> {
     Box::new(NoopEngine)
 }
 
+/// Plain-text clipboard. `None` when empty, not text, or held by another app.
+pub fn clipboard_text() -> Option<String> {
+    #[cfg(desktop)]
+    return arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok().filter(|t| !t.is_empty());
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Replace the clipboard text, unless it already holds exactly that (keeps clipboard-history apps clean).
+pub fn set_clipboard_text(text: &str) {
+    #[cfg(desktop)]
+    if clipboard_text().as_deref() != Some(text) {
+        if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            eprintln!("clipboard: {e}");
+        }
+    }
+}
+
 /// Mobile (and unsupported desktops): the phone only renders received telemetry.
 struct NoopEngine;
 impl SpatialPlatformEngine for NoopEngine {

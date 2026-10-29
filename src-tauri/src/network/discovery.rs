@@ -1,10 +1,13 @@
-//! LocalSend-style discovery: JSON announce on a 224.0.0.0/24 multicast group, peers reply on the group.
+//! LocalSend-style discovery: JSON announce on a 224.0.0.0/24 multicast group on every interface;
+//! peers answer an announce by unicast. Manually added hosts get the announce by unicast too,
+//! for networks that drop multicast (guest Wi-Fi, client isolation).
 
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    collections::HashSet,
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
     time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, sync::watch};
@@ -60,54 +63,106 @@ pub struct Peer {
 pub const STALE: Duration = Duration::from_secs(15);
 const HEARTBEAT: Duration = Duration::from_secs(5);
 
-// shortcut: joins the group on the default interface only; pick per-interface if VPN/Hyper-V adapters steal it.
 fn bind() -> io::Result<UdpSocket> {
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     s.set_reuse_address(true)?; // several LOKA instances (simulator) on one host
     #[cfg(unix)]
     s.set_reuse_port(true)?;
     s.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT).into())?;
-    s.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED)?;
     s.set_multicast_loop_v4(true)?;
     s.set_nonblocking(true)?;
     UdpSocket::from_std(s.into())
 }
 
+/// IPv4 addresses of every interface that is up, loopback excluded.
+pub fn local_ipv4() -> Vec<Ipv4Addr> {
+    let all = if_addrs::get_if_addrs().unwrap_or_default();
+    all.iter()
+        .filter(|i| i.is_oper_up() && !i.is_loopback())
+        .filter_map(|i| match i.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// Announce out of every interface (the OS default one may be a VPN or Hyper-V adapter), joining the group
+/// on interfaces that came up since last time, then by unicast to each manual host.
+/// Send errors are expected (adapter going down, no route) and must not stop discovery.
+async fn broadcast(sock: &UdpSocket, joined: &mut HashSet<Ipv4Addr>, me: &DeviceInfo, announce: bool, hosts: &[IpAddr]) {
+    let s = socket2::SockRef::from(sock);
+    let ifaces = local_ipv4();
+    // a new network (Wi-Fi joined after launch): ask everyone there to answer
+    let mut new = false;
+    for ip in &ifaces {
+        if !joined.contains(ip) && s.join_multicast_v4(&GROUP, ip).is_ok() {
+            joined.insert(*ip);
+            new = true;
+        }
+    }
+    let msg = encode(me, announce || new);
+    for ip in &ifaces {
+        if s.set_multicast_if_v4(ip).is_ok() {
+            let _ = sock.send_to(&msg, (GROUP, PORT)).await;
+        }
+    }
+    // hosts only hear unicast, so they must be asked to answer every time to stay fresh on our side
+    let ask = encode(me, true);
+    for &h in hosts {
+        let _ = sock.send_to(&ask, (h, PORT)).await;
+    }
+}
+
+fn encode(me: &DeviceInfo, announce: bool) -> Vec<u8> {
+    serde_json::to_vec(&Announcement { info: me.clone(), announce }).expect("plain struct")
+}
+
+/// Ask `host` to answer right away (manual add), from a throwaway socket: answers go to our discovery port.
+pub async fn poke(host: IpAddr, me: &DeviceInfo) -> io::Result<()> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    sock.send_to(&encode(me, true), (host, PORT)).await.map(drop)
+}
+
 /// Announce `me` (again whenever it changes, and every few seconds), answer newcomers,
-/// and report every peer heard. Runs forever.
-pub async fn run(mut me: watch::Receiver<DeviceInfo>, mut on_peer: impl FnMut(Peer) + Send) -> io::Result<()> {
+/// and report every peer heard. `hosts` = manually added addresses. Runs forever.
+pub async fn run(
+    mut me: watch::Receiver<DeviceInfo>,
+    hosts: impl Fn() -> Vec<IpAddr> + Send,
+    mut on_peer: impl FnMut(Peer) + Send,
+) -> io::Result<()> {
     let sock = bind()?;
-    let group = SocketAddr::from((GROUP, PORT));
-    let encode = |me: &DeviceInfo, announce| serde_json::to_vec(&Announcement { info: me.clone(), announce }).expect("plain struct");
-    let hello = encode(&me.borrow(), true); // watch guard must not live across an await
-    sock.send_to(&hello, group).await?;
-    let mut heartbeat = tokio::time::interval(HEARTBEAT);
+    let mut joined = HashSet::new();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT); // first tick is immediate: the hello
     let mut buf = [0u8; 2048];
     loop {
         tokio::select! {
             r = sock.recv_from(&mut buf) => {
-                let (n, from) = r?;
+                // Windows reports an ICMP "port unreachable" from an earlier unicast as a recv error
+                let Ok((n, from)) = r else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
                 let Ok(a) = serde_json::from_slice::<Announcement>(&buf[..n]) else { continue };
                 if a.info.fingerprint == me.borrow().fingerprint {
                     continue;
                 }
                 if a.announce {
                     let reply = encode(&me.borrow(), false);
-                    sock.send_to(&reply, group).await?;
+                    let _ = sock.send_to(&reply, (from.ip(), PORT)).await;
                 }
                 on_peer(Peer { info: a.info, addr: from.ip(), seen: Instant::now() });
             }
             _ = heartbeat.tick() => {
-                let beat = encode(&me.borrow(), false);
-                sock.send_to(&beat, group).await?;
+                let info = me.borrow().clone(); // watch guard must not live across an await
+                broadcast(&sock, &mut joined, &info, false, &hosts()).await;
             }
             changed = me.changed() => {
                 if changed.is_err() {
                     return Ok(()); // app shutting down
                 }
                 // role switch: ask everyone to answer so lists refresh immediately
-                let again = encode(&me.borrow_and_update(), true);
-                sock.send_to(&again, group).await?;
+                let info = me.borrow_and_update().clone();
+                broadcast(&sock, &mut joined, &info, true, &hosts()).await;
             }
         }
     }

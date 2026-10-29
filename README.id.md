@@ -17,9 +17,11 @@ Dorong kursor melewati tepi layar yang menyala, dan kursor langsung pindah ke pe
 
 - **Berbagi mouse dan keyboard.** Satu komputer menjadi **Main**: mouse dan keyboard-nya mengendalikan perangkat lain. Setiap perangkat di sekitarnya menjalankan LOKA sebagai **Client**.
 - **Bezel Portal.** Tandai bagian tepi layar tempat perangkat lain berada di mejamu. Dorong kursor ke garis yang menyala itu, dan kursor pindah ke sana. Dorong keluar dari sisi seberang perangkat itu untuk kembali. **Ctrl+Alt+Esc** selalu mengembalikannya.
-- **Keyboard ikut kursor.** Ketikan selalu masuk ke perangkat tempat kursor berada.
-- **Lempar file ke tepi layar.** Seret file ke garis yang menyala lalu lepaskan. File masuk ke `Downloads/LOKA` di perangkat pasangan. File lama tidak pernah ditimpa. Garis yang menyala terisi seiring file berjalan, dan kedua komputer menampilkan progres, kecepatan, serta sisa waktunya. Transfer bisa dibatalkan, foldernya bisa langsung dibuka saat file tiba, dan ada notifikasi sistem ketika file masuk.
-- **Pairing ala LocalSend.** Perangkat di jaringan yang sama saling menemukan. Klik salah satunya, lalu konfirmasi di perangkat itu.
+- **Keyboard dan clipboard ikut kursor.** Ketikan selalu masuk ke perangkat tempat kursor berada. Salin teks di satu komputer, pindah, lalu tempel di komputer lain (hanya teks, dua arah).
+- **Lempar file ke tepi layar.** Seret file ke garis yang menyala lalu lepaskan. File masuk ke `Downloads/LOKA` di perangkat pasangan. File lama tidak pernah ditimpa.
+ Garis yang menyala terisi seiring file berjalan, dan kedua komputer menampilkan progres, kecepatan, serta sisa waktunya. Transfer bisa dibatalkan, foldernya bisa langsung dibuka saat file tiba, dan ada notifikasi sistem ketika file masuk.
+- **Pairing ala LocalSend.** Perangkat di jaringan yang sama saling menemukan. Klik salah satunya, lalu konfirmasi di perangkat itu. Di jaringan yang memblokir pencarian perangkat (Wi-Fi tamu), tambahkan Client lewat alamat IP-nya.
+- **Selalu terbaru.** Menu **About** menampilkan versi, isi tiap rilis, dan memberi tahu jika ada versi baru di GitHub.
 - **Sesuaikan sendiri.** Pilih warna glow (sekaligus jadi warna aksen aplikasi), seberapa transparan glow-nya, dan animasi saat menyeberang: Ripple, Pulse, atau Calm.
 - **Tinggal di tray.** Menutup jendela tidak menghentikan LOKA; berbagi tetap jalan di latar belakang. Klik ikon di tray untuk membukanya lagi, atau pilih **Quit LOKA** di sana untuk berhenti.
 
@@ -43,8 +45,17 @@ Kenalan dengan **Oka**, si kecil dari LOKA: sebuah kursor, benda yang memang ber
 
 Unduh installer dari [Releases](https://github.com/fanrsd/LOKA/releases/latest):
 
-- **Windows:** `LOKA_x.y.z_x64-setup.exe` atau `.msi`
-- **macOS:** `LOKA_x.y.z_universal.dmg`. Aplikasi belum dinotarisasi, jadi saat pertama kali klik kanan lalu pilih **Open**.
+- **Windows:** `LOKA_x.y.z_x64-setup.exe` atau `.msi`. Jika SmartScreen memperingatkan, pilih **More info → Run anyway**. Saat Windows Firewall bertanya, centang **Private** dan **Public**. Perangkat masih tidak saling terlihat? Di LOKA buka **About → Allow through Windows Firewall**.
+- **macOS:** `LOKA_x.y.z_universal.dmg` (Apple Silicon dan Intel). Buka, seret LOKA ke **Applications**, lalu buka dari folder Applications. LOKA belum dinotarisasi, jadi pembukaan pertama diblokir: klik **Done** (jangan Move to Trash), lalu:
+  - macOS 15 ke atas: System Settings → Privacy & Security → gulir ke bawah → **Open Anyway**.
+  - macOS 14 ke bawah: klik kanan LOKA di Applications → **Open** → **Open**.
+  - "LOKA is damaged and can't be opened" (atau versi apa pun): jalankan di Terminal
+
+    ```bash
+    xattr -dr com.apple.quarantine /Applications/LOKA.app
+    ```
+
+  Izinkan **Accessibility** saat diminta (System Settings → Privacy & Security → Accessibility), di Main maupun Client; di macOS 15+ izinkan juga **Local Network**. Setelah update, jika mouse tidak bisa pindah lagi, hapus LOKA dari daftar Accessibility dengan tombol **−** lalu aktifkan lagi.
 
 Lalu:
 
@@ -52,7 +63,7 @@ Lalu:
 2. Di Main, klik Oka milik Client. Terima di Client.
 3. Pilih tepi layar, lalu geser bar yang menyala sampai sejajar dengan letak perangkat lain.
 
-Kedua perangkat harus berada di jaringan lokal yang sama. LOKA memakai UDP 53318 (pencarian perangkat) dan TCP 53319–53321 (telemetri, file, input). Izinkan port tersebut di firewall.
+Kedua perangkat harus berada di jaringan lokal yang sama. LOKA memakai UDP 53318 (pencarian perangkat) dan TCP 53319–53321 (telemetri, file, input). Wi-Fi tamu atau router dengan client isolation memblokir pencarian: di Client, LOKA menampilkan **This computer's address**; ketik alamat itu di **Add by IP** pada Main.
 
 ## Build dari source
 

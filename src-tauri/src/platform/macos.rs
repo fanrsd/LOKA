@@ -107,6 +107,27 @@ extern "C" {
     fn CFRunLoopRun();
     fn CFRunLoopStop(rl: Ref);
     static kCFRunLoopCommonModes: *const c_void;
+    static kCFBooleanTrue: *const c_void;
+    static kCFTypeDictionaryKeyCallBacks: c_void;
+    static kCFTypeDictionaryValueCallBacks: c_void;
+    fn CFDictionaryCreate(alloc: *const c_void, keys: *const *const c_void, values: *const *const c_void, n: isize, key_cb: *const c_void, value_cb: *const c_void) -> Ref;
+}
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    static kAXTrustedCheckOptionPrompt: *const c_void;
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+}
+
+/// Main (event tap) and Client (CGEventPost, silently dropped otherwise) both need Accessibility.
+/// Untrusted → macOS adds LOKA to the list and shows its "open System Settings" prompt.
+fn ask_accessibility() {
+    unsafe {
+        let keys = [kAXTrustedCheckOptionPrompt];
+        let values = [kCFBooleanTrue];
+        let opts = CFDictionaryCreate(null(), keys.as_ptr(), values.as_ptr(), 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        AXIsProcessTrustedWithOptions(opts);
+        CFRelease(opts);
+    }
 }
 
 /// (set-1 scancode, macOS virtual keycode). Positional, so layouts behave like a physical keyboard.
@@ -180,6 +201,7 @@ impl SpatialPlatformEngine for MacEngine {
                 | NSWindowCollectionBehavior::Stationary
                 | NSWindowCollectionBehavior::IgnoresCycle,
         );
+        ask_accessibility(); // runs once at launch, main thread
         window.set_ignore_cursor_events(true)
     }
 

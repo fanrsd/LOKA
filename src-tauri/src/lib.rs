@@ -63,11 +63,15 @@ impl Shared {
 struct Device {
     info: DeviceInfo,
     paired: Vec<PairedDevice>,
+    /// this computer's LAN addresses, to type into another LOKA's "Add by IP"
+    ips: Vec<std::net::Ipv4Addr>,
+    hosts: Vec<IpAddr>,
 }
 
 #[tauri::command]
 fn get_device(state: State<AppState>, me: State<watch::Sender<DeviceInfo>>) -> Device {
-    Device { info: me.borrow().clone(), paired: state.lock().unwrap().settings.paired.clone() }
+    let s = state.lock().unwrap();
+    Device { info: me.borrow().clone(), paired: s.settings.paired.clone(), ips: discovery::local_ipv4(), hosts: s.settings.hosts.clone() }
 }
 
 #[tauri::command]
@@ -125,6 +129,74 @@ fn unpair(app: AppHandle, state: State<AppState>, fingerprint: String) {
         s.target = None;
     }
     let _ = app.emit("paired", ());
+}
+
+/// Remember a device by address (networks that drop multicast) and ask it to answer now.
+#[tauri::command]
+async fn add_host(state: State<'_, AppState>, me: State<'_, watch::Sender<DeviceInfo>>, ip: String) -> Result<(), String> {
+    let ip: std::net::Ipv4Addr = ip.trim().parse().map_err(|_| "Type an address like 192.168.1.20")?;
+    if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() || ip.is_loopback() {
+        return Err("That address can't be another computer".into());
+    }
+    let ip = IpAddr::V4(ip);
+    {
+        let mut s = state.lock().unwrap();
+        if !s.settings.hosts.contains(&ip) {
+            s.settings.hosts.push(ip);
+            s.settings.save();
+        }
+    }
+    let info = me.borrow().clone();
+    discovery::poke(ip, &info).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_host(state: State<AppState>, ip: IpAddr) {
+    let mut s = state.lock().unwrap();
+    s.settings.hosts.retain(|h| *h != ip);
+    s.settings.save();
+}
+
+/// Windows: allow LOKA inbound on every network profile (one UAC prompt). The first-run firewall
+/// prompt often only allows Public or Private, and Windows marks new networks Public.
+#[tauri::command]
+async fn allow_firewall() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let args = format!("advfirewall firewall add rule name=LOKA dir=in action=allow profile=any program=\"{}\"", exe.display());
+        // Start-Process throws when the UAC prompt is declined → exit 1
+        let script = format!(
+            "$p = Start-Process netsh -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '{}'; exit $p.ExitCode",
+            args.replace('\'', "''")
+        );
+        let status = tauri::async_runtime::spawn_blocking(move || {
+            std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).creation_flags(CREATE_NO_WINDOW).status()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        return if status.success() { Ok(()) } else { Err("Windows Firewall was not changed".into()) };
+    }
+    #[allow(unreachable_code)]
+    Err("Only needed on Windows".into())
+}
+
+/// Open a web page in the default browser.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("only https links".into());
+    }
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer").arg(&url).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(&url).spawn();
+    r.map(drop).map_err(|e| e.to_string())
 }
 
 /// Show a pairing prompt in `window` and wait for the user (or time out → declined).
@@ -219,6 +291,12 @@ impl kvm::Sink for EngineSink {
     fn inject(&mut self, e: Injected) {
         self.engine.inject(e);
     }
+    fn clipboard(&self) -> Option<String> {
+        platform::clipboard_text()
+    }
+    fn set_clipboard(&mut self, text: String) {
+        platform::set_clipboard_text(&text);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -236,6 +314,10 @@ pub fn run() {
             send_text,
             cancel_transfer,
             reveal,
+            add_host,
+            remove_host,
+            allow_firewall,
+            open_url,
             sim::start_sim
         ])
         // closing the window keeps LOKA sharing from the tray; "Quit LOKA" there ends it
@@ -307,7 +389,9 @@ pub fn run() {
 
 fn spawn_discovery(app: AppHandle, state: AppState, me: watch::Receiver<DeviceInfo>) {
     tauri::async_runtime::spawn(async move {
-        let r = discovery::run(me, |peer| {
+        let hosts_state = state.clone();
+        let hosts = move || hosts_state.lock().unwrap().settings.hosts.clone();
+        let r = discovery::run(me, hosts, |peer| {
             let previous = state.lock().unwrap().peers.insert(peer.info.fingerprint.clone(), peer.clone());
             // heartbeats are frequent; only tell the UI about arrivals and changes
             if previous.map_or(true, |p| p.info != peer.info || p.addr != peer.addr || p.seen.elapsed() >= discovery::STALE) {
@@ -350,6 +434,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     };
     let open = MenuItem::with_id(app, "open", "Open LOKA", true, None::<&str>)?;
+    let about = MenuItem::with_id(app, "about", "About LOKA", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit LOKA", true, None::<&str>)?;
     let show = |app: &AppHandle| {
         if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
@@ -360,10 +445,14 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     };
     let mut tray = TrayIconBuilder::new()
         .tooltip("LOKA")
-        .menu(&Menu::with_items(app, &[&open, &quit])?)
+        .menu(&Menu::with_items(app, &[&open, &about, &quit])?)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, e| match e.id.as_ref() {
             "open" => show(app),
+            "about" => {
+                show(app);
+                let _ = app.emit_to(MAIN_WINDOW, "about", ());
+            }
             "quit" => app.exit(0),
             _ => {}
         })

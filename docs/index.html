@@ -151,6 +151,14 @@
   .os h3 { font-size: 30px; font-weight: 800; letter-spacing: -.03em; display: flex; align-items: center; gap: 14px; }
   .os p { color: var(--muted); font-size: 13.5px; }
   .os .btn { align-self: start; margin-top: auto; }
+  .os ol { color: var(--muted); font-size: 13.5px; padding-left: 20px; display: grid; gap: 6px; }
+  .os ol b, .os p b { color: var(--fg); font-weight: 600; }
+  .os { min-width: 0; }
+  .cmd { display: flex; align-items: center; gap: 10px; border-radius: 12px; padding: 10px 10px 10px 14px; box-shadow: inset 0 0 0 1px var(--line); font: 400 12.5px/1.5 var(--mono); color: var(--fg); }
+  .cmd code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; }
+  .cmd button { flex: none; font: 600 12px/1 var(--mono); color: var(--fg); background: none; border: 0; border-radius: 999px; padding: 8px 12px; box-shadow: inset 0 0 0 1px var(--line); cursor: pointer; }
+  .cmd button:hover, .cmd button:focus-visible { color: var(--accent); }
+  .faq code { font: 400 12.5px/1.5 var(--mono); color: var(--fg); overflow-wrap: anywhere; }
 
   /* faq */
   .faq { display: grid; grid-template-columns: 1fr 1.3fr; gap: 64px; }
@@ -297,8 +305,8 @@
         <h3>Bezel Portal</h3>
         <p><span lang="en">Only the stretch of edge you mark is a door, so the rest of the edge works normally.</span><span lang="id">Hanya bagian tepi yang kamu tandai yang menjadi pintu, sisanya tetap normal.</span></p></li>
       <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="3"/><path d="M7 14h10" stroke-linecap="round"/></svg></span>
-        <h3><span lang="en">Keyboard follows</span><span lang="id">Keyboard ikut</span></h3>
-        <p><span lang="en">Typing goes to whichever device has the cursor. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd> always brings it home.</span><span lang="id">Ketikan masuk ke perangkat tempat kursor berada. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd> selalu mengembalikannya.</span></p></li>
+        <h3><span lang="en">Keyboard and clipboard follow</span><span lang="id">Keyboard dan clipboard ikut</span></h3>
+        <p><span lang="en">Typing goes to whichever device has the cursor, and text you copy comes along. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd> always brings it home.</span><span lang="id">Ketikan masuk ke perangkat tempat kursor berada, dan teks yang kamu salin ikut terbawa. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd> selalu mengembalikannya.</span></p></li>
       <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg></span>
         <h3><span lang="en">Drop files on the edge</span><span lang="id">Lempar file ke tepi</span></h3>
         <p><span lang="en">Let go of a file on the glow and it lands in Downloads/LOKA on the other side. Nothing gets overwritten.</span><span lang="id">Lepas file di garis yang menyala, file masuk ke Downloads/LOKA di seberang. Tidak ada yang tertimpa.</span></p></li>
@@ -320,12 +328,24 @@
     <div class="downloads">
       <article class="os">
         <h3><svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.5l7.5-1v7H3zM11.5 4.4L21 3v8.5h-9.5zM3 12.5h7.5v7L3 18.5zM11.5 12.5H21V21l-9.5-1.4z"/></svg>Windows</h3>
-        <p><span lang="en">Windows 10 or 11, 64-bit. Installer (.exe) or .msi. If SmartScreen warns, choose More info → Run anyway.</span><span lang="id">Windows 10 atau 11, 64-bit. Installer (.exe) atau .msi. Jika SmartScreen memperingatkan, pilih More info → Run anyway.</span></p>
+        <p><span lang="en">Windows 10 or 11, 64-bit. Installer (<b>.exe</b>) or <b>.msi</b>.</span><span lang="id">Windows 10 atau 11, 64-bit. Installer (<b>.exe</b>) atau <b>.msi</b>.</span></p>
+        <ol>
+          <li><span lang="en">If SmartScreen warns, choose <b>More info → Run anyway</b>.</span><span lang="id">Jika SmartScreen memperingatkan, pilih <b>More info → Run anyway</b>.</span></li>
+          <li><span lang="en">When Windows Firewall asks, tick both <b>Private</b> and <b>Public</b> networks.</span><span lang="id">Saat Windows Firewall bertanya, centang jaringan <b>Private</b> dan <b>Public</b>.</span></li>
+          <li><span lang="en">Devices still don't see each other? In LOKA open <b>About → Allow through Windows Firewall</b>.</span><span lang="id">Perangkat masih tidak saling terlihat? Di LOKA buka <b>About → Allow through Windows Firewall</b>.</span></li>
+        </ol>
         <a class="btn" href="https://github.com/fanrsd/LOKA/releases/latest"><span lang="en">Download for Windows</span><span lang="id">Unduh untuk Windows</span></a>
       </article>
       <article class="os">
         <h3><svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.4 12.6c0-2.6 2.1-3.8 2.2-3.9-1.2-1.8-3.1-2-3.8-2-1.6-.2-3.1.9-3.9.9s-2-.9-3.4-.9C5.8 6.8 4 7.900 3.100 9.700c-1.900 3.300-.5 8.200 1.300 10.900.9 1.300 2 2.800 3.400 2.700 1.400-.1 1.900-.9 3.500-.9s2.100.9 3.500.9c1.500 0 2.400-1.300 3.300-2.700 1-1.500 1.500-3 1.500-3.100-.1 0-2.900-1.100-2.900-4.300zM13.800 4.900c.7-.9 1.200-2.100 1.100-3.300-1 .1-2.300.7-3 1.600-.7.800-1.300 2-1.100 3.200 1.100.1 2.300-.6 3-1.500z"/></svg>macOS</h3>
-        <p><span lang="en">Apple Silicon and Intel (.dmg). Right-click → Open the first time, then allow LOKA under Privacy &amp; Security → Accessibility.</span><span lang="id">Apple Silicon dan Intel (.dmg). Pertama kali klik kanan → Open, lalu izinkan LOKA di Privacy &amp; Security → Accessibility.</span></p>
+        <p><span lang="en">Apple Silicon and Intel (<b>.dmg</b>).</span><span lang="id">Apple Silicon dan Intel (<b>.dmg</b>).</span></p>
+        <ol>
+          <li><span lang="en">Open the .dmg and drag LOKA onto <b>Applications</b>. Open it from Applications.</span><span lang="id">Buka .dmg lalu seret LOKA ke <b>Applications</b>. Buka dari folder Applications.</span></li>
+          <li><span lang="en">macOS blocks the first launch: click <b>Done</b>. On macOS 15+, go to System Settings → Privacy &amp; Security and click <b>Open Anyway</b>. On 14 and older, right-click LOKA → <b>Open</b>.</span><span lang="id">macOS memblokir saat pertama dibuka: klik <b>Done</b>. Di macOS 15+, buka System Settings → Privacy &amp; Security lalu klik <b>Open Anyway</b>. Di versi 14 ke bawah, klik kanan LOKA → <b>Open</b>.</span></li>
+          <li><span lang="en">Allow <b>Accessibility</b> and, on macOS 15+, <b>Local Network</b>.</span><span lang="id">Izinkan <b>Accessibility</b> dan, di macOS 15+, <b>Local Network</b>.</span></li>
+        </ol>
+        <p><span lang="en">Says “damaged”? Run this in Terminal:</span><span lang="id">Muncul pesan “damaged”? Jalankan di Terminal:</span></p>
+        <div class="cmd"><code>xattr -dr com.apple.quarantine /Applications/LOKA.app</code><button type="button" class="copy"><span lang="en">Copy</span><span lang="id">Salin</span></button></div>
         <a class="btn" href="https://github.com/fanrsd/LOKA/releases/latest"><span lang="en">Download for macOS</span><span lang="id">Unduh untuk macOS</span></a>
       </article>
     </div>
@@ -353,6 +373,18 @@
       <details>
         <summary><span lang="en">Why does macOS ask for Accessibility?</span><span lang="id">Kenapa macOS meminta izin Accessibility?</span></summary>
         <p><span lang="en">macOS only lets apps read and move the mouse and keyboard with that permission. Without it LOKA can't hand input over.</span><span lang="id">macOS hanya mengizinkan aplikasi membaca dan menggerakkan mouse serta keyboard dengan izin itu. Tanpanya LOKA tidak bisa memindahkan input.</span></p>
+      </details>
+      <details>
+        <summary><span lang="en">Can't see the other computer?</span><span lang="id">Komputer lain tidak terlihat?</span></summary>
+        <p><span lang="en">Both must be on the same network. On Windows, allow LOKA through the firewall (About → Allow through Windows Firewall). Guest Wi-Fi and routers with “client isolation” block discovery: on the Client, LOKA shows <b>This computer's address</b> (e.g. 192.168.1.20); type it into <b>Add by IP</b> on the Main.</span><span lang="id">Keduanya harus di jaringan yang sama. Di Windows, izinkan LOKA lewat firewall (About → Allow through Windows Firewall). Wi-Fi tamu dan router dengan “client isolation” memblokir pencarian perangkat: di Client, LOKA menampilkan <b>This computer's address</b> (mis. 192.168.1.20); ketik alamat itu di <b>Add by IP</b> pada Main.</span></p>
+      </details>
+      <details>
+        <summary><span lang="en">macOS says LOKA is damaged or can't be opened</span><span lang="id">macOS bilang LOKA rusak atau tidak bisa dibuka</span></summary>
+        <p><span lang="en">LOKA isn't notarized by Apple yet. Click <b>Done</b> (not Move to Trash), then System Settings → Privacy &amp; Security → <b>Open Anyway</b>. If it says “damaged”, run <code>xattr -dr com.apple.quarantine /Applications/LOKA.app</code> in Terminal.</span><span lang="id">LOKA belum dinotarisasi Apple. Klik <b>Done</b> (jangan Move to Trash), lalu System Settings → Privacy &amp; Security → <b>Open Anyway</b>. Jika muncul “damaged”, jalankan <code>xattr -dr com.apple.quarantine /Applications/LOKA.app</code> di Terminal.</span></p>
+      </details>
+      <details>
+        <summary><span lang="en">Mouse stopped crossing after updating on Mac?</span><span lang="id">Mouse tidak bisa pindah lagi setelah update di Mac?</span></summary>
+        <p><span lang="en">Each version gets a new identity on macOS. In Privacy &amp; Security → Accessibility, remove LOKA with the <b>−</b> button, then turn it on again.</span><span lang="id">Setiap versi punya identitas baru di macOS. Di Privacy &amp; Security → Accessibility, hapus LOKA dengan tombol <b>−</b>, lalu aktifkan lagi.</span></p>
       </details>
       <details>
         <summary><span lang="en">What about iPhone, iPad and Android?</span><span lang="id">Bagaimana dengan iPhone, iPad, dan Android?</span></summary>
@@ -430,6 +462,13 @@
 
   const toTop = document.querySelector(".top");
   addEventListener("scroll", () => toTop.classList.toggle("show", scrollY > 600), { passive: true });
+
+  document.querySelectorAll(".copy").forEach((b) => b.addEventListener("click", async () => {
+    const [en, id] = b.children;
+    try { await navigator.clipboard.writeText(b.previousElementSibling.textContent); } catch { return; }
+    en.textContent = "Copied"; id.textContent = "Tersalin";
+    setTimeout(() => { en.textContent = "Copy"; id.textContent = "Salin"; }, 1600);
+  }));
 </script>
 </body>
 </html>

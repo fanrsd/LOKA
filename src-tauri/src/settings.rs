@@ -2,7 +2,10 @@
 
 use crate::network::discovery::Role;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    net::IpAddr,
+    path::{Path, PathBuf},
+};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PairedDevice {
@@ -16,6 +19,9 @@ pub struct Settings {
     pub fingerprint: String,
     pub role: Option<Role>,
     pub paired: Vec<PairedDevice>,
+    /// Addresses added by hand, for networks that drop discovery multicast.
+    #[serde(default)]
+    pub hosts: Vec<IpAddr>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -27,7 +33,7 @@ impl Settings {
         let mut s = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
-            .unwrap_or_else(|| Settings { fingerprint: uuid::Uuid::new_v4().to_string(), role: None, paired: Vec::new(), path: PathBuf::new() });
+            .unwrap_or_else(|| Settings { fingerprint: uuid::Uuid::new_v4().to_string(), role: None, paired: Vec::new(), hosts: Vec::new(), path: PathBuf::new() });
         s.path = path;
         s.save();
         s

@@ -17,9 +17,10 @@ Push the cursor through a glowing edge of your screen and it lands on the device
 
 - **Shared mouse & keyboard.** One computer is the **Main**: its mouse and keyboard drive the others. Each device nearby runs LOKA as a **Client**.
 - **The Bezel Portal.** You mark the stretch of your screen edge where the other device physically sits. Push the cursor into that glowing segment and it moves over. Push it out the far side of that device and it comes home. **Ctrl+Alt+Esc** always brings it back.
-- **The keyboard follows the cursor.** Whatever you type goes to the device the cursor is on.
+- **The keyboard and clipboard follow the cursor.** Whatever you type goes to the device the cursor is on. Copy text on one computer, move over, and paste it on the other (text only, both directions).
 - **Drop files on the edge.** Drag a file to the glowing edge and let go. It arrives in `Downloads/LOKA` on the paired device. Existing files are never overwritten. The glow fills up as the file travels, and both computers show its progress, speed and time left. You can cancel it, open the folder when it lands, and get a system notification on arrival.
-- **LocalSend-style pairing.** Devices on the same network find each other. Click one, then confirm on the other device.
+- **LocalSend-style pairing.** Devices on the same network find each other. Click one, then confirm on the other device. On networks that block discovery (guest Wi-Fi), add the Client by its IP address.
+- **Stays up to date.** **About** shows the version, what's new in each release, and tells you when a newer one is on GitHub.
 - **Make it yours.** Pick the glow colour, which also becomes the app's accent, how see-through the glow is, and the crossing animation: Ripple, Pulse or Calm.
 - **Lives in the tray.** Closing the window keeps LOKA sharing in the background. Click the tray icon to open it again, or choose **Quit LOKA** there to stop it.
 
@@ -43,8 +44,17 @@ Meet **Oka**, the little one from LOKA: a cursor, the thing that actually travel
 
 Download the installer from [Releases](https://github.com/fanrsd/LOKA/releases/latest):
 
-- **Windows:** `LOKA_x.y.z_x64-setup.exe`, or the `.msi`
-- **macOS:** `LOKA_x.y.z_universal.dmg`. The app is not notarized yet, so right-click it and choose **Open** the first time.
+- **Windows:** `LOKA_x.y.z_x64-setup.exe`, or the `.msi`. If SmartScreen warns, choose **More info → Run anyway**. When Windows Firewall asks, tick both **Private** and **Public**. Devices still don't see each other? In LOKA open **About → Allow through Windows Firewall**.
+- **macOS:** `LOKA_x.y.z_universal.dmg` (Apple Silicon and Intel). Open it, drag LOKA onto **Applications**, and open it from Applications. LOKA is not notarized yet, so the first launch is blocked: click **Done** (not Move to Trash), then:
+  - macOS 15 and newer: System Settings → Privacy & Security → scroll down → **Open Anyway**.
+  - macOS 14 and older: right-click LOKA in Applications → **Open** → **Open**.
+  - "LOKA is damaged and can't be opened" (or any version): run in Terminal
+
+    ```bash
+    xattr -dr com.apple.quarantine /Applications/LOKA.app
+    ```
+
+  Allow **Accessibility** when asked (System Settings → Privacy & Security → Accessibility), on both Main and Client; on macOS 15+ also allow **Local Network**. After updating, if the mouse stops crossing, remove LOKA from the Accessibility list with **−** and turn it on again.
 
 Then:
 
@@ -52,7 +62,7 @@ Then:
 2. On the Main, click the Client's Oka. Accept on the Client.
 3. Pick the edge and slide the glowing bar until it lines up with where the other device sits.
 
-Both devices must be on the same local network. LOKA uses UDP 53318 (discovery) and TCP 53319–53321 (telemetry, files, input). Allow them in your firewall.
+Both devices must be on the same local network. LOKA uses UDP 53318 (discovery) and TCP 53319–53321 (telemetry, files, input). Guest Wi-Fi or routers with client isolation block discovery: on the Client, LOKA shows **This computer's address**; type it into **Add by IP** on the Main.
 
 ## Build from source
 

@@ -1,9 +1,10 @@
 //! Shared mouse & keyboard. Pushing the cursor into the portal hands input to the paired device over TCP;
 //! pushing it out of that device's opposite edge (or Ctrl+Alt+Esc) hands it back.
 //!
-//! Wire: fixed 9-byte frames `tag | payload (8 bytes, LE)`.
+//! Wire: fixed 9-byte frames `tag | payload (8 bytes, LE)`. A Clipboard frame is followed by `len` bytes
+//! of UTF-8: the clipboard travels with the cursor (Main → Client on Enter, Client → Main on Return).
 
-use crate::platform::{edge_point, Captured, Edge, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine};
+use crate::platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine};
 use std::{
     future::Future,
     io,
@@ -12,7 +13,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc::unbounded_channel,
     time::timeout,
@@ -27,6 +28,11 @@ const RETURN_INSET: f64 = 12.0;
 /// Where the cursor appears on the receiver: far enough inside that hand jitter right after
 /// crossing does not bounce control straight back.
 const ENTER_INSET: f64 = 8.0;
+/// Larger clipboard text stays home (also the receiver's limit).
+const MAX_CLIPBOARD: u32 = 1 << 20;
+/// Sender: clipboard text last exchanged with a Client, so only new copies travel and an
+/// unchanged clipboard never overwrites the other side's (e.g. an image there).
+static LAST_SHARED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Msg {
@@ -39,6 +45,8 @@ pub enum Msg {
     /// Main → client: ask the client's user to pair with this device.
     PairRequest,
     PairResponse { accepted: bool },
+    /// Clipboard text follows: `len` bytes of UTF-8.
+    Clipboard { len: u32 },
 }
 
 fn edge_byte(e: Edge) -> u8 {
@@ -82,6 +90,10 @@ impl Msg {
             Msg::Leave => put(0, &[7]),
             Msg::PairRequest => put(0, &[8]),
             Msg::PairResponse { accepted } => put(0, &[9, accepted as u8]),
+            Msg::Clipboard { len } => {
+                put(0, &[10]);
+                put(1, &len.to_le_bytes());
+            }
         }
         b
     }
@@ -108,6 +120,7 @@ impl Msg {
             7 => Msg::Leave,
             8 => Msg::PairRequest,
             9 => Msg::PairResponse { accepted: b[1] != 0 },
+            10 => Msg::Clipboard { len: Some(u32::from_le_bytes(b[1..5].try_into().unwrap())).filter(|l| *l <= MAX_CLIPBOARD)? },
             _ => return None,
         })
     }
@@ -117,6 +130,21 @@ async fn read_msg(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Msg> {
     let mut b = [0u8; FRAME];
     r.read_exact(&mut b).await?;
     Msg::decode(&b).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad kvm frame"))
+}
+
+/// Send `text` as a Clipboard frame; nothing for an empty or oversized clipboard.
+async fn write_clipboard(w: &mut (impl AsyncWrite + Unpin), text: Option<String>) -> io::Result<()> {
+    let Some(text) = text.filter(|t| t.len() <= MAX_CLIPBOARD as usize) else { return Ok(()) };
+    let mut frame = Msg::Clipboard { len: text.len() as u32 }.encode().to_vec();
+    frame.extend_from_slice(text.as_bytes());
+    w.write_all(&frame).await
+}
+
+/// The bytes after a Clipboard frame; `None` if they are not UTF-8 (still consumed, so framing holds).
+async fn read_clipboard(r: &mut (impl AsyncRead + Unpin), len: u32) -> io::Result<Option<String>> {
+    let mut b = vec![0; len as usize];
+    r.read_exact(&mut b).await?;
+    Ok(String::from_utf8(b).ok())
 }
 
 /// Receiver-side cursor: absolute position inside `area`, entered through `edge`.
@@ -203,16 +231,30 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
     s.set_nodelay(true)?;
     let (mut rd, mut wr) = s.into_split();
     wr.write_all(&Msg::Enter { edge: portal.edge, y }.encode()).await?;
+    let fresh = clipboard_text().filter(|t| LAST_SHARED.lock().unwrap().as_ref() != Some(t));
+    timeout(WRITE_TIMEOUT, write_clipboard(&mut wr, fresh.clone())).await??;
+    if fresh.is_some() {
+        *LAST_SHARED.lock().unwrap() = fresh;
+    }
 
     let (tx, mut rx) = unbounded_channel();
     let m = portal.monitor;
     engine.start_capture((m.x + m.w / 2.0, m.y + m.h / 2.0), tx).map_err(io::Error::other)?;
 
     // reading in its own task keeps frames intact when the select below picks the other branch
+    // shortcut: the Client's clipboard only comes back on an edge return, not on Ctrl+Alt+Esc; add a Leave ack if needed.
     let mut returned = tokio::spawn(async move {
         loop {
             match read_msg(&mut rd).await {
                 Ok(Msg::Return { y }) => return Some(y),
+                Ok(Msg::Clipboard { len }) => match read_clipboard(&mut rd, len).await {
+                    Ok(Some(text)) => {
+                        set_clipboard_text(&text);
+                        *LAST_SHARED.lock().unwrap() = Some(text);
+                    }
+                    Ok(None) => {}
+                    Err(_) => return None,
+                },
                 Ok(_) => {}
                 Err(_) => return None,
             }
@@ -248,6 +290,11 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
 pub trait Sink: Send {
     fn area(&self) -> Rect;
     fn inject(&mut self, e: Injected);
+    /// Clipboard text to hand back with control; the simulator has none of its own.
+    fn clipboard(&self) -> Option<String> {
+        None
+    }
+    fn set_clipboard(&mut self, _text: String) {}
 }
 
 /// Main side of pairing: resolves once the client's user answers (or the request times out).
@@ -298,11 +345,30 @@ pub async fn serve<S: Sink, F: Future<Output = bool>>(
 async fn session(mut s: TcpStream, sink: &mut impl Sink, edge: Edge, y: f32) -> io::Result<()> {
     let (mut rcv, first) = Receiver::enter(sink.area(), edge, y);
     sink.inject(first);
+    // hand the clipboard back only if it changed here, so the Main's own (maybe an image) survives
+    let mut seen = sink.clipboard();
     let result = loop {
         match read_msg(&mut s).await {
             Ok(Msg::Input(e)) => match rcv.apply(e) {
                 Applied::Inject(i) => sink.inject(i),
-                Applied::Return(y) => break s.write_all(&Msg::Return { y }.encode()).await,
+                Applied::Return(y) => {
+                    // clipboard first: the Main stops reading once it sees Return
+                    let now = sink.clipboard();
+                    if now != seen {
+                        if let Err(e) = write_clipboard(&mut s, now).await {
+                            break Err(e);
+                        }
+                    }
+                    break s.write_all(&Msg::Return { y }.encode()).await;
+                }
+            },
+            Ok(Msg::Clipboard { len }) => match read_clipboard(&mut s, len).await {
+                Ok(Some(text)) => {
+                    sink.set_clipboard(text.clone());
+                    seen = Some(text);
+                }
+                Ok(None) => {}
+                Err(e) => break Err(e),
             },
             Ok(Msg::Leave) => break Ok(()),
             Ok(_) => {}
@@ -334,6 +400,7 @@ mod tests {
             Msg::Leave,
             Msg::PairRequest,
             Msg::PairResponse { accepted: true },
+            Msg::Clipboard { len: MAX_CLIPBOARD },
         ];
         for m in all {
             assert_eq!(Msg::decode(&m.encode()), Some(m));
@@ -343,6 +410,7 @@ mod tests {
         assert_eq!(Msg::decode(&bad), None);
         assert_eq!(Msg::decode(&[3, 9, 1, 0, 0, 0, 0, 0, 0]), None); // button 9
         assert_eq!(Msg::decode(&[0; FRAME]), None);
+        assert_eq!(Msg::decode(&Msg::Clipboard { len: MAX_CLIPBOARD + 1 }.encode()), None);
     }
 
     #[test]
@@ -440,5 +508,59 @@ mod tests {
         s.write_all(&Msg::Leave.encode()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(*got.lock().unwrap(), vec![Injected::MoveTo { x: 991.0, y: 0.0 }]);
+    }
+
+    /// Receiver's clipboard; records what the Main sent.
+    struct Clip {
+        own: Arc<Mutex<Option<String>>>,
+    }
+    impl Sink for Clip {
+        fn area(&self) -> Rect {
+            AREA
+        }
+        fn inject(&mut self, _: Injected) {}
+        fn clipboard(&self) -> Option<String> {
+            self.own.lock().unwrap().clone()
+        }
+        fn set_clipboard(&mut self, text: String) {
+            *self.own.lock().unwrap() = Some(text);
+        }
+    }
+
+    async fn crossing(port: u16, own: Arc<Mutex<Option<String>>>, send: Option<&str>, copy_on_client: Option<&str>) -> Option<String> {
+        let o = own.clone();
+        tokio::spawn(serve(port, |_| true, |_| async { false }, move || Some(Clip { own: o.clone() })));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(&Msg::Enter { edge: Edge::Left, y: 0.5 }.encode()).await.unwrap();
+        write_clipboard(&mut s, send.map(String::from)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(c) = copy_on_client {
+            *own.lock().unwrap() = Some(c.into()); // user copies something on the Client
+        }
+        // entered on the receiver's right edge; pushing right crosses back
+        s.write_all(&Msg::Input(InputEvent::Move { dx: 5000, dy: 0 }).encode()).await.unwrap();
+        let mut back = None;
+        loop {
+            match read_msg(&mut s).await.unwrap() {
+                Msg::Clipboard { len } => back = read_clipboard(&mut s, len).await.unwrap(),
+                Msg::Return { .. } => return back,
+                m => panic!("unexpected {m:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clipboard_travels_with_the_cursor_and_only_when_changed() {
+        // Main's text lands on the Client; the Client's new copy comes back before Return
+        let own = Arc::new(Mutex::new(Some("old client text".into())));
+        let back = crossing(53396, own.clone(), Some("from main"), Some("from client")).await;
+        assert_eq!(back.as_deref(), Some("from client"));
+
+        // nothing copied on the Client: nothing is sent back, so the Main's clipboard (maybe an image) survives
+        let own = Arc::new(Mutex::new(Some("client text".into())));
+        let back = crossing(53395, own.clone(), Some("from main"), None).await;
+        assert_eq!(back, None);
+        assert_eq!(own.lock().unwrap().as_deref(), Some("from main"));
     }
 }

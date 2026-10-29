@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { About, useUpdate } from "./About";
 import { Calibrate } from "./Calibrate";
 import { Face, type Mood } from "./Face";
 import { PairPrompt, osLabel, quietButton, type Device, type Peer, type Role } from "./Pairing";
@@ -11,19 +12,23 @@ const TARGET_KEY = "loka.target";
 export function Home() {
   const [device, setDevice] = useState<Device | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
+  const [about, setAbout] = useState(false);
+  const update = useUpdate();
+  const refreshDevice = () => invoke<Device>("get_device").then(setDevice);
 
   useEffect(() => {
-    const refreshDevice = () => invoke<Device>("get_device").then(setDevice);
     const refreshPeers = () => invoke<Peer[]>("peers").then(setPeers);
     refreshDevice();
     // subscribe before the first fetch so nothing announced in between is missed
     const unPeer = listen("peer", refreshPeers);
     unPeer.then(refreshPeers);
     const unPaired = listen("paired", refreshDevice);
+    const unAbout = listen("about", () => setAbout(true)); // tray menu
     const prune = setInterval(refreshPeers, 5000); // devices that went quiet drop off
     return () => {
       unPeer.then((f) => f());
       unPaired.then((f) => f());
+      unAbout.then((f) => f());
       clearInterval(prune);
     };
   }, []);
@@ -32,9 +37,16 @@ export function Home() {
   const setRole = (role: Role) =>
     invoke("set_role", { role }).then(() => setDevice({ ...device, info: { ...device.info, role } }));
 
-  if (!device.info.role) return <RolePicker device={device} onPick={setRole} />;
-
   const { alias, fingerprint, role } = device.info;
+  const sheet = about && <About update={update} seed={fingerprint} windows={device.info.os === "windows"} onClose={() => setAbout(false)} />;
+  if (!role)
+    return (
+      <>
+        <RolePicker device={device} onPick={setRole} />
+        {sheet}
+      </>
+    );
+
   return (
     <main className="mx-auto flex min-h-full max-w-3xl flex-col px-8 pb-6 pt-6">
       <header className="flex items-center gap-3">
@@ -44,9 +56,18 @@ export function Home() {
           <p className="text-xs text-muted">This computer</p>
         </div>
         <RoleSwitch role={role!} onChange={setRole} />
+        <button
+          onClick={() => setAbout(true)}
+          aria-label={update.available ? `About LOKA, ${update.available.name} available` : "About LOKA"}
+          className={`${quietButton} relative`}
+        >
+          About
+          {update.available && <span aria-hidden className="absolute right-2 top-2 h-2 w-2 rounded-full bg-accent" />}
+        </button>
       </header>
-      {role === "main" ? <MainHome device={device} peers={peers} /> : <ClientHome device={device} peers={peers} />}
+      {role === "main" ? <MainHome device={device} peers={peers} onHosts={refreshDevice} /> : <ClientHome device={device} peers={peers} />}
       <Transfers />
+      {sheet}
     </main>
   );
 }
@@ -116,7 +137,7 @@ function RolePicker({ device, onPick }: { device: Device; onPick: (role: Role) =
 
 type PairState = "waiting" | "declined" | string; // any other string is an error message
 
-function MainHome({ device, peers }: { device: Device; peers: Peer[] }) {
+function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; onHosts: () => void }) {
   const [target, setTarget] = useState<string | null>(() => localStorage.getItem(TARGET_KEY));
   const [pairing, setPairing] = useState<Record<string, PairState>>({});
   const [kvm, setKvm] = useState<{ active: boolean; error?: string | null }>({ active: false });
@@ -227,6 +248,7 @@ function MainHome({ device, peers }: { device: Device; peers: Peer[] }) {
             ))}
           </ul>
         )}
+        <AddHost hosts={device.hosts} onChange={onHosts} />
       </section>
 
       {selected && target && (
@@ -293,6 +315,11 @@ function ClientHome({ device, peers }: { device: Device; peers: Peer[] }) {
             ? `Push the cursor off ${pairedMain.info.alias}'s glowing edge and it lands here.`
             : "On your main computer, open LOKA and click this face to pair. You'll confirm it here."}
         </p>
+        {device.ips.length > 0 && (
+          <p className="rise mt-5 text-sm text-faint" style={{ "--i": 3 } as React.CSSProperties}>
+            This computer's address: <span className="select-text font-mono text-fg">{device.ips.join(", ")}</span>
+          </p>
+        )}
       </section>
 
       {mains.length > 0 && (
@@ -320,5 +347,67 @@ function ClientHome({ device, peers }: { device: Device; peers: Peer[] }) {
       )}
       <PairPrompt selfSeed={device.info.fingerprint} />
     </>
+  );
+}
+
+/** Fallback for networks that drop discovery (guest Wi-Fi, client isolation): reach a Client by its address. */
+function AddHost({ hosts, onChange }: { hosts: string[]; onChange: () => void }) {
+  const [ip, setIp] = useState("");
+  const [error, setError] = useState("");
+
+  const add = (e: React.FormEvent) => {
+    e.preventDefault();
+    invoke("add_host", { ip }).then(
+      () => {
+        setIp("");
+        setError("");
+        onChange();
+      },
+      (err) => setError(String(err)),
+    );
+  };
+
+  return (
+    <div className="mt-8 text-sm">
+      <form onSubmit={add} className="flex flex-wrap items-center gap-2">
+        <label htmlFor="add-ip" className="text-muted">
+          Not showing up? Add by IP
+        </label>
+        <input
+          id="add-ip"
+          value={ip}
+          onChange={(e) => setIp(e.target.value)}
+          placeholder="192.168.1.20"
+          inputMode="decimal"
+          spellCheck={false}
+          aria-describedby={error ? "add-ip-error" : undefined}
+          className="w-36 rounded-full bg-white/[0.06] px-4 py-2 font-mono text-fg ring-1 ring-line placeholder:text-faint focus-visible:outline-2 focus-visible:outline-accent"
+        />
+        <button type="submit" disabled={!ip.trim()} className={quietButton + " ring-1 ring-line disabled:opacity-50"}>
+          Add
+        </button>
+      </form>
+      {error && (
+        <p id="add-ip-error" role="alert" className="mt-2 text-xs text-danger">
+          {error}
+        </p>
+      )}
+      {hosts.length > 0 && (
+        <ul className="mt-3 flex flex-wrap gap-2" aria-label="Added by IP">
+          {hosts.map((h) => (
+            <li key={h} className="flex items-center gap-1 rounded-full bg-white/[0.04] py-1 pl-3 pr-1 font-mono text-xs text-muted ring-1 ring-line">
+              {h}
+              <button
+                onClick={() => invoke("remove_host", { ip: h }).then(onChange)}
+                aria-label={`Remove ${h}`}
+                className="grid h-6 w-6 place-items-center rounded-full hover:bg-white/10 hover:text-danger focus-visible:outline-2 focus-visible:outline-accent"
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
