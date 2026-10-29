@@ -47,6 +47,25 @@ pub enum Msg {
     PairResponse { accepted: bool },
     /// Clipboard text follows: `len` bytes of UTF-8.
     Clipboard { len: u32 },
+    /// Client → Main: session turned down, so the Main can say why instead of "closed".
+    Refuse(Refusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Refusal {
+    NotClient,
+    NotPaired,
+    NoScreen,
+}
+
+impl Refusal {
+    fn text(self) -> &'static str {
+        match self {
+            Refusal::NotClient => "the other device is set as Main, switch it to Client",
+            Refusal::NotPaired => "the other device isn't paired with this one, pair them again",
+            Refusal::NoScreen => "the other device has no screen to show the cursor on",
+        }
+    }
 }
 
 fn edge_byte(e: Edge) -> u8 {
@@ -94,6 +113,7 @@ impl Msg {
                 put(0, &[10]);
                 put(1, &len.to_le_bytes());
             }
+            Msg::Refuse(r) => put(0, &[11, r as u8]),
         }
         b
     }
@@ -121,6 +141,12 @@ impl Msg {
             8 => Msg::PairRequest,
             9 => Msg::PairResponse { accepted: b[1] != 0 },
             10 => Msg::Clipboard { len: Some(u32::from_le_bytes(b[1..5].try_into().unwrap())).filter(|l| *l <= MAX_CLIPBOARD)? },
+            11 => Msg::Refuse(match b[1] {
+                0 => Refusal::NotClient,
+                1 => Refusal::NotPaired,
+                2 => Refusal::NoScreen,
+                _ => return None,
+            }),
             _ => return None,
         })
     }
@@ -243,20 +269,22 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
 
     // reading in its own task keeps frames intact when the select below picks the other branch
     // shortcut: the Client's clipboard only comes back on an edge return, not on Ctrl+Alt+Esc; add a Leave ack if needed.
+    let closed = || io::Error::new(io::ErrorKind::ConnectionAborted, "peer closed the session");
     let mut returned = tokio::spawn(async move {
         loop {
             match read_msg(&mut rd).await {
-                Ok(Msg::Return { y }) => return Some(y),
+                Ok(Msg::Return { y }) => return Ok(y),
+                Ok(Msg::Refuse(r)) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, r.text())),
                 Ok(Msg::Clipboard { len }) => match read_clipboard(&mut rd, len).await {
                     Ok(Some(text)) => {
                         set_clipboard_text(&text);
                         *LAST_SHARED.lock().unwrap() = Some(text);
                     }
                     Ok(None) => {}
-                    Err(_) => return None,
+                    Err(_) => return Err(closed()),
                 },
                 Ok(_) => {}
-                Err(_) => return None,
+                Err(_) => return Err(closed()),
             }
         }
     });
@@ -272,10 +300,8 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
                     }
                 },
                 r = &mut returned => {
-                    return match r.ok().flatten() {
-                        Some(y) => { back_y = y; Ok(()) }
-                        None => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "peer closed the session")),
-                    };
+                    back_y = r.unwrap_or_else(|_| Err(closed()))?;
+                    return Ok(());
                 }
             }
         }
@@ -312,12 +338,13 @@ pub async fn request_pair(to: SocketAddr) -> io::Result<bool> {
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Client side. One connection at a time: a pairing request (answered by `ask_pair`) or an input
-/// session, which only peers passing `allow_session` (paired mains) may start.
+/// session, which only peers passing `allow_session` (paired mains) may start. `make_sink` gets the
+/// Main's address and the edge the cursor enters (and leaves) through.
 pub async fn serve<S: Sink, F: Future<Output = bool>>(
     port: u16,
-    allow_session: impl Fn(IpAddr) -> bool,
+    allow_session: impl Fn(IpAddr) -> Result<(), Refusal>,
     ask_pair: impl Fn(IpAddr) -> F,
-    mut make_sink: impl FnMut() -> Option<S>,
+    mut make_sink: impl FnMut(IpAddr, Edge) -> Option<S>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     loop {
@@ -331,12 +358,21 @@ pub async fn serve<S: Sink, F: Future<Output = bool>>(
                 let accepted = ask_pair(ip).await;
                 let _ = s.write_all(&Msg::PairResponse { accepted }.encode()).await;
             }
-            Msg::Enter { edge, y } if allow_session(ip) => {
-                let Some(mut sink) = make_sink() else { continue };
-                if let Err(e) = session(s, &mut sink, edge, y).await {
-                    eprintln!("kvm session from {from} ended: {e}");
+            Msg::Enter { edge, y } => match allow_session(ip).and_then(|()| make_sink(ip, edge.opposite()).ok_or(Refusal::NoScreen)) {
+                Ok(mut sink) => {
+                    if let Err(e) = session(s, &mut sink, edge, y).await {
+                        eprintln!("kvm session from {from} ended: {e}");
+                    }
                 }
-            }
+                Err(r) => {
+                    // let the Main hang up first: closing with its clipboard frame unread resets the link and loses the Refuse
+                    let _ = timeout(WRITE_TIMEOUT, async {
+                        s.write_all(&Msg::Refuse(r).encode()).await?;
+                        tokio::io::copy(&mut s, &mut tokio::io::sink()).await
+                    })
+                    .await;
+                }
+            },
             _ => {}
         }
     }
@@ -398,6 +434,7 @@ mod tests {
             Msg::Input(InputEvent::Key { scan: 0xE05B, down: false }),
             Msg::Return { y: 1.0 },
             Msg::Leave,
+            Msg::Refuse(Refusal::NoScreen),
             Msg::PairRequest,
             Msg::PairResponse { accepted: true },
             Msg::Clipboard { len: MAX_CLIPBOARD },
@@ -458,7 +495,7 @@ mod tests {
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
         let port = 53398;
-        tokio::spawn(serve(port, |_| true, |_| async { false }, move || Some(Recorder(g.clone()))));
+        tokio::spawn(serve(port, |_| Ok(()), |_| async { false }, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         for m in [
@@ -485,7 +522,7 @@ mod tests {
         let paired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (g, p1, p2) = (got.clone(), paired.clone(), paired.clone());
         let port = 53397;
-        let allow = move |_| p1.load(std::sync::atomic::Ordering::SeqCst);
+        let allow = move |_| if p1.load(std::sync::atomic::Ordering::SeqCst) { Ok(()) } else { Err(Refusal::NotPaired) };
         let ask = move |_| {
             let p = p2.clone();
             async move {
@@ -493,13 +530,14 @@ mod tests {
                 true
             }
         };
-        tokio::spawn(serve(port, allow, ask, move || Some(Recorder(g.clone()))));
+        tokio::spawn(serve(port, allow, ask, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
         let enter = Msg::Enter { edge: Edge::Left, y: 0.0 }.encode();
 
-        TcpStream::connect(to).await.unwrap().write_all(&enter).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut s = TcpStream::connect(to).await.unwrap();
+        s.write_all(&enter).await.unwrap();
+        assert_eq!(read_msg(&mut s).await.unwrap(), Msg::Refuse(Refusal::NotPaired), "the Main is told why");
         assert!(got.lock().unwrap().is_empty(), "session before pairing must be dropped");
 
         assert!(request_pair(to).await.unwrap());
@@ -508,6 +546,41 @@ mod tests {
         s.write_all(&Msg::Leave.encode()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(*got.lock().unwrap(), vec![Injected::MoveTo { x: 991.0, y: 0.0 }]);
+    }
+
+    /// Main-side engine: capture "works" (holds the input channel open, like a real hook) and
+    /// records where the cursor is warped back to.
+    #[derive(Default)]
+    struct Captor {
+        out: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Captured>>>,
+        warped: Mutex<Option<(f64, f64)>>,
+    }
+    impl SpatialPlatformEngine for Captor {
+        fn prepare_overlay(&self, _: &tauri::WebviewWindow) -> tauri::Result<()> {
+            Ok(())
+        }
+        fn cursor(&self) -> Option<crate::platform::CursorSample> {
+            None
+        }
+        fn start_capture(&self, _: (f64, f64), out: tokio::sync::mpsc::UnboundedSender<Captured>) -> Result<(), String> {
+            *self.out.lock().unwrap() = Some(out);
+            Ok(())
+        }
+        fn stop_capture(&self, warp_to: (f64, f64)) {
+            *self.warped.lock().unwrap() = Some(warp_to);
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_session_says_why_and_gives_input_back() {
+        let port = 53394;
+        tokio::spawn(serve(port, |_| Err(Refusal::NotClient), |_| async { false }, |_, _| None::<Recorder>));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let engine = Arc::new(Captor::default());
+        let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
+        let e = send_session(engine.clone(), ([127, 0, 0, 1], port).into(), portal, 0.5).await.unwrap_err();
+        assert_eq!(e.to_string(), Refusal::NotClient.text());
+        assert_eq!(*engine.warped.lock().unwrap(), Some(portal.point(0.5, RETURN_INSET)));
     }
 
     /// Receiver's clipboard; records what the Main sent.
@@ -529,7 +602,7 @@ mod tests {
 
     async fn crossing(port: u16, own: Arc<Mutex<Option<String>>>, send: Option<&str>, copy_on_client: Option<&str>) -> Option<String> {
         let o = own.clone();
-        tokio::spawn(serve(port, |_| true, |_| async { false }, move || Some(Clip { own: o.clone() })));
+        tokio::spawn(serve(port, |_| Ok(()), |_| async { false }, move |_, _| Some(Clip { own: o.clone() })));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         s.write_all(&Msg::Enter { edge: Edge::Left, y: 0.5 }.encode()).await.unwrap();

@@ -9,7 +9,7 @@ use network::{
     telemetry::{self, PacketType, PayloadKind, SpatialPacket},
     transfer::{self, Kind},
 };
-use platform::{Injected, Portal, Rect, SpatialPlatformEngine};
+use platform::{Edge, Injected, Portal, Rect, SpatialPlatformEngine};
 use settings::{PairedDevice, Settings};
 use std::{
     collections::HashMap,
@@ -33,6 +33,8 @@ struct Shared {
     /// fingerprint of the paired client the portal leads to
     target: Option<String>,
     last_y: f32,
+    /// Client, while a Main controls us: its address and our band on the edge leading back to it
+    session: Option<(IpAddr, Portal)>,
     /// pairing prompts waiting for the user's answer
     pending: HashMap<u64, oneshot::Sender<bool>>,
     next_request: u64,
@@ -50,12 +52,18 @@ impl Shared {
         self.peers.get(f)
     }
 
+    /// Where dropped payloads go: our selected Client (Main), or the Main controlling us (Client).
+    fn drop_target(&self) -> Option<&Peer> {
+        self.target().or_else(|| self.session.and_then(|(ip, _)| self.paired_peer_at(ip, Role::Main)))
+    }
+
     fn live_peers(&self) -> impl Iterator<Item = &Peer> {
         self.peers.values().filter(|p| p.seen.elapsed() < discovery::STALE)
     }
 
+    /// Not only live peers: a few lost heartbeats must not lock out a paired device mid-use.
     fn paired_peer_at(&self, ip: IpAddr, role: Role) -> Option<&Peer> {
-        self.live_peers().find(|p| p.addr == ip && p.info.role == Some(role) && self.settings.is_paired(&p.info.fingerprint))
+        self.peers.values().find(|p| p.addr == ip && p.info.role == Some(role) && self.settings.is_paired(&p.info.fingerprint))
     }
 }
 
@@ -226,21 +234,21 @@ fn set_portal(app: AppHandle, state: State<AppState>, portal: Portal, target: Op
     }
     let _ = app.emit("portal", portal.edge); // overlay + simulated phone redraw for a new edge
     sim::place(&app, &portal).map_err(|e| e.to_string())?;
-    if let Some(w) = app.get_webview_window(OVERLAY) {
-        let b = portal.hit_box();
-        let run = || -> tauri::Result<()> {
-            w.set_position(tauri::PhysicalPosition::new(b.x as i32, b.y as i32))?;
-            w.set_size(tauri::PhysicalSize::new(b.w as u32, b.h as u32))?;
-            w.show()?;
-            // show() rewrites window styles on Windows; restore the overlay ones
-            match app.try_state::<Arc<dyn SpatialPlatformEngine>>() {
-                Some(e) => e.set_click_through(&w, true),
-                None => Ok(()),
-            }
-        };
-        run().map_err(|e| e.to_string())?;
+    place_overlay(&app, &portal).map_err(|e| e.to_string())
+}
+
+/// Move the overlay window onto `portal`'s band and show it, click-through.
+fn place_overlay(app: &AppHandle, portal: &Portal) -> tauri::Result<()> {
+    let Some(w) = app.get_webview_window(OVERLAY) else { return Ok(()) };
+    let b = portal.hit_box();
+    w.set_position(tauri::PhysicalPosition::new(b.x as i32, b.y as i32))?;
+    w.set_size(tauri::PhysicalSize::new(b.w as u32, b.h as u32))?;
+    w.show()?;
+    // show() rewrites window styles on Windows; restore the overlay ones
+    match app.try_state::<Arc<dyn SpatialPlatformEngine>>() {
+        Some(e) => e.set_click_through(&w, true),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -267,7 +275,7 @@ fn reveal(path: std::path::PathBuf) -> Result<(), String> {
 }
 
 fn transfer_addr(state: &AppState) -> Option<SocketAddr> {
-    state.lock().unwrap().target().map(|p| SocketAddr::new(p.addr, p.info.transfer_port))
+    state.lock().unwrap().drop_target().map(|p| SocketAddr::new(p.addr, p.info.transfer_port))
 }
 
 fn telemetry_addr(state: &AppState) -> Option<SocketAddr> {
@@ -283,6 +291,17 @@ fn kvm_addr(state: &AppState) -> Option<SocketAddr> {
 struct EngineSink {
     engine: Arc<dyn SpatialPlatformEngine>,
     area: Rect,
+    app: AppHandle,
+}
+
+/// Session over: no band back to the Main any more.
+impl Drop for EngineSink {
+    fn drop(&mut self) {
+        self.app.state::<AppState>().lock().unwrap().session = None;
+        if let Some(w) = self.app.get_webview_window(OVERLAY) {
+            let _ = w.hide();
+        }
+    }
 }
 
 impl kvm::Sink for EngineSink {
@@ -354,6 +373,7 @@ pub fn run() {
                 portal: None,
                 target: None,
                 last_y: 0.0,
+                session: None,
                 pending: HashMap::new(),
                 next_request: 0,
             }));
@@ -410,8 +430,11 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState) -> tauri::Result<()> 
     let dir = app.path().download_dir().or_else(|_| app.path().app_data_dir())?.join("LOKA");
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
-        // only a paired Main may push payloads to us
-        let allow = move |ip| state.lock().unwrap().paired_peer_at(ip, Role::Main).is_some();
+        // paired devices only: a Main pushes to its Clients, a Client drops back to its Main
+        let allow = move |ip| {
+            let s = state.lock().unwrap();
+            s.paired_peer_at(ip, Role::Main).or(s.paired_peer_at(ip, Role::Client)).is_some()
+        };
         let r = transfer::serve(transfer::PORT, dir, allow, move |e| {
             // one notification per burst, not one per file of a dropped folder
             static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -495,12 +518,13 @@ fn setup_overlay(app: &mut tauri::App, state: AppState) -> tauri::Result<()> {
     let (h, s) = (app.handle().clone(), state.clone());
     overlay.on_window_event(move |e| {
         let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = e else { return };
-        let (Some(to), Some(tele)) = (transfer_addr(&s), telemetry_addr(&s)) else { return };
+        let Some(to) = transfer_addr(&s) else { return };
+        let tele = telemetry_addr(&s); // none on a Client: the Main has no glow for us
         let y = s.lock().unwrap().last_y;
         let (h, paths) = (h.clone(), paths.clone());
         tauri::async_runtime::spawn(async move {
             let drop = SpatialPacket { kind: PacketType::Drop, normalized_y: y, proximity: 1.0, payload: PayloadKind::File };
-            if let Ok(sock) = telemetry::sender().await {
+            if let (Ok(sock), Some(tele)) = (telemetry::sender().await, tele) {
                 telemetry::send(&sock, tele, &drop).await;
             }
             let _ = h.emit_to(OVERLAY, "spatial", drop);
@@ -539,7 +563,11 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
         let st = state.clone();
         let allow = move |ip| {
             let s = st.lock().unwrap();
-            is_client(&s) && s.paired_peer_at(ip, Role::Main).is_some()
+            match (is_client(&s), s.paired_peer_at(ip, Role::Main)) {
+                (false, _) => Err(kvm::Refusal::NotClient),
+                (true, None) => Err(kvm::Refusal::NotPaired),
+                (true, Some(_)) => Ok(()),
+            }
         };
         let (a, st) = (app.clone(), state.clone());
         let ask = move |ip: IpAddr| {
@@ -562,10 +590,15 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                 accepted
             }
         };
-        let make = move || {
+        let make = move |ip: IpAddr, edge: Edge| {
             let m = app.primary_monitor().ok().flatten()?;
             let area = Rect { x: m.position().x as f64, y: m.position().y as f64, w: m.size().width as f64, h: m.size().height as f64 };
-            Some(EngineSink { engine: engine.clone(), area })
+            // the whole entry edge leads back to the Main: files dragged there and dropped go to it (reach = Calibrate's REACH)
+            let band = Portal { edge, monitor: area, start: 0.0, end: 1.0, reach: 120.0 };
+            app.state::<AppState>().lock().unwrap().session = Some((ip, band));
+            let _ = app.emit("portal", edge);
+            let _ = place_overlay(&app, &band);
+            Some(EngineSink { engine: engine.clone(), area, app: app.clone() })
         };
         if let Err(e) = kvm::serve(kvm::PORT, allow, ask, make).await {
             eprintln!("kvm receiver stopped: {e}");
@@ -585,10 +618,11 @@ async fn track(app: AppHandle, overlay: tauri::WebviewWindow, engine: Arc<dyn Sp
         tick.tick().await;
         let portal = {
             let s = state.lock().unwrap();
-            if s.settings.role != Some(Role::Main) {
-                continue;
+            match s.settings.role {
+                Some(Role::Main) => s.portal,
+                Some(Role::Client) => s.session.map(|(_, band)| band),
+                None => None,
             }
-            s.portal
         };
         let Some(portal) = portal else { continue };
         let Some(c) = engine.cursor() else { continue };

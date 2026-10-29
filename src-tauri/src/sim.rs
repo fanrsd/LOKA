@@ -112,7 +112,10 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
 
     // Pairing prompts appear in the phone window; the pairing itself is stored by this host's Main side.
     let (h, st) = (app.clone(), state.clone());
-    let allow = move |ip: IpAddr| ip.is_loopback() && st.lock().unwrap().settings.is_paired(FINGERPRINT);
+    let allow = move |ip: IpAddr| match ip.is_loopback() && st.lock().unwrap().settings.is_paired(FINGERPRINT) {
+        true => Ok(()),
+        false => Err(kvm::Refusal::NotPaired),
+    };
     let (a, st) = (app.clone(), state.clone());
     let ask = move |ip: IpAddr| {
         let (app, state) = (a.clone(), st.clone());
@@ -125,7 +128,7 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
         }
     };
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = kvm::serve(KVM_PORT, allow, ask, move || Some(WindowSink(h.clone()))).await {
+        if let Err(e) = kvm::serve(KVM_PORT, allow, ask, move |_, _| Some(WindowSink(h.clone()))).await {
             eprintln!("sim kvm receiver stopped: {e}");
         }
     });
