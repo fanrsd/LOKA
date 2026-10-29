@@ -7,7 +7,7 @@
 **Satu mouse dan keyboard untuk semua komputer di mejamu.**
 Dorong kursor melewati tepi layar yang menyala, dan kursor langsung pindah ke perangkat di sebelahnya.
 
-[English](README.md) · **Bahasa Indonesia** · [Website](https://loka.aufanirsad.me) · [Unduh](https://github.com/fanrsd/LOKA/releases/latest)
+[English](README.md) · **Bahasa Indonesia** · [Website](https://loka.margingroup.id) · [Unduh](https://github.com/fanrsd/LOKA/releases/latest)
 
 <img src="docs/screenshots/calibrate.webp" width="640" alt="LOKA terhubung dengan Studio PC, tepi menyala di sisi kanan layar 1">
 
