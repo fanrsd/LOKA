@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="b" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b7ecff"/>
+      <stop offset="1" stop-color="#3fa9e6"/>
+    </linearGradient>
+    <filter id="g" x="-2" y="-0.5" width="5" height="2"><feGaussianBlur stdDeviation="22"/></filter>
+  </defs>
+  <rect width="1024" height="1024" rx="230" fill="#0b0d16"/>
+  <rect x="842" y="250" width="34" height="524" rx="17" fill="#4cc9ff" filter="url(#g)"/>
+  <rect x="848" y="262" width="22" height="500" rx="11" fill="#dff6ff"/>
+  <g transform="translate(150 150) scale(7.4)">
+    <path d="M24 9 L24 78 L41 63 L51 83 L62 78 L53 59 L78 58 Z" fill="url(#b)" stroke="url(#b)" stroke-width="15" stroke-linejoin="round"/>
+    <path d="M22 16 L22 40" stroke="#fff" stroke-opacity=".45" stroke-width="3" stroke-linecap="round"/>
+    <ellipse cx="36" cy="45" rx="3.4" ry="4.6" fill="#05060c"/>
+    <ellipse cx="51" cy="45" rx="3.4" ry="4.6" fill="#05060c"/>
+    <circle cx="37.2" cy="43.3" r="1.25" fill="#fff"/>
+    <circle cx="52.2" cy="43.3" r="1.25" fill="#fff"/>
+    <path d="M39.5 56 Q44 63 48.5 56 Z" fill="#05060c" stroke="#05060c" stroke-width="2.6" stroke-linejoin="round"/>
+  </g>
+</svg>

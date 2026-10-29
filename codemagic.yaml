@@ -1,0 +1,34 @@
+# macOS build. Push a tag like v0.1.0 (or start the workflow from the Codemagic UI / API)
+# and the universal .dmg is attached to the GitHub release with the same tag.
+# Needs an environment group "github" with GITHUB_TOKEN (a token with "contents: write" on this repo).
+workflows:
+  macos:
+    name: LOKA macOS
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      groups:
+        - github
+      node: 20
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "v*"
+    scripts:
+      - name: Install Rust
+        script: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "PATH=$HOME/.cargo/bin:$PATH" >> $CM_ENV
+      - name: Add both Mac targets
+        script: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Install npm packages
+        script: npm ci
+      - name: Build universal dmg
+        script: npx tauri build --target universal-apple-darwin --bundles dmg
+      - name: Attach to GitHub release
+        script: |
+          TAG=${CM_TAG:-v$(node -p "require('./package.json').version")}
+          GH_TOKEN=$GITHUB_TOKEN gh release upload "$TAG" src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg --repo fanrsd/LOKA --clobber
+    artifacts:
+      - src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg

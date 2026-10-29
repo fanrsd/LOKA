@@ -1,0 +1,108 @@
+@import "tailwindcss";
+@import "@fontsource-variable/bricolage-grotesque";
+
+@theme {
+  /* chunky, friendly display face for headings; the OS face (SF / Segoe UI Variable) for everything else */
+  --font-display: "Bricolage Grotesque Variable", "Segoe UI Variable Display", system-ui, sans-serif;
+  --font-sans: system-ui, "Segoe UI Variable Text", -apple-system, sans-serif;
+
+  /* one ink-tinted neutral family + one accent (the portal's cyan) */
+  --color-ink: #05060c;
+  --color-raised: #0c0e18;
+  --color-fg: #eceff7;
+  --color-muted: #8c94a8;
+  --color-faint: #737b8f; /* 4.5:1 on raised surfaces */
+  --color-line: rgb(236 239 247 / 0.08);
+  --color-accent: #4cc9ff;
+  --color-danger: #ff7a85;
+
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--color-ink);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none; /* desktop app, not a document */
+}
+/* overlay needs a see-through page */
+body.transparent { background: transparent; }
+
+/* quiet scrollbar that matches the ink surface */
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgb(236 239 247 / 0.12); border-radius: 999px; border: 3px solid var(--color-ink); }
+::-webkit-scrollbar-thumb:hover { background: rgb(236 239 247 / 0.22); }
+::-webkit-scrollbar-button { display: none; }
+
+/* range: thin track filled up to the thumb (--fill), white knob, like a system slider */
+.loka-range {
+  appearance: none;
+  height: 1.25rem;
+  background: transparent;
+  cursor: pointer;
+}
+.loka-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(to right, var(--color-accent) var(--fill, 50%), rgb(236 239 247 / 0.1) var(--fill, 50%));
+}
+.loka-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.5);
+  transition: transform 0.2s var(--ease-spring);
+}
+.loka-range:active::-webkit-slider-thumb { transform: scale(1.15); }
+.loka-range:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 4px; border-radius: 999px; }
+
+h1, h2, h3 { text-wrap: balance; }
+p { text-wrap: pretty; }
+
+/* ---- motion -------------------------------------------------------- */
+
+/* staggered entrance: give children style="--i: n" */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+}
+.rise { animation: rise 0.6s var(--ease-out-soft) both; animation-delay: calc(var(--i, 0) * 60ms); }
+
+/* mascot: an occasional blink, eyes darting while waiting (svg user units), a hover while searching */
+@keyframes blink {
+  0%, 94%, 100% { transform: scaleY(1); }
+  97% { transform: scaleY(0.1); }
+}
+@keyframes glance {
+  0%, 30% { translate: -3px 0; }
+  50%, 80% { translate: 3px 0; }
+  100% { translate: -3px 0; }
+}
+@keyframes hop {
+  0%, 100% { translate: 0 0; }
+  50% { translate: 0 -6%; }
+}
+@keyframes ripple {
+  from { transform: scale(0.9); opacity: 0.5; }
+  to { transform: scale(1.9); opacity: 0; }
+}
+@keyframes sheet-in {
+  from { opacity: 0; transform: translateY(16px) scale(0.96); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
