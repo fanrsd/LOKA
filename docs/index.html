@@ -87,13 +87,27 @@
   .window img { width: 100%; height: 100%; object-fit: cover; object-position: top; display: block; }
 
   /* desk demo */
-  .desk { position: relative; margin-top: 48px; aspect-ratio: 1100 / 380; }
-  .screen { position: absolute; top: 0; height: 100%; width: 48.5%; border-radius: 18px; background: var(--panel) radial-gradient(rgb(255 255 255 / .06) 1px, transparent 1px) 0 0 / 22px 22px; box-shadow: inset 0 0 0 1px var(--line); }
-  .screen.a { left: 0; } .screen.b { right: 0; }
-  .screen span { position: absolute; top: 14px; left: 18px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
-  .portal { position: absolute; left: calc(48.5% - 9px); top: 26%; height: 48%; width: 6px; border-radius: 6px; background: color-mix(in srgb, var(--accent), white 70%);
+  .desk { position: relative; margin-top: 48px; aspect-ratio: 1100 / 440; }
+  .screen { position: absolute; top: 0; height: 84%; width: 48.5%; border-radius: 12px; background: var(--panel) radial-gradient(rgb(255 255 255 / .06) 1px, transparent 1px) 0 0 / 22px 22px; box-shadow: inset 0 0 0 1px var(--line), 0 0 0 5px #05060a, 0 0 0 6px var(--line); }
+  .screen.a { left: 0; } .screen.b { right: 0; border-radius: 12px 12px 4px 4px; }
+  .tag { position: absolute; top: 14px; left: 18px; font-size: clamp(8px, 1vw, 11px); letter-spacing: .06em; color: var(--faint); }
+  .screen.b .tag { top: calc(7% + 12px); }
+  /* Windows monitor: neck + foot; MacBook: notch + base */
+  .screen.a::after { content: ""; position: absolute; left: 50%; bottom: -12%; width: 7%; height: 11%; translate: -50%; background: linear-gradient(#1d2028, #121419); }
+  .screen.a::before { content: ""; position: absolute; left: 50%; bottom: -15%; width: 28%; height: 3.5%; translate: -50%; border-radius: 6px 6px 3px 3px; background: #1d2028; box-shadow: inset 0 1px 0 rgb(255 255 255 / .08); }
+  .screen.b::after { content: ""; position: absolute; left: -5%; right: -5%; bottom: calc(-6% - 6px); height: 6%; border-radius: 3px 3px 16px 16px; background: linear-gradient(#2b2e36, #15171c); box-shadow: inset 0 1px 0 rgb(255 255 255 / .12); }
+  .screen.b::before { content: ""; position: absolute; left: 50%; top: 0; width: 11%; height: 5%; translate: -50%; border-radius: 0 0 7px 7px; background: #05060a; z-index: 1; }
+  .taskbar { position: absolute; inset: auto 1px 1px; height: 10%; border-radius: 0 0 11px 11px; border-top: 1px solid var(--line); background: rgb(255 255 255 / .04); display: flex; align-items: center; justify-content: center; gap: 1.6%; }
+  .taskbar i, .dock i { display: block; height: 52%; aspect-ratio: 1; border-radius: 22%; background: rgb(255 255 255 / .12); }
+  .taskbar svg { height: 48%; fill: #4cc2ff; }
+  .menubar { position: absolute; inset: 1px 1px auto; height: 7%; border-radius: 11px 11px 0 0; background: rgb(255 255 255 / .05); display: flex; align-items: center; gap: 2.4%; padding-left: 3%; font: 600 clamp(6px, .9vw, 11px) var(--display); color: var(--muted); }
+  .menubar svg { height: 56%; fill: currentColor; }
+  .dock { position: absolute; bottom: 4%; left: 50%; translate: -50%; height: 10%; padding: 0 1.4%; border-radius: 12px; border: 1px solid var(--line); background: rgb(255 255 255 / .06); display: flex; align-items: center; gap: .9vw; }
+  .dock i { height: 66%; }
+  .dock i:first-child { background: color-mix(in srgb, var(--accent), transparent 40%); }
+  .portal { position: absolute; left: calc(48.5% - 9px); top: 21%; height: 42%; width: 6px; border-radius: 6px; background: color-mix(in srgb, var(--accent), white 70%);
     box-shadow: 0 0 14px 3px var(--accent), 0 0 50px 10px color-mix(in srgb, var(--accent), transparent 55%); animation: glow 4s ease-in-out infinite; }
-  .oka { position: absolute; top: 34%; width: 10%; animation: cross 4s cubic-bezier(.65, 0, .35, 1) infinite; }
+  .oka { position: absolute; top: 25%; width: 10%; animation: cross 4s cubic-bezier(.65, 0, .35, 1) infinite; }
   .oka svg { display: block; width: 100%; filter: drop-shadow(0 6px 10px rgb(0 0 0 / .5)); }
   @keyframes cross { 0%, 14% { left: 26%; } 48% { left: 41%; transform: scale(.92, 1.04); } 56% { left: 53%; transform: scale(1.06, .95); } 84%, 100% { left: 68%; transform: none; } }
   @keyframes glow { 0%, 40%, 72%, 100% { width: 6px; } 54% { width: 12px; box-shadow: 0 0 26px 8px var(--accent), 0 0 90px 22px color-mix(in srgb, var(--accent), transparent 40%); } }
@@ -204,9 +218,12 @@
       <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Drop files across screens</span><span lang="id">Lempar file antar layar</span></li>
     </ul>
 
-    <div class="desk" role="img" aria-label="Oka, a cursor with a face, crosses from the Main screen through a glowing edge onto the Client screen">
-      <div class="screen a"><span>Main</span></div>
-      <div class="screen b"><span>Client</span></div>
+    <div class="desk" role="img" aria-label="Oka, a cursor with a face, crosses from a Windows PC through a glowing edge onto a Mac">
+      <div class="screen a"><span class="tag">Windows · Main</span>
+        <div class="taskbar"><svg viewBox="0 0 16 16"><path d="M0 0h7.5v7.5H0zM8.5 0H16v7.5H8.5zM0 8.5h7.5V16H0zM8.5 8.5H16V16H8.5z"/></svg><i></i><i></i><i></i></div></div>
+      <div class="screen b"><div class="menubar"><svg viewBox="0 0 384 512"><path d="M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119.3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-11.4 69.5-34.3z"/></svg><span>LOKA</span><span>File</span><span>Edit</span></div>
+        <span class="tag">macOS · Client</span>
+        <div class="dock"><i></i><i></i><i></i><i></i><i></i></div></div>
       <div class="portal"></div>
       <div class="oka"><svg viewBox="0 0 100 100"><use href="#oka"/></svg></div>
     </div>
