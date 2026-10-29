@@ -7,7 +7,7 @@
 **One mouse and keyboard for every computer on your desk.**
 Push the cursor through a glowing edge of your screen and it lands on the device next to it.
 
-**English** · [Bahasa Indonesia](README.id.md) · [Website](https://aufanirsad.me/LOKA) · [Download](https://github.com/fanrsd/LOKA/releases/latest)
+**English** · [Bahasa Indonesia](README.id.md) · [Website](https://loka.aufanirsad.me) · [Download](https://github.com/fanrsd/LOKA/releases/latest)
 
 <img src="docs/screenshots/calibrate.webp" width="640" alt="LOKA paired with Studio PC, with the glowing edge set on the right side of screen 1">
 
