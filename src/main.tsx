@@ -14,6 +14,16 @@ const isPhone = /Android|iPhone|iPad/i.test(navigator.userAgent);
 applyAccent(loadLook().color);
 listen<Look>("look", (e) => applyAccent(e.payload.color));
 
+// a native app has no "Back / Reload / Print / Inspect" menu or browser shortcuts (dev builds keep them for debugging)
+const BROWSER_KEYS: Record<string, true> = { r: true, f: true, g: true, p: true, s: true, u: true, j: true, h: true, o: true, n: true, "+": true, "-": true, "=": true, "0": true };
+if (!import.meta.env.DEV) {
+  addEventListener("contextmenu", (e) => e.preventDefault());
+  addEventListener("keydown", (e) => {
+    const ctrl = (e.ctrlKey || e.metaKey) && BROWSER_KEYS[e.key.toLowerCase()];
+    if (ctrl || ["F3", "F5", "F7", "F12"].includes(e.key)) e.preventDefault();
+  });
+}
+
 function App() {
   if (label === "edge-overlay") return <BezelPortal side={loadCalibration().edge} event="spatial" />;
   if (label === "mobile-view" || isPhone) return <PhoneView />;

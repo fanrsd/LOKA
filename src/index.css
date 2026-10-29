@@ -27,7 +27,10 @@ body {
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   user-select: none; /* desktop app, not a document */
+  cursor: default; /* no text I-beam over labels */
+  overscroll-behavior: none;
 }
+img, a, svg { -webkit-user-drag: none; }
 /* overlay needs a see-through page */
 body.transparent { background: transparent; }
 
