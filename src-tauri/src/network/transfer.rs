@@ -87,10 +87,9 @@ async fn write_header(s: &mut TcpStream, h: &Header) -> io::Result<()> {
     s.write_all(&json).await
 }
 
-pub async fn send_file(to: SocketAddr, path: &Path, id: u64, mut progress: impl FnMut(u64, u64)) -> io::Result<()> {
+pub async fn send_file(to: SocketAddr, path: &Path, name: String, id: u64, mut progress: impl FnMut(u64, u64)) -> io::Result<()> {
     let mut f = File::open(path).await?;
     let size = f.metadata().await?.len();
-    let name = file_name(path);
     let mut s = TcpStream::connect(to).await?;
     s.set_nodelay(true)?;
     write_header(&mut s, &Header { kind: Kind::File, name, size }).await?;
@@ -114,6 +113,25 @@ pub async fn send_file(to: SocketAddr, path: &Path, id: u64, mut progress: impl 
 
 pub fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into())
+}
+
+/// Files to send for dropped `paths`: folders recursively, each named relative to the drop
+/// ("Photos/2024/a.jpg") so the receiver rebuilds the tree. Symlinks are skipped (no loops).
+pub fn expand(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, String)> = paths.iter().map(|p| (p.clone(), file_name(p))).collect();
+    while let Some((p, name)) = stack.pop() {
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() => {
+                for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+                    stack.push((e.path(), format!("{name}/{}", e.file_name().to_string_lossy())));
+                }
+            }
+            Ok(m) if m.is_file() => out.push((p, name)),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub async fn send_text(to: SocketAddr, kind: Kind, text: &str) -> io::Result<()> {
@@ -200,9 +218,11 @@ async fn receive(mut s: TcpStream, dir: &Path, on_event: &(impl Fn(TransferEvent
     Ok(())
 }
 
-/// Keep only the last path component (no `..`, no absolute paths) and never overwrite.
+/// Keep a relative path ("Photos/a.jpg") but nothing that climbs out of `dir`, and never overwrite.
 async fn create_unique(dir: &Path, name: &str) -> io::Result<(PathBuf, File)> {
-    let base = Path::new(name).file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty()).unwrap_or("file");
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != "." && *p != ".." && !p.contains(':')).collect();
+    let (base, folders) = parts.split_last().map(|(b, f)| (*b, f)).unwrap_or(("file", &[]));
+    let dir = &folders.iter().fold(dir.to_path_buf(), |d, p| d.join(p));
     let (stem, ext) = match base.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
         _ => (base, String::new()),
@@ -239,17 +259,19 @@ mod tests {
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
 
         let mut last = 0;
-        send_file(to, &src, next_id(), |d, _| last = d).await.unwrap();
-        send_file(to, &src, next_id(), |_, _| {}).await.unwrap();
+        send_file(to, &src, file_name(&src), next_id(), |d, _| last = d).await.unwrap();
+        send_file(to, &src, file_name(&src), next_id(), |_, _| {}).await.unwrap();
         // a cancelled send stops and the receiver deletes its partial copy
         let id = next_id();
         cancel(id);
-        assert!(send_file(to, &src, id, |_, _| {}).await.is_err());
+        assert!(send_file(to, &src, file_name(&src), id, |_, _| {}).await.is_err());
         // hostile name must stay inside `dir`
-        let mut s = TcpStream::connect(to).await.unwrap();
-        write_header(&mut s, &Header { kind: Kind::File, name: "../../evil.txt".into(), size: 2 }).await.unwrap();
-        s.write_all(b"hi").await.unwrap();
-        s.shutdown().await.unwrap();
+        for name in ["../../evil.txt", "C:/Photos/./../2024/a.jpg"] {
+            let mut s = TcpStream::connect(to).await.unwrap();
+            write_header(&mut s, &Header { kind: Kind::File, name: name.into(), size: 2 }).await.unwrap();
+            s.write_all(b"hi").await.unwrap();
+            s.shutdown().await.unwrap();
+        }
         send_text(to, Kind::Url, "https://loka.dev").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -259,9 +281,22 @@ mod tests {
         let (stem, _) = src_name.rsplit_once('.').unwrap();
         assert_eq!(std::fs::read(dir.join(format!("{stem} (1).bin"))).unwrap(), data);
         assert_eq!(std::fs::read(dir.join("evil.txt")).unwrap(), b"hi");
+        assert_eq!(std::fs::read(dir.join("Photos").join("2024").join("a.jpg")).unwrap(), b"hi"); // folder drops keep their tree
         assert!(!dir.join(format!("{stem} (2).bin")).exists());
         assert!(events.lock().unwrap().iter().any(|e| matches!(e, TransferEvent::Failed { outgoing: false, .. })));
         assert!(events.lock().unwrap().iter().any(|e| matches!(e, TransferEvent::Text { kind: Kind::Url, text } if text == "https://loka.dev")));
+
+        // a dropped folder expands to its files, named relative to the drop
+        let tree = std::env::temp_dir().join(format!("loka-tree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub").join("b.txt"), b"b").unwrap();
+        let mut names: Vec<String> = expand(&[tree.clone(), src.clone()]).into_iter().map(|(_, n)| n).collect();
+        names.sort();
+        let top = tree.file_name().unwrap().to_str().unwrap();
+        let mut want = vec![format!("{top}/sub/b.txt"), src_name.to_string()];
+        want.sort();
+        assert_eq!(names, want);
+        let _ = std::fs::remove_dir_all(&tree);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&src);
     }

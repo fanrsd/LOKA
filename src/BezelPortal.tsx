@@ -32,8 +32,9 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
     let lastEmit = 0;
     let flash = -1e9;
     let raf = 0;
-    // file transfer progress drawn along the edge; `end` starts the fade-out
+    // file transfer progress drawn along the edge, summed over files in flight; `end` starts the fade-out
     const xfer = { pct: 0, end: -1e9, active: false };
+    const files = new Map<number, [number, number]>();
 
     // crossing / drop / preview
     const splash = (y: number) => {
@@ -51,9 +52,14 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
         if (payload.kind === "drop") splash(payload.normalizedY);
       }),
       listen<{ active: boolean; y?: number }>("kvm", ({ payload }) => payload.active && splash(payload.y ?? cur.y)),
-      listen<{ type: string; done?: number; total?: number }>("transfer", ({ payload: e }) => {
-        if (e.type === "progress") Object.assign(xfer, { pct: e.total ? e.done! / e.total : 1, active: true });
-        else if (e.type !== "text" && xfer.active) Object.assign(xfer, { pct: e.type === "failed" ? xfer.pct : 1, active: false, end: performance.now() });
+      listen<{ type: string; id?: number; done?: number; total?: number }>("transfer", ({ payload: e }) => {
+        if (e.type === "text") return;
+        if (e.type === "progress") files.set(e.id!, [e.done!, e.total!]);
+        else if (files.delete(e.id!) && e.type !== "failed") Object.assign(xfer, { pct: 1 });
+        let done = 0, total = 0;
+        for (const [d, t] of files.values()) (done += d), (total += t);
+        if (files.size) Object.assign(xfer, { pct: total ? done / total : 1, active: true });
+        else if (xfer.active) Object.assign(xfer, { active: false, end: performance.now() });
       }),
       listen<Look>("look", ({ payload }) => {
         const opacityOnly = payload.color === look.color && payload.motion === look.motion;

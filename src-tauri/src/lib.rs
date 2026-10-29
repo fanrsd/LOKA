@@ -413,10 +413,16 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState) -> tauri::Result<()> 
         // only a paired Main may push payloads to us
         let allow = move |ip| state.lock().unwrap().paired_peer_at(ip, Role::Main).is_some();
         let r = transfer::serve(transfer::PORT, dir, allow, move |e| {
+            // one notification per burst, not one per file of a dropped folder
+            static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
             if let transfer::TransferEvent::File { path, .. } = &e {
-                use tauri_plugin_notification::NotificationExt;
-                let name = transfer::file_name(path);
-                let _ = h.notification().builder().title("LOKA").body(format!("{name} saved to Downloads/LOKA")).show();
+                let mut last = LAST.lock().unwrap();
+                if last.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3)) {
+                    use tauri_plugin_notification::NotificationExt;
+                    let name = transfer::file_name(path);
+                    let _ = h.notification().builder().title("LOKA").body(format!("{name} saved to Downloads/LOKA")).show();
+                }
+                *last = Some(std::time::Instant::now());
             }
             let _ = h.emit("transfer", e);
         })
@@ -498,15 +504,22 @@ fn setup_overlay(app: &mut tauri::App, state: AppState) -> tauri::Result<()> {
                 telemetry::send(&sock, tele, &drop).await;
             }
             let _ = h.emit_to(OVERLAY, "spatial", drop);
-            for path in paths {
-                let (id, name) = (transfer::next_id(), transfer::file_name(&path));
-                let r = transfer::send_file(to, &path, id, |done, total| {
-                    let _ = h.emit("transfer", transfer::TransferEvent::Progress { id, outgoing: true, name: name.clone(), done, total });
-                })
-                .await;
-                let _ = h.emit("transfer", match r {
-                    Ok(()) => transfer::TransferEvent::Sent { id },
-                    Err(e) => transfer::TransferEvent::Failed { id, outgoing: true, name, error: e.to_string() },
+            let files = tokio::task::spawn_blocking(move || transfer::expand(&paths)).await.unwrap_or_default();
+            // 4 at a time like LocalSend's parallel uploads: small files don't queue behind each other's handshakes
+            let slots = Arc::new(tokio::sync::Semaphore::new(4));
+            for (path, name) in files {
+                let (h, slot) = (h.clone(), slots.clone().acquire_owned().await.unwrap());
+                tauri::async_runtime::spawn(async move {
+                    let id = transfer::next_id();
+                    let r = transfer::send_file(to, &path, name.clone(), id, |done, total| {
+                        let _ = h.emit("transfer", transfer::TransferEvent::Progress { id, outgoing: true, name: name.clone(), done, total });
+                    })
+                    .await;
+                    std::mem::drop(slot); // `drop` is the packet above
+                    let _ = h.emit("transfer", match r {
+                        Ok(()) => transfer::TransferEvent::Sent { id },
+                        Err(e) => transfer::TransferEvent::Failed { id, outgoing: true, name, error: e.to_string() },
+                    });
                 });
             }
         });
