@@ -87,7 +87,8 @@
   .window img { width: 100%; height: 100%; object-fit: cover; object-position: top; display: block; }
 
   /* desk demo */
-  .desk { position: relative; margin-top: 48px; aspect-ratio: 1100 / 440; }
+  .desk { position: relative; margin-top: 48px; aspect-ratio: 1100 / 470; }
+  .desk > .screen { height: 79%; }
   .screen { position: absolute; top: 0; height: 84%; width: 48.5%; border-radius: 12px; background: var(--panel) radial-gradient(rgb(255 255 255 / .06) 1px, transparent 1px) 0 0 / 22px 22px; box-shadow: inset 0 0 0 1px var(--line), 0 0 0 5px #05060a, 0 0 0 6px var(--line); }
   .screen.a { left: 0; } .screen.b { right: 0; border-radius: 12px 12px 4px 4px; }
   .tag { position: absolute; top: 14px; left: 18px; font-size: clamp(8px, 1vw, 11px); letter-spacing: .06em; color: var(--faint); }
@@ -106,11 +107,30 @@
   .dock i { height: 66%; }
   .dock i:first-child { background: color-mix(in srgb, var(--accent), transparent 40%); }
   .portal { position: absolute; left: calc(48.5% - 9px); top: 21%; height: 42%; width: 6px; border-radius: 6px; background: color-mix(in srgb, var(--accent), white 70%);
-    box-shadow: 0 0 14px 3px var(--accent), 0 0 50px 10px color-mix(in srgb, var(--accent), transparent 55%); animation: glow 4s ease-in-out infinite; }
-  .oka { position: absolute; top: 25%; width: 10%; animation: cross 4s cubic-bezier(.65, 0, .35, 1) infinite; }
+    box-shadow: 0 0 14px 3px var(--accent), 0 0 50px 10px color-mix(in srgb, var(--accent), transparent 55%); animation: glow 10s ease-in-out infinite; }
+  .portal { top: 19%; height: 40%; }
+  /* one 10 s story: cursor crosses carrying a file, drops it, then the Windows keyboard types on the Mac */
+  .oka { position: absolute; top: 23%; width: 10%; z-index: 2; animation: cross 10s cubic-bezier(.65, 0, .35, 1) infinite; }
   .oka svg { display: block; width: 100%; filter: drop-shadow(0 6px 10px rgb(0 0 0 / .5)); }
-  @keyframes cross { 0%, 14% { left: 26%; } 48% { left: 41%; transform: scale(.92, 1.04); } 56% { left: 53%; transform: scale(1.06, .95); } 84%, 100% { left: 68%; transform: none; } }
-  @keyframes glow { 0%, 40%, 72%, 100% { width: 6px; } 54% { width: 12px; box-shadow: 0 0 26px 8px var(--accent), 0 0 90px 22px color-mix(in srgb, var(--accent), transparent 40%); } }
+  .chip { position: absolute; left: 62%; top: 66%; display: flex; align-items: center; gap: 4px; padding: 3px 7px; border-radius: 7px; background: #f4f6fb; color: #0b0d12; font: 600 clamp(7px, .85vw, 11px) var(--display); white-space: nowrap; animation: chip 10s infinite; }
+  .chip svg, .saved svg { width: 1.2em; height: 1.2em; fill: none; stroke: currentColor; stroke-width: 2; }
+  .saved { position: absolute; left: 66%; top: 20%; display: grid; justify-items: center; gap: 2px; color: var(--accent); font-size: clamp(7px, .85vw, 11px); opacity: 0; animation: saved 10s infinite; }
+  .saved svg { width: 2.6em; height: 2.6em; stroke-width: 1.4; }
+  .saved small { color: var(--muted); font-size: 1em; }
+  .note { text-align: left; position: absolute; left: 7%; top: 60%; width: 52%; padding: 1.4% 2.4%; border-radius: 8px; border: 1px solid var(--line); background: #0d0f14; font-size: clamp(7px, 1vw, 12px); color: var(--fg); opacity: 0; animation: note 10s infinite; }
+  .note b { display: block; font-weight: 400; color: var(--faint); font-size: .8em; }
+  .note span { display: inline-block; overflow: hidden; white-space: nowrap; vertical-align: bottom; width: 0; border-right: 2px solid var(--accent); animation: type 10s steps(24) infinite; }
+  .kb { position: absolute; left: 33%; bottom: 0; width: 14%; height: 9%; padding: .5%; border-radius: 6px; background: #1d2028; box-shadow: inset 0 1px 0 rgb(255 255 255 / .1); display: grid; grid-template-columns: repeat(10, 1fr); gap: 2px; }
+  .kb i { border-radius: 2px; background: #2b2f39; animation: key 10s infinite; }
+  .kb i:nth-child(3n) { animation-delay: .15s; } .kb i:nth-child(4n+1) { animation-delay: .3s; } .kb i:nth-child(5n+2) { animation-delay: .45s; }
+  .kb i.space { grid-column: 3 / 9; }
+  @keyframes cross { 0%, 8% { left: 26%; opacity: 1; } 22% { left: 41%; transform: scale(.92, 1.04); } 26% { left: 53%; transform: scale(1.06, .95); } 36%, 92% { left: 68%; transform: none; opacity: 1; } 95% { left: 68%; opacity: 0; } 97% { left: 26%; opacity: 0; } }
+  @keyframes glow { 0%, 18%, 34%, 100% { width: 6px; } 25% { width: 12px; box-shadow: 0 0 26px 8px var(--accent), 0 0 90px 22px color-mix(in srgb, var(--accent), transparent 40%); } }
+  @keyframes chip { 0%, 37% { opacity: 1; transform: none; } 41%, 100% { opacity: 0; transform: translateY(14px) scale(.6); } }
+  @keyframes saved { 0%, 39% { opacity: 0; transform: scale(.7); } 43%, 92% { opacity: 1; transform: none; } 95%, 100% { opacity: 0; } }
+  @keyframes note { 0%, 47% { opacity: 0; } 50%, 92% { opacity: 1; } 95%, 100% { opacity: 0; } }
+  @keyframes type { 0%, 52% { width: 0; } 80%, 100% { width: 24ch; } }
+  @keyframes key { 0%, 52%, 80%, 100% { background: #2b2f39; } 54%, 60%, 66%, 72% { background: var(--accent); } 57%, 63%, 69%, 75% { background: #2b2f39; } }
   .swatches { margin-top: 28px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .swatches span { font-size: 13px; color: var(--faint); margin-right: 6px; }
   .swatches button { width: 34px; height: 34px; border-radius: 50%; border: 0; background: var(--c); cursor: pointer; transition: transform .2s; }
@@ -218,14 +238,17 @@
       <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Drop files across screens</span><span lang="id">Lempar file antar layar</span></li>
     </ul>
 
-    <div class="desk" role="img" aria-label="Oka, a cursor with a face, crosses from a Windows PC through a glowing edge onto a Mac">
+    <div class="desk" role="img" aria-label="Oka, the cursor, crosses from a Windows PC through a glowing edge onto a Mac carrying a file, drops it there, then the Windows keyboard types on the Mac">
       <div class="screen a"><span class="tag">Windows · Main</span>
         <div class="taskbar"><svg viewBox="0 0 16 16"><path d="M0 0h7.5v7.5H0zM8.5 0H16v7.5H8.5zM0 8.5h7.5V16H0zM8.5 8.5H16V16H8.5z"/></svg><i></i><i></i><i></i></div></div>
       <div class="screen b"><div class="menubar"><svg viewBox="0 0 384 512"><path d="M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119.3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-11.4 69.5-34.3z"/></svg><span>LOKA</span><span>File</span><span>Edit</span></div>
         <span class="tag">macOS · Client</span>
+        <div class="saved"><svg viewBox="0 0 24 24"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5"/></svg>photo.png<small>Downloads/LOKA</small></div>
+        <div class="note"><b>Notes</b><span>typed on the PC keyboard</span></div>
         <div class="dock"><i></i><i></i><i></i><i></i><i></i></div></div>
+      <div class="kb"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="space"></i></div>
       <div class="portal"></div>
-      <div class="oka"><svg viewBox="0 0 100 100"><use href="#oka"/></svg></div>
+      <div class="oka"><svg viewBox="0 0 100 100"><use href="#oka"/></svg><span class="chip"><svg viewBox="0 0 24 24"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5"/></svg>photo.png</span></div>
     </div>
     <div class="swatches" role="group" aria-label="Glow colour">
       <span><span lang="en">Pick a glow:</span><span lang="id">Pilih warna glow:</span></span>
