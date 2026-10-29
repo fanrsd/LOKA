@@ -38,8 +38,9 @@ impl kvm::Sink for WindowSink {
     }
 }
 
+// async: building a window inside a sync command deadlocks WebView2 on Windows (blank, unclosable window)
 #[tauri::command]
-pub fn start_sim(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+pub async fn start_sim(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     start(&app, &state).map_err(|e| e.to_string())
 }
 
