@@ -5,6 +5,7 @@ import { About, useUpdate } from "./About";
 import { Calibrate } from "./Calibrate";
 import { Face, type Mood } from "./Face";
 import { PairPrompt, osLabel, quietButton, type Device, type Peer, type Role } from "./Pairing";
+import { Pointer } from "./Pointer";
 import { Transfers } from "./Transfers";
 
 const TARGET_KEY = "loka.target";
@@ -141,10 +142,16 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
   const [target, setTarget] = useState<string | null>(() => localStorage.getItem(TARGET_KEY));
   const [pairing, setPairing] = useState<Record<string, PairState>>({});
   const [kvm, setKvm] = useState<{ active: boolean; error?: string | null }>({ active: false });
+  const [locked, setLocked] = useState(false);
+  const mac = device.info.os === "macos";
 
   useEffect(() => {
     const un = listen<{ active: boolean; error?: string | null }>("kvm", (e) => setKvm(e.payload));
-    return () => void un.then((f) => f());
+    const unLock = listen<boolean>("lock", (e) => setLocked(e.payload));
+    return () => {
+      un.then((f) => f());
+      unLock.then((f) => f());
+    };
   }, []);
 
   const isPaired = (f: string) => device.paired.some((p) => p.fingerprint === f);
@@ -254,6 +261,7 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
       {selected && target && (
         <>
           <Calibrate target={target} />
+          <Pointer initial={device.cursor} mac={mac} />
           <div className="mt-4 flex justify-end">
             <button
               onClick={() => {
@@ -274,21 +282,25 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
         </button>
       </footer>
 
-      {/* status toast while input is on the other device, or why it couldn't move */}
-      {(kvm.active || kvm.error) && (
+      {/* status toast while input is on the other device, locked, or why it couldn't move */}
+      {(kvm.active || kvm.error || locked) && (
         <div
           role="status"
           className="fixed bottom-5 left-1/2 flex -translate-x-1/2 items-center gap-3 rounded-full bg-raised py-2 pl-2 pr-4 text-sm ring-1 ring-line"
           style={{ animation: "sheet-in 0.4s var(--ease-spring)" }}
         >
-          {kvm.active && selected ? <Face seed={selected.info.fingerprint} size={26} mood="happy" /> : <Face seed="error" size={26} mood="sad" />}
+          {kvm.active && selected ? <Face seed={selected.info.fingerprint} size={26} mood="happy" /> : <Face seed={kvm.error ? "error" : device.info.fingerprint} size={26} mood={kvm.error ? "sad" : "idle"} />}
           {kvm.active ? (
             <span>
-              Using {selected?.info.alias ?? "the other device"} ·{" "}
-              <kbd className="rounded-md bg-white/10 px-1.5 py-0.5 font-sans text-xs text-muted">Ctrl Alt Esc</kbd> to return
+              Using {selected?.info.alias ?? "the other device"}
+              {locked && " · locked"} · <kbd className="rounded-md bg-white/10 px-1.5 py-0.5 font-sans text-xs text-muted">{mac ? "⌃ ⌥ Esc" : "Ctrl Alt Esc"}</kbd> to return
             </span>
-          ) : (
+          ) : kvm.error ? (
             <span className="text-danger">Couldn't move over: {kvm.error}</span>
+          ) : (
+            <span>
+              Pointer locked here · <kbd className="rounded-md bg-white/10 px-1.5 py-0.5 font-sans text-xs text-muted">{mac ? "F14" : "Scroll Lock"}</kbd> to release
+            </span>
           )}
         </div>
       )}

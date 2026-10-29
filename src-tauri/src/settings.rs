@@ -13,6 +13,24 @@ pub struct PairedDevice {
     pub alias: String,
 }
 
+/// How this computer's mouse and keyboard behave on the devices it drives.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CursorPrefs {
+    /// pointer speed on the other device, × this computer's own
+    pub speed: f32,
+    /// how long the cursor must rest against the portal before it crosses (0 = at once)
+    pub edge_delay_ms: u32,
+    /// Ctrl here acts as ⌘ on a Mac (and ⌘ as Ctrl on a PC), so shortcuts keep working
+    pub swap_ctrl_cmd: bool,
+}
+
+impl Default for CursorPrefs {
+    fn default() -> Self {
+        Self { speed: 1.0, edge_delay_ms: 0, swap_ctrl_cmd: true }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
     /// Stable identity; pairings are remembered against it.
@@ -22,6 +40,8 @@ pub struct Settings {
     /// Addresses added by hand, for networks that drop discovery multicast.
     #[serde(default)]
     pub hosts: Vec<IpAddr>,
+    #[serde(default)]
+    pub cursor: CursorPrefs,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -33,7 +53,14 @@ impl Settings {
         let mut s = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
-            .unwrap_or_else(|| Settings { fingerprint: uuid::Uuid::new_v4().to_string(), role: None, paired: Vec::new(), hosts: Vec::new(), path: PathBuf::new() });
+            .unwrap_or_else(|| Settings {
+                fingerprint: uuid::Uuid::new_v4().to_string(),
+                role: None,
+                paired: Vec::new(),
+                hosts: Vec::new(),
+                cursor: CursorPrefs::default(),
+                path: PathBuf::new(),
+            });
         s.path = path;
         s.save();
         s

@@ -28,6 +28,9 @@ pub enum InputEvent {
     Key { scan: u16, down: bool },
 }
 
+/// Scroll Lock (set-1), the cursor-lock key as in Synergy; a Mac's F14 maps to it.
+pub const LOCK_SCAN: u16 = 0x46;
+
 /// What the local capture hook produced.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Captured {
@@ -63,6 +66,10 @@ pub trait SpatialPlatformEngine: Send + Sync {
     /// Give input back to the local machine and put the cursor at `warp_to`. Idempotent.
     fn stop_capture(&self, _warp_to: (f64, f64)) {}
     fn inject(&self, _event: Injected) {}
+    /// Cursor-lock key held right now on this machine's own keyboard: Scroll Lock (F14 on a Mac).
+    fn lock_key_down(&self) -> bool {
+        false
+    }
 }
 
 pub fn engine() -> Box<dyn SpatialPlatformEngine> {

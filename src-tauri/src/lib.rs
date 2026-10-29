@@ -10,7 +10,7 @@ use network::{
     transfer::{self, Kind},
 };
 use platform::{Edge, Injected, Portal, Rect, SpatialPlatformEngine};
-use settings::{PairedDevice, Settings};
+use settings::{CursorPrefs, PairedDevice, Settings};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -74,12 +74,21 @@ struct Device {
     /// this computer's LAN addresses, to type into another LOKA's "Add by IP"
     ips: Vec<std::net::Ipv4Addr>,
     hosts: Vec<IpAddr>,
+    cursor: CursorPrefs,
 }
 
 #[tauri::command]
 fn get_device(state: State<AppState>, me: State<watch::Sender<DeviceInfo>>) -> Device {
     let s = state.lock().unwrap();
-    Device { info: me.borrow().clone(), paired: s.settings.paired.clone(), ips: discovery::local_ipv4(), hosts: s.settings.hosts.clone() }
+    Device { info: me.borrow().clone(), paired: s.settings.paired.clone(), ips: discovery::local_ipv4(), hosts: s.settings.hosts.clone(), cursor: s.settings.cursor }
+}
+
+/// Applies from the next crossing on.
+#[tauri::command]
+fn set_cursor_prefs(state: State<AppState>, prefs: CursorPrefs) {
+    let mut s = state.lock().unwrap();
+    s.settings.cursor = prefs;
+    s.settings.save();
 }
 
 #[tauri::command]
@@ -331,6 +340,7 @@ pub fn run() {
             answer_pair,
             unpair,
             set_portal,
+            set_cursor_prefs,
             send_text,
             cancel_transfer,
             reveal,
@@ -614,30 +624,54 @@ async fn track(app: AppHandle, overlay: tauri::WebviewWindow, engine: Arc<dyn Sp
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (mut interactive, mut streaming) = (false, false);
     let remote = Arc::new(AtomicBool::new(false));
+    // cursor lock key edge, last lock state shown, since when the cursor rests on the portal edge
+    let (mut lock_key, mut shown_lock, mut resting) = (false, false, None::<std::time::Instant>);
     loop {
         tick.tick().await;
-        let portal = {
+        let (portal, prefs, peer_is_mac) = {
             let s = state.lock().unwrap();
-            match s.settings.role {
+            let portal = match s.settings.role {
                 Some(Role::Main) => s.portal,
                 Some(Role::Client) => s.session.map(|(_, band)| band),
                 None => None,
-            }
+            };
+            (portal, s.settings.cursor, s.target().is_some_and(|p| p.info.os == "macos"))
         };
         let Some(portal) = portal else { continue };
+        let driving = remote.load(Ordering::SeqCst);
+        if kvm_addr(&state).is_some() {
+            // at home the lock key is read here; while driving, the capture hook swallows it and Tune toggles
+            let down = engine.lock_key_down();
+            if down && !lock_key && !driving {
+                kvm::LOCKED.fetch_xor(true, Ordering::SeqCst);
+            }
+            lock_key = down;
+        }
+        let locked = kvm::LOCKED.load(Ordering::SeqCst);
+        if locked != shown_lock {
+            shown_lock = locked;
+            let _ = app.emit("lock", locked);
+        }
         let Some(c) = engine.cursor() else { continue };
-        if remote.load(Ordering::SeqCst) {
+        if driving {
             continue;
         }
         let sample = portal.sample(c.x, c.y);
-        // pushing against the portal edge (no drag) hands mouse & keyboard to the paired device
-        if let (Some((y, p)), false, Some(to)) = (sample, c.button_down, kvm_addr(&state)) {
-            if p >= 1.0 {
+        // resting against the portal edge (no drag, not locked) hands mouse & keyboard to the paired device
+        let at_edge = matches!(sample, Some((_, p)) if p >= 1.0) && !c.button_down && !locked;
+        if !at_edge {
+            resting = None;
+        }
+        if let (true, Some((y, _)), Some(to)) = (at_edge, sample, kvm_addr(&state)) {
+            let since = *resting.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= Duration::from_millis(prefs.edge_delay_ms.into()) {
+                resting = None;
                 remote.store(true, Ordering::SeqCst);
                 let (engine, remote, app) = (engine.clone(), remote.clone(), app.clone());
+                let tune = kvm::Tune::new(prefs.speed, prefs.swap_ctrl_cmd && peer_is_mac != cfg!(target_os = "macos"));
                 tauri::async_runtime::spawn(async move {
                     let _ = app.emit("kvm", serde_json::json!({ "active": true, "y": y }));
-                    let r = kvm::send_session(engine, to, portal, y).await;
+                    let r = kvm::send_session(engine, to, portal, y, tune).await;
                     let error = r.as_ref().err().map(|e| e.to_string());
                     let _ = app.emit("kvm", serde_json::json!({ "active": false, "error": error }));
                     if error.is_some() {
@@ -645,8 +679,8 @@ async fn track(app: AppHandle, overlay: tauri::WebviewWindow, engine: Arc<dyn Sp
                     }
                     remote.store(false, Ordering::SeqCst);
                 });
-                continue;
             }
+            continue;
         }
         // only a drag (button held) inside the portal may make the overlay catch input
         let hit = sample.filter(|_| c.button_down);

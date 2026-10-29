@@ -18,11 +18,12 @@ use windows_sys::Win32::{
             KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
             MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
             MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
-            VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_MENU,
+            VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_MENU, VK_SCROLL,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PeekMessageW,
-            PostThreadMessageW, SetCursorPos, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, UnhookWindowsHookEx, GWL_EXSTYLE,
+            CallNextHookEx, CreateCursor, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PeekMessageW,
+            PostThreadMessageW, SetCursorPos, SetSystemCursor, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, SystemParametersInfoW,
+            UnhookWindowsHookEx, GWL_EXSTYLE, SPI_SETCURSORS,
             HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SM_CXVIRTUALSCREEN,
             SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
             WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -49,6 +50,7 @@ pub struct WindowsEngine;
 
 impl SpatialPlatformEngine for WindowsEngine {
     fn prepare_overlay(&self, window: &WebviewWindow) -> tauri::Result<()> {
+        show_cursors(); // a crash while driving another computer would have left them blank
         self.set_click_through(window, true)
     }
 
@@ -97,6 +99,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                 return;
             }
             HOOK_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
+            hide_cursors(); // parked in the middle of this screen, it would only distract
             let _ = ready_tx.send(true);
             // Another app's LL hook installed after ours runs first and may not pass input on (seen with
             // input utilities running), so keys and moves leak to this machine. Watch for leaks and
@@ -153,6 +156,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                 SendInput(1, &input, size_of::<INPUT>() as i32);
             }
             SetCursorPos(warp_to.0 as i32, warp_to.1 as i32);
+            show_cursors();
         }
     }
 
@@ -216,6 +220,32 @@ impl SpatialPlatformEngine for WindowsEngine {
             }
             SendInput(1, &input, size_of::<INPUT>() as i32);
         }
+    }
+
+    fn lock_key_down(&self) -> bool {
+        unsafe { GetAsyncKeyState(VK_SCROLL as i32) < 0 }
+    }
+}
+
+/// Every system cursor (OCR_NORMAL … OCR_PERSON) swapped for a blank one.
+fn hide_cursors() {
+    const OCR: [u32; 16] = [32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650, 32651, 32671, 32672];
+    let (and, xor) = ([0xFFu8; 128], [0u8; 128]); // 32×32: AND 1 + XOR 0 = screen untouched
+    unsafe {
+        let module = GetModuleHandleW(null());
+        for id in OCR {
+            let blank = CreateCursor(module, 0, 0, 32, 32, and.as_ptr().cast(), xor.as_ptr().cast());
+            if !blank.is_null() {
+                SetSystemCursor(blank, id); // takes ownership of `blank`
+            }
+        }
+    }
+}
+
+/// The user's own cursors, reloaded from their settings.
+fn show_cursors() {
+    unsafe {
+        SystemParametersInfoW(SPI_SETCURSORS, 0, null_mut(), 0);
     }
 }
 

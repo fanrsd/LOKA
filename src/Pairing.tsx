@@ -7,7 +7,8 @@ export type Role = "main" | "client";
 export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string; role: Role | null };
 export type Peer = { info: DeviceInfo; addr: string };
 export type PairedDevice = { fingerprint: string; alias: string };
-export type Device = { info: DeviceInfo; paired: PairedDevice[]; ips: string[]; hosts: string[] };
+export type CursorPrefs = { speed: number; edgeDelayMs: number; swapCtrlCmd: boolean };
+export type Device = { info: DeviceInfo; paired: PairedDevice[]; ips: string[]; hosts: string[]; cursor: CursorPrefs };
 
 const OS_LABEL: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux", android: "Android", ios: "iOS", sim: "Simulator" };
 export const osLabel = (os: string) => OS_LABEL[os] ?? os;

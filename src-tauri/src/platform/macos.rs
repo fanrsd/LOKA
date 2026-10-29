@@ -4,7 +4,7 @@ use std::{
     ffi::c_void,
     ptr::{null, null_mut},
     sync::{
-        atomic::{AtomicPtr, Ordering},
+        atomic::{AtomicBool, AtomicPtr, Ordering},
         Mutex,
     },
 };
@@ -97,10 +97,17 @@ extern "C" {
     fn CGEventCreateKeyboardEvent(source: *const c_void, key: u16, down: bool) -> Ref;
     fn CGEventCreateScrollWheelEvent(source: *const c_void, units: u32, count: u32, wheel1: i32, ...) -> Ref;
     fn CGEventPost(tap: u32, event: Ref);
+    fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+    // private, as Synergy/Barrier use them: hiding the cursor otherwise needs LOKA to be the active app
+    fn _CGSDefaultConnection() -> i32;
+    fn CGSSetConnectionProperty(cid: i32, target: i32, key: *const c_void, value: *const c_void) -> i32;
 }
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRelease(cf: *const c_void);
+    fn CFStringCreateWithCString(alloc: *const c_void, s: *const std::ffi::c_char, encoding: u32) -> Ref;
     fn CFMachPortCreateRunLoopSource(alloc: *const c_void, port: Ref, order: isize) -> Ref;
     fn CFRunLoopGetCurrent() -> Ref;
     fn CFRunLoopAddSource(rl: Ref, source: Ref, mode: *const c_void);
@@ -153,6 +160,8 @@ const KEYMAP: &[(u16, u16)] = &[
     (0x52, 0x52), (0x4F, 0x53), (0x50, 0x54), (0x51, 0x55), (0x4B, 0x56), (0x4C, 0x57), (0x4D, 0x58),
     (0x47, 0x59), (0x48, 0x5B), (0x49, 0x5C), (0x53, 0x41), (0x37, 0x43), (0x4E, 0x45), (0x4A, 0x4E),
     (0xE035, 0x4B), (0xE01C, 0x4C), (0x45, 0x47),
+    // a Mac has no Scroll Lock: F14 is the cursor-lock key
+    (super::LOCK_SCAN, 0x6B),
 ];
 
 fn mac_key(scan: u16) -> Option<u16> {
@@ -178,6 +187,25 @@ struct Capture {
 static CAPTURE: Mutex<Option<Capture>> = Mutex::new(None);
 static TAP: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static RUN_LOOP: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+/// CGDisplayHide/ShowCursor are counted; keep them balanced.
+static HIDDEN: AtomicBool = AtomicBool::new(false);
+
+fn set_cursor_hidden(hide: bool) {
+    if HIDDEN.swap(hide, Ordering::SeqCst) == hide {
+        return;
+    }
+    unsafe {
+        if hide {
+            let key = CFStringCreateWithCString(null(), c"SetsCursorInBackground".as_ptr(), 0x0800_0100);
+            let cid = _CGSDefaultConnection();
+            CGSSetConnectionProperty(cid, cid, key, kCFBooleanTrue);
+            CFRelease(key);
+            CGDisplayHideCursor(CGMainDisplayID());
+        } else {
+            CGDisplayShowCursor(CGMainDisplayID());
+        }
+    }
+}
 
 /// Receiver-side state CoreGraphics does not track for synthetic events.
 struct Injection {
@@ -245,6 +273,7 @@ impl SpatialPlatformEngine for MacEngine {
             let s = main_scale();
             CGWarpMouseCursorPosition(CGPoint { x: park.0 / s, y: park.1 / s });
             CGAssociateMouseAndMouseCursorPosition(0); // freeze the cursor; deltas still arrive
+            set_cursor_hidden(true); // parked in the middle of this screen, it would only distract
             let _ = ready_tx.send(true);
             CFRunLoopRun();
             CGEventTapEnable(tap, false);
@@ -271,6 +300,7 @@ impl SpatialPlatformEngine for MacEngine {
             let s = main_scale();
             CGWarpMouseCursorPosition(CGPoint { x: warp_to.0 / s, y: warp_to.1 / s });
         }
+        set_cursor_hidden(false);
     }
 
     fn inject(&self, event: Injected) {
@@ -322,6 +352,10 @@ impl SpatialPlatformEngine for MacEngine {
             CGEventPost(HID_TAP, ev);
             CFRelease(ev);
         }
+    }
+
+    fn lock_key_down(&self) -> bool {
+        unsafe { CGEventSourceKeyState(COMBINED_SESSION_STATE, 0x6B) } // F14
     }
 }
 

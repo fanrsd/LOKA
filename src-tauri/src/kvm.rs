@@ -4,12 +4,15 @@
 //! Wire: fixed 9-byte frames `tag | payload (8 bytes, LE)`. A Clipboard frame is followed by `len` bytes
 //! of UTF-8: the clipboard travels with the cursor (Main → Client on Enter, Client → Main on Return).
 
-use crate::platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine};
+use crate::platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine, LOCK_SCAN};
 use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -49,6 +52,8 @@ pub enum Msg {
     Clipboard { len: u32 },
     /// Client → Main: session turned down, so the Main can say why instead of "closed".
     Refuse(Refusal),
+    /// Main → Client: cursor lock on/off; while on, the way back is not watched.
+    Lock { on: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,6 +119,7 @@ impl Msg {
                 put(1, &len.to_le_bytes());
             }
             Msg::Refuse(r) => put(0, &[11, r as u8]),
+            Msg::Lock { on } => put(0, &[12, on as u8]),
         }
         b
     }
@@ -147,6 +153,7 @@ impl Msg {
                 2 => Refusal::NoScreen,
                 _ => return None,
             }),
+            12 => Msg::Lock { on: b[1] != 0 },
             _ => return None,
         })
     }
@@ -181,6 +188,8 @@ pub struct Receiver {
     y: f64,
     buttons: u8,
     keys: Vec<u16>,
+    /// cursor lock: the way back is not watched
+    locked: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -195,7 +204,7 @@ impl Receiver {
     pub fn enter(area: Rect, sender_edge: Edge, y: f32) -> (Self, Injected) {
         let edge = sender_edge.opposite();
         let (x, y) = edge_point(area, edge, y as f64, ENTER_INSET);
-        (Self { area, edge, x, y, buttons: 0, keys: Vec::new() }, Injected::MoveTo { x, y })
+        (Self { area, edge, x, y, buttons: 0, keys: Vec::new(), locked: false }, Injected::MoveTo { x, y })
     }
 
     pub fn apply(&mut self, e: InputEvent) -> Applied {
@@ -211,8 +220,8 @@ impl Receiver {
                 };
                 self.x = nx.clamp(a.x, a.x + a.w - 1.0);
                 self.y = ny.clamp(a.y, a.y + a.h - 1.0);
-                // never hand back mid-drag: the button-up would land on the wrong machine
-                if crossed && self.buttons == 0 {
+                // never hand back mid-drag (the button-up would land on the wrong machine) or while locked
+                if crossed && self.buttons == 0 && !self.locked {
                     let along = match self.edge {
                         Edge::Left | Edge::Right => (self.y - a.y) / a.h,
                         Edge::Top | Edge::Bottom => (self.x - a.x) / a.w,
@@ -250,9 +259,63 @@ impl Receiver {
     }
 }
 
+/// Cursor lock (Scroll Lock / F14): the pointer stays on the device it is on. Set at home by the
+/// tracker, while driving by `send_session` from `Tune`; any session end clears it.
+pub static LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Sender-side shaping of captured input before it goes out.
+pub struct Tune {
+    speed: f32,
+    swap_ctrl_cmd: bool,
+    /// sub-pixel motion left over after scaling, so slow speeds still move
+    rest: (f32, f32),
+    locked: bool,
+}
+
+impl Tune {
+    /// A session never starts locked: the tracker does not cross while the lock is on.
+    pub fn new(speed: f32, swap_ctrl_cmd: bool) -> Self {
+        Self { speed: speed.clamp(0.25, 4.0), swap_ctrl_cmd, rest: (0.0, 0.0), locked: false }
+    }
+
+    /// The frame for `e`, if any: moves scaled, Ctrl↔⌘ swapped, the lock key toggling the lock.
+    pub fn shape(&mut self, e: InputEvent) -> Option<Msg> {
+        Some(match e {
+            InputEvent::Move { dx, dy } => {
+                let (fx, fy) = (dx as f32 * self.speed + self.rest.0, dy as f32 * self.speed + self.rest.1);
+                let (mx, my) = (fx.trunc(), fy.trunc());
+                self.rest = (fx - mx, fy - my);
+                if mx == 0.0 && my == 0.0 {
+                    return None;
+                }
+                Msg::Input(InputEvent::Move { dx: mx as i32, dy: my as i32 })
+            }
+            InputEvent::Key { scan: LOCK_SCAN, down } => {
+                if !down {
+                    return None;
+                }
+                self.locked = !self.locked;
+                Msg::Lock { on: self.locked }
+            }
+            InputEvent::Key { scan, down } if self.swap_ctrl_cmd => {
+                // Ctrl sits where ⌘ does in every shortcut; the Win key (⌘'s spot) takes Ctrl's place
+                let scan = match scan {
+                    0x1D => 0xE05B,
+                    0xE01D => 0xE05C,
+                    0xE05B => 0x1D,
+                    0xE05C => 0xE01D,
+                    s => s,
+                };
+                Msg::Input(InputEvent::Key { scan, down })
+            }
+            e => Msg::Input(e),
+        })
+    }
+}
+
 /// Sender side: capture local input and stream it until the peer returns control, Ctrl+Alt+Esc, or an error.
 /// Local input is always restored before returning.
-pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr, portal: Portal, y: f32) -> io::Result<()> {
+pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr, portal: Portal, y: f32, mut tune: Tune) -> io::Result<()> {
     let s = timeout(Duration::from_secs(2), TcpStream::connect(to)).await??;
     s.set_nodelay(true)?;
     let (mut rd, mut wr) = s.into_split();
@@ -290,23 +353,49 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
     });
     let mut back_y = y;
     let result: io::Result<()> = async {
+        // an event read past a run of moves, handled next turn
+        let mut held: Option<Captured> = None;
         loop {
-            tokio::select! {
-                c = rx.recv() => match c {
-                    Some(Captured::Input(e)) => timeout(WRITE_TIMEOUT, wr.write_all(&Msg::Input(e).encode())).await??,
-                    Some(Captured::Escape) | None => {
-                        let _ = timeout(WRITE_TIMEOUT, wr.write_all(&Msg::Leave.encode())).await;
+            let c = match held.take() {
+                Some(c) => Some(c),
+                None => tokio::select! {
+                    c = rx.recv() => c,
+                    r = &mut returned => {
+                        back_y = r.unwrap_or_else(|_| Err(closed()))?;
                         return Ok(());
                     }
                 },
-                r = &mut returned => {
-                    back_y = r.unwrap_or_else(|_| Err(closed()))?;
+            };
+            let e = match c {
+                Some(Captured::Input(InputEvent::Move { mut dx, mut dy })) => {
+                    // moves that piled up while a write was slow go as one: the pointer never replays old motion
+                    while let Ok(next) = rx.try_recv() {
+                        match next {
+                            Captured::Input(InputEvent::Move { dx: x, dy: y }) => (dx, dy) = (dx.saturating_add(x), dy.saturating_add(y)),
+                            other => {
+                                held = Some(other);
+                                break;
+                            }
+                        }
+                    }
+                    InputEvent::Move { dx, dy }
+                }
+                Some(Captured::Input(e)) => e,
+                Some(Captured::Escape) | None => {
+                    let _ = timeout(WRITE_TIMEOUT, wr.write_all(&Msg::Leave.encode())).await;
                     return Ok(());
                 }
+            };
+            if let Some(msg) = tune.shape(e) {
+                if let Msg::Lock { on } = msg {
+                    LOCKED.store(on, Ordering::SeqCst);
+                }
+                timeout(WRITE_TIMEOUT, wr.write_all(&msg.encode())).await??;
             }
         }
     }
     .await;
+    LOCKED.store(false, Ordering::SeqCst);
     returned.abort();
     engine.stop_capture(portal.point(back_y, RETURN_INSET));
     result
@@ -407,6 +496,7 @@ async fn session(mut s: TcpStream, sink: &mut impl Sink, edge: Edge, y: f32) -> 
                 Err(e) => break Err(e),
             },
             Ok(Msg::Leave) => break Ok(()),
+            Ok(Msg::Lock { on }) => rcv.locked = on,
             Ok(_) => {}
             Err(e) => break Err(e),
         }
@@ -435,6 +525,7 @@ mod tests {
             Msg::Return { y: 1.0 },
             Msg::Leave,
             Msg::Refuse(Refusal::NoScreen),
+            Msg::Lock { on: true },
             Msg::PairRequest,
             Msg::PairResponse { accepted: true },
             Msg::Clipboard { len: MAX_CLIPBOARD },
@@ -478,6 +569,38 @@ mod tests {
                 Injected::Button { button: 1, down: false },
             ]
         );
+    }
+
+    #[test]
+    fn locked_receiver_keeps_the_cursor_until_unlocked() {
+        let (mut r, _) = Receiver::enter(AREA, Edge::Right, 0.5);
+        r.locked = true;
+        assert_eq!(r.apply(InputEvent::Move { dx: -50, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 0.0, y: 250.0 }));
+        r.locked = false;
+        assert_eq!(r.apply(InputEvent::Move { dx: -1, dy: 0 }), Applied::Return(0.5));
+    }
+
+    #[test]
+    fn tune_scales_without_losing_slow_motion() {
+        let mut t = Tune::new(0.5, false);
+        assert_eq!(t.shape(InputEvent::Move { dx: 1, dy: -1 }), None, "half a pixel is kept, not sent");
+        assert_eq!(t.shape(InputEvent::Move { dx: 1, dy: -1 }), Some(Msg::Input(InputEvent::Move { dx: 1, dy: -1 })));
+        let mut fast = Tune::new(1.5, false);
+        assert_eq!(fast.shape(InputEvent::Move { dx: 3, dy: 0 }), Some(Msg::Input(InputEvent::Move { dx: 4, dy: 0 })));
+        assert_eq!(fast.shape(InputEvent::Move { dx: 1, dy: 0 }), Some(Msg::Input(InputEvent::Move { dx: 2, dy: 0 })));
+    }
+
+    #[test]
+    fn tune_swaps_ctrl_and_cmd_and_toggles_the_lock() {
+        let key = |scan, down| InputEvent::Key { scan, down };
+        let mut t = Tune::new(1.0, true);
+        assert_eq!(t.shape(key(0x1D, true)), Some(Msg::Input(key(0xE05B, true))), "Ctrl+C on the PC is ⌘C on the Mac");
+        assert_eq!(t.shape(key(0xE05C, false)), Some(Msg::Input(key(0xE01D, false))));
+        assert_eq!(t.shape(key(0x2E, true)), Some(Msg::Input(key(0x2E, true))));
+        assert_eq!(t.shape(key(LOCK_SCAN, true)), Some(Msg::Lock { on: true }));
+        assert_eq!(t.shape(key(LOCK_SCAN, false)), None, "the lock key itself never reaches the other device");
+        assert_eq!(t.shape(key(LOCK_SCAN, true)), Some(Msg::Lock { on: false }));
+        assert_eq!(Tune::new(1.0, false).shape(key(0x1D, true)), Some(Msg::Input(key(0x1D, true))));
     }
 
     struct Recorder(Arc<Mutex<Vec<Injected>>>);
@@ -578,7 +701,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
-        let e = send_session(engine.clone(), ([127, 0, 0, 1], port).into(), portal, 0.5).await.unwrap_err();
+        let e = send_session(engine.clone(), ([127, 0, 0, 1], port).into(), portal, 0.5, Tune::new(1.0, false)).await.unwrap_err();
         assert_eq!(e.to_string(), Refusal::NotClient.text());
         assert_eq!(*engine.warped.lock().unwrap(), Some(portal.point(0.5, RETURN_INSET)));
     }
