@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { BezelPortal } from "./BezelPortal";
-import { loadCalibration, opposite } from "./calibration";
+import { opposite, useEdge } from "./calibration";
 import { Face } from "./Face";
 import { PairPrompt } from "./Pairing";
 import type { TransferEvent } from "./Transfers";
@@ -44,7 +44,7 @@ export function PhoneView() {
   const [progress, setProgress] = useState<{ name: string; pct: number } | null>(null);
   const [items, setItems] = useState<string[]>([]);
   // the phone's glowing edge faces the monitor edge it is calibrated against
-  const side = opposite[loadCalibration().edge];
+  const side = opposite[useEdge()];
 
   useEffect(() => {
     const un = listen<TransferEvent>("transfer", ({ payload: e }) => {

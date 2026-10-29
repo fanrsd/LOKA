@@ -224,6 +224,7 @@ fn set_portal(app: AppHandle, state: State<AppState>, portal: Portal, target: Op
         s.portal = Some(portal);
         s.target = target;
     }
+    let _ = app.emit("portal", portal.edge); // overlay + simulated phone redraw for a new edge
     sim::place(&app, &portal).map_err(|e| e.to_string())?;
     if let Some(w) = app.get_webview_window(OVERLAY) {
         let b = portal.hit_box();

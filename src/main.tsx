@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { BezelPortal } from "./BezelPortal";
 import { Home } from "./Home";
 import { PhoneView } from "./PhoneView";
-import { loadCalibration } from "./calibration";
+import { useEdge } from "./calibration";
 import { type Look, applyAccent, loadLook } from "./look";
 import { listen } from "@tauri-apps/api/event";
 import "./index.css";
@@ -24,8 +24,12 @@ if (!import.meta.env.DEV) {
   });
 }
 
+function Overlay() {
+  return <BezelPortal side={useEdge()} event="spatial" />;
+}
+
 function App() {
-  if (label === "edge-overlay") return <BezelPortal side={loadCalibration().edge} event="spatial" />;
+  if (label === "edge-overlay") return <Overlay />;
   if (label === "mobile-view" || isPhone) return <PhoneView />;
   return <Home />;
 }
