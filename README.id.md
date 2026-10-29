@@ -18,7 +18,7 @@ Dorong kursor melewati tepi layar yang menyala, dan kursor langsung pindah ke pe
 - **Berbagi mouse dan keyboard.** Satu komputer menjadi **Main**: mouse dan keyboard-nya mengendalikan perangkat lain. Setiap perangkat di sekitarnya menjalankan LOKA sebagai **Client**.
 - **Bezel Portal.** Tandai bagian tepi layar tempat perangkat lain berada di mejamu. Dorong kursor ke garis yang menyala itu, dan kursor pindah ke sana. Dorong keluar dari sisi seberang perangkat itu untuk kembali. **Ctrl+Alt+Esc** selalu mengembalikannya.
 - **Keyboard ikut kursor.** Ketikan selalu masuk ke perangkat tempat kursor berada.
-- **Lempar file ke tepi layar.** Seret file ke garis yang menyala lalu lepaskan. File masuk ke `Downloads/LOKA` di perangkat pasangan. File lama tidak pernah ditimpa.
+- **Lempar file ke tepi layar.** Seret file ke garis yang menyala lalu lepaskan. File masuk ke `Downloads/LOKA` di perangkat pasangan. File lama tidak pernah ditimpa. Garis yang menyala terisi seiring file berjalan, dan kedua komputer menampilkan progres, kecepatan, serta sisa waktunya. Transfer bisa dibatalkan, foldernya bisa langsung dibuka saat file tiba, dan ada notifikasi sistem ketika file masuk.
 - **Pairing ala LocalSend.** Perangkat di jaringan yang sama saling menemukan. Klik salah satunya, lalu konfirmasi di perangkat itu.
 - **Sesuaikan sendiri.** Pilih warna glow (sekaligus jadi warna aksen aplikasi), seberapa transparan glow-nya, dan animasi saat menyeberang: Ripple, Pulse, atau Calm.
 - **Tinggal di tray.** Menutup jendela tidak menghentikan LOKA; berbagi tetap jalan di latar belakang. Klik ikon di tray untuk membukanya lagi, atau pilih **Quit LOKA** di sana untuk berhenti.

@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Calibrate } from "./Calibrate";
 import { Face, type Mood } from "./Face";
 import { PairPrompt, osLabel, quietButton, type Device, type Peer, type Role } from "./Pairing";
+import { Transfers } from "./Transfers";
 
 const TARGET_KEY = "loka.target";
 
@@ -45,6 +46,7 @@ export function Home() {
         <RoleSwitch role={role!} onChange={setRole} />
       </header>
       {role === "main" ? <MainHome device={device} peers={peers} /> : <ClientHome device={device} peers={peers} />}
+      <Transfers />
     </main>
   );
 }

@@ -176,6 +176,23 @@ async fn send_text(state: State<'_, AppState>, kind: Kind, text: String) -> Resu
     transfer::send_text(to, kind, &text).await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn cancel_transfer(id: u64) {
+    transfer::cancel(id);
+}
+
+/// Open the file manager with `path` selected.
+#[tauri::command]
+fn reveal(path: std::path::PathBuf) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer").arg("/select,").arg(&path).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(&path)).spawn();
+    r.map(drop).map_err(|e| e.to_string())
+}
+
 fn transfer_addr(state: &AppState) -> Option<SocketAddr> {
     state.lock().unwrap().target().map(|p| SocketAddr::new(p.addr, p.info.transfer_port))
 }
@@ -207,6 +224,7 @@ impl kvm::Sink for EngineSink {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             get_device,
             set_role,
@@ -216,6 +234,8 @@ pub fn run() {
             unpair,
             set_portal,
             send_text,
+            cancel_transfer,
+            reveal,
             sim::start_sim
         ])
         // closing the window keeps LOKA sharing from the tray; "Quit LOKA" there ends it
@@ -308,6 +328,11 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState) -> tauri::Result<()> 
         // only a paired Main may push payloads to us
         let allow = move |ip| state.lock().unwrap().paired_peer_at(ip, Role::Main).is_some();
         let r = transfer::serve(transfer::PORT, dir, allow, move |e| {
+            if let transfer::TransferEvent::File { path, .. } = &e {
+                use tauri_plugin_notification::NotificationExt;
+                let name = transfer::file_name(path);
+                let _ = h.notification().builder().title("LOKA").body(format!("{name} saved to Downloads/LOKA")).show();
+            }
             let _ = h.emit("transfer", e);
         })
         .await;
@@ -384,14 +409,15 @@ fn setup_overlay(app: &mut tauri::App, state: AppState) -> tauri::Result<()> {
             }
             let _ = h.emit_to(OVERLAY, "spatial", drop);
             for path in paths {
-                let name = path.display().to_string();
-                let r = transfer::send_file(to, &path, |done, total| {
-                    let _ = h.emit("transfer", transfer::TransferEvent::Progress { name: name.clone(), done, total });
+                let (id, name) = (transfer::next_id(), transfer::file_name(&path));
+                let r = transfer::send_file(to, &path, id, |done, total| {
+                    let _ = h.emit("transfer", transfer::TransferEvent::Progress { id, outgoing: true, name: name.clone(), done, total });
                 })
                 .await;
-                if let Err(e) = r {
-                    eprintln!("sending {name} failed: {e}");
-                }
+                let _ = h.emit("transfer", match r {
+                    Ok(()) => transfer::TransferEvent::Sent { id },
+                    Err(e) => transfer::TransferEvent::Failed { id, outgoing: true, name, error: e.to_string() },
+                });
             }
         });
     });

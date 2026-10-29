@@ -4,11 +4,7 @@ import { BezelPortal } from "./BezelPortal";
 import { loadCalibration, opposite } from "./calibration";
 import { Face } from "./Face";
 import { PairPrompt } from "./Pairing";
-
-type TransferEvent =
-  | { type: "progress"; name: string; done: number; total: number }
-  | { type: "file"; path: string }
-  | { type: "text"; kind: "text" | "url"; text: string };
+import type { TransferEvent } from "./Transfers";
 
 type Injected =
   | { type: "moveTo"; x: number; y: number }
@@ -52,11 +48,13 @@ export function PhoneView() {
 
   useEffect(() => {
     const un = listen<TransferEvent>("transfer", ({ payload: e }) => {
-      if (e.type === "progress") setProgress({ name: e.name, pct: e.total ? e.done / e.total : 1 });
-      else {
+      // the simulator shares this process with Main, so skip the sending half
+      if (e.type === "progress") {
+        if (!e.outgoing) setProgress({ name: e.name, pct: e.total ? e.done / e.total : 1 });
+      } else if (e.type === "file" || e.type === "text") {
         setProgress(null);
         setItems((xs) => [e.type === "file" ? e.path : e.text, ...xs].slice(0, 20));
-      }
+      } else if (e.type === "failed" && !e.outgoing) setProgress(null);
     });
     return () => void un.then((f) => f());
   }, []);

@@ -3,10 +3,15 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -37,9 +42,43 @@ pub struct Header {
 #[derive(Serialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TransferEvent {
-    Progress { name: String, done: u64, total: u64 },
-    File { path: PathBuf },
+    Progress { id: u64, outgoing: bool, name: String, done: u64, total: u64 },
+    /// received and saved
+    File { id: u64, path: PathBuf },
+    Sent { id: u64 },
+    Failed { id: u64, outgoing: bool, name: String, error: String },
     Text { kind: Kind, text: String },
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static CANCELLED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+pub fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Stops transfer `id` at its next chunk; the peer sees the connection close.
+pub fn cancel(id: u64) {
+    CANCELLED.lock().unwrap().get_or_insert_with(HashSet::new).insert(id);
+}
+
+fn take_cancel(id: u64) -> io::Result<()> {
+    match CANCELLED.lock().unwrap().as_mut().is_some_and(|s| s.remove(&id)) {
+        true => Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+        false => Ok(()),
+    }
+}
+
+/// Progress at most every 100 ms (plus the final chunk) so a 4 GB file doesn't flood the UI.
+struct Throttle(Option<Instant>);
+impl Throttle {
+    fn due(&mut self, done: u64, total: u64) -> bool {
+        let due = done == total || self.0.is_none_or(|t| t.elapsed() >= Duration::from_millis(100));
+        if due {
+            self.0 = Some(Instant::now());
+        }
+        due
+    }
 }
 
 async fn write_header(s: &mut TcpStream, h: &Header) -> io::Result<()> {
@@ -48,25 +87,33 @@ async fn write_header(s: &mut TcpStream, h: &Header) -> io::Result<()> {
     s.write_all(&json).await
 }
 
-pub async fn send_file(to: SocketAddr, path: &Path, mut progress: impl FnMut(u64, u64)) -> io::Result<()> {
+pub async fn send_file(to: SocketAddr, path: &Path, id: u64, mut progress: impl FnMut(u64, u64)) -> io::Result<()> {
     let mut f = File::open(path).await?;
     let size = f.metadata().await?.len();
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let name = file_name(path);
     let mut s = TcpStream::connect(to).await?;
     s.set_nodelay(true)?;
     write_header(&mut s, &Header { kind: Kind::File, name, size }).await?;
     let mut buf = vec![0u8; CHUNK];
-    let mut done = 0;
+    let (mut done, mut tick) = (0, Throttle(None));
+    progress(0, size);
     while done < size {
+        take_cancel(id)?;
         let n = f.read(&mut buf).await?;
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file shrank while sending"));
         }
         s.write_all(&buf[..n]).await?;
         done += n as u64;
-        progress(done, size);
+        if tick.due(done, size) {
+            progress(done, size);
+        }
     }
     s.shutdown().await
+}
+
+pub fn file_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into())
 }
 
 pub async fn send_text(to: SocketAddr, kind: Kind, text: &str) -> io::Result<()> {
@@ -119,23 +166,37 @@ async fn receive(mut s: TcpStream, dir: &Path, on_event: &(impl Fn(TransferEvent
         return Ok(());
     }
 
+    let id = next_id();
     let (path, mut f) = create_unique(dir, &h.name).await?;
-    let mut buf = vec![0u8; CHUNK];
-    let mut done = 0;
-    while done < h.size {
-        let want = CHUNK.min((h.size - done) as usize);
-        let n = s.read(&mut buf[..want]).await?;
-        if n == 0 {
+    let r = async {
+        let mut buf = vec![0u8; CHUNK];
+        let (mut done, mut tick) = (0, Throttle(None));
+        on_event(TransferEvent::Progress { id, outgoing: false, name: h.name.clone(), done, total: h.size });
+        while done < h.size {
+            take_cancel(id)?;
+            let want = CHUNK.min((h.size - done) as usize);
+            let n = s.read(&mut buf[..want]).await?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the sender stopped"));
+            }
+            f.write_all(&buf[..n]).await?;
+            done += n as u64;
+            if tick.due(done, h.size) {
+                on_event(TransferEvent::Progress { id, outgoing: false, name: h.name.clone(), done, total: h.size });
+            }
+        }
+        f.flush().await
+    }
+    .await;
+    match r {
+        Ok(()) => on_event(TransferEvent::File { id, path }),
+        Err(e) => {
             drop(f);
             let _ = tokio::fs::remove_file(&path).await; // don't leave a truncated file behind
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "sender closed early"));
+            on_event(TransferEvent::Failed { id, outgoing: false, name: h.name, error: e.to_string() });
+            return Err(e);
         }
-        f.write_all(&buf[..n]).await?;
-        done += n as u64;
-        on_event(TransferEvent::Progress { name: h.name.clone(), done, total: h.size });
     }
-    f.flush().await?;
-    on_event(TransferEvent::File { path });
     Ok(())
 }
 
@@ -178,8 +239,12 @@ mod tests {
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
 
         let mut last = 0;
-        send_file(to, &src, |d, _| last = d).await.unwrap();
-        send_file(to, &src, |_, _| {}).await.unwrap();
+        send_file(to, &src, next_id(), |d, _| last = d).await.unwrap();
+        send_file(to, &src, next_id(), |_, _| {}).await.unwrap();
+        // a cancelled send stops and the receiver deletes its partial copy
+        let id = next_id();
+        cancel(id);
+        assert!(send_file(to, &src, id, |_, _| {}).await.is_err());
         // hostile name must stay inside `dir`
         let mut s = TcpStream::connect(to).await.unwrap();
         write_header(&mut s, &Header { kind: Kind::File, name: "../../evil.txt".into(), size: 2 }).await.unwrap();
@@ -194,6 +259,8 @@ mod tests {
         let (stem, _) = src_name.rsplit_once('.').unwrap();
         assert_eq!(std::fs::read(dir.join(format!("{stem} (1).bin"))).unwrap(), data);
         assert_eq!(std::fs::read(dir.join("evil.txt")).unwrap(), b"hi");
+        assert!(!dir.join(format!("{stem} (2).bin")).exists());
+        assert!(events.lock().unwrap().iter().any(|e| matches!(e, TransferEvent::Failed { outgoing: false, .. })));
         assert!(events.lock().unwrap().iter().any(|e| matches!(e, TransferEvent::Text { kind: Kind::Url, text } if text == "https://loka.dev")));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&src);

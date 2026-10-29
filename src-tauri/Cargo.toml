@@ -1,6 +1,6 @@
 [package]
 name = "loka"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/fanrsd/LOKA"
@@ -19,6 +19,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["net", "time", "fs", "io-util", "macros", "rt", "sync"] }
 socket2 = "0.6"
 uuid = { version = "1", features = ["v4"] }
+tauri-plugin-notification = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Threading"] }

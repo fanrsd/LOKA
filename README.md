@@ -18,7 +18,7 @@ Push the cursor through a glowing edge of your screen and it lands on the device
 - **Shared mouse & keyboard.** One computer is the **Main**: its mouse and keyboard drive the others. Each device nearby runs LOKA as a **Client**.
 - **The Bezel Portal.** You mark the stretch of your screen edge where the other device physically sits. Push the cursor into that glowing segment and it moves over. Push it out the far side of that device and it comes home. **Ctrl+Alt+Esc** always brings it back.
 - **The keyboard follows the cursor.** Whatever you type goes to the device the cursor is on.
-- **Drop files on the edge.** Drag a file to the glowing edge and let go. It arrives in `Downloads/LOKA` on the paired device. Existing files are never overwritten.
+- **Drop files on the edge.** Drag a file to the glowing edge and let go. It arrives in `Downloads/LOKA` on the paired device. Existing files are never overwritten. The glow fills up as the file travels, and both computers show its progress, speed and time left. You can cancel it, open the folder when it lands, and get a system notification on arrival.
 - **LocalSend-style pairing.** Devices on the same network find each other. Click one, then confirm on the other device.
 - **Make it yours.** Pick the glow colour, which also becomes the app's accent, how see-through the glow is, and the crossing animation: Ripple, Pulse or Calm.
 - **Lives in the tray.** Closing the window keeps LOKA sharing in the background. Click the tray icon to open it again, or choose **Quit LOKA** there to stop it.

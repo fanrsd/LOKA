@@ -32,6 +32,8 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
     let lastEmit = 0;
     let flash = -1e9;
     let raf = 0;
+    // file transfer progress drawn along the edge; `end` starts the fade-out
+    const xfer = { pct: 0, end: -1e9, active: false };
 
     // crossing / drop / preview
     const splash = (y: number) => {
@@ -49,6 +51,10 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
         if (payload.kind === "drop") splash(payload.normalizedY);
       }),
       listen<{ active: boolean; y?: number }>("kvm", ({ payload }) => payload.active && splash(payload.y ?? cur.y)),
+      listen<{ type: string; done?: number; total?: number }>("transfer", ({ payload: e }) => {
+        if (e.type === "progress") Object.assign(xfer, { pct: e.total ? e.done! / e.total : 1, active: true });
+        else if (e.type !== "text" && xfer.active) Object.assign(xfer, { pct: e.type === "failed" ? xfer.pct : 1, active: false, end: performance.now() });
+      }),
       listen<Look>("look", ({ payload }) => {
         const opacityOnly = payload.color === look.color && payload.motion === look.motion;
         look = payload;
@@ -127,6 +133,22 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
       }
       ctx.globalAlpha = 1;
       ctx.shadowBlur = 0;
+
+      const xAlpha = xfer.active ? 1 : Math.max(0, 1 - (now - xfer.end) / 900);
+      if (xAlpha > 0) {
+        ctx.beginPath();
+        const [x0, y0] = at(0, 3), [x1, y1] = at(xfer.pct * L, 3);
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.strokeStyle = core(look.color);
+        ctx.shadowColor = look.color;
+        ctx.shadowBlur = 16;
+        ctx.lineWidth = 4;
+        ctx.globalAlpha = xAlpha;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.shadowBlur = 0;
+      }
       ctx.globalCompositeOperation = "source-over";
       raf = requestAnimationFrame(frame);
     };
