@@ -81,10 +81,20 @@ pub fn engine() -> Box<dyn SpatialPlatformEngine> {
     Box::new(NoopEngine)
 }
 
-/// Plain-text clipboard. `None` when empty, not text, or held by another app.
+/// A password manager marked what's on the clipboard as secret: it never leaves this computer.
+pub fn clipboard_concealed() -> bool {
+    #[cfg(target_os = "windows")]
+    return windows::clipboard_concealed();
+    #[cfg(target_os = "macos")]
+    return macos::clipboard_concealed();
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Plain-text clipboard. `None` when empty, not text, secret, or held by another app.
 pub fn clipboard_text() -> Option<String> {
     #[cfg(desktop)]
-    return arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok().filter(|t| !t.is_empty());
+    return arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok().filter(|t| !t.is_empty() && !clipboard_concealed());
     #[allow(unreachable_code)]
     None
 }
@@ -96,6 +106,37 @@ pub fn set_clipboard_text(text: &str) {
         if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             eprintln!("clipboard: {e}");
         }
+    }
+}
+
+/// Picture on the clipboard: `(width, height, RGBA)`.
+pub fn clipboard_image() -> Option<(usize, usize, Vec<u8>)> {
+    #[cfg(desktop)]
+    return arboard::Clipboard::new().and_then(|mut c| c.get_image()).ok().map(|i| (i.width, i.height, i.bytes.into_owned()));
+    #[allow(unreachable_code)]
+    None
+}
+
+pub fn set_clipboard_image(width: usize, height: usize, rgba: Vec<u8>) {
+    #[cfg(desktop)]
+    if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_image(arboard::ImageData { width, height, bytes: rgba.into() })) {
+        eprintln!("clipboard image: {e}");
+    }
+}
+
+/// Files and folders copied in Explorer/Finder; empty when there are none.
+pub fn clipboard_files() -> Vec<std::path::PathBuf> {
+    #[cfg(desktop)]
+    return arboard::Clipboard::new().and_then(|mut c| c.get().file_list()).unwrap_or_default();
+    #[allow(unreachable_code)]
+    Vec::new()
+}
+
+/// Put `paths` on the clipboard as copied files, ready to paste in Explorer/Finder or an app.
+pub fn set_clipboard_files(paths: &[std::path::PathBuf]) {
+    #[cfg(desktop)]
+    if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set().file_list(paths)) {
+        eprintln!("clipboard files: {e}");
     }
 }
 

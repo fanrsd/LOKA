@@ -3,6 +3,8 @@ mod network;
 mod platform;
 mod settings;
 mod sim;
+mod clip;
+mod carry;
 
 use network::{
     discovery::{self, DeviceInfo, DeviceType, Peer, Role},
@@ -35,6 +37,12 @@ struct Shared {
     last_y: f32,
     /// Client, while a Main controls us: its address and our band on the edge leading back to it
     session: Option<(IpAddr, Portal)>,
+    /// files of an OS drag hovering the overlay right now
+    hover: Option<Vec<std::path::PathBuf>>,
+    /// the next Drop on the overlay is our own hand-off of a drag to the other device, not a transfer
+    handoff: bool,
+    /// file drags carried across the edge, waiting for their files or the held cursor
+    carry: carry::Carry,
     /// pairing prompts waiting for the user's answer
     pending: HashMap<u64, oneshot::Sender<bool>>,
     next_request: u64,
@@ -303,10 +311,19 @@ struct EngineSink {
     app: AppHandle,
 }
 
-/// Session over: no band back to the Main any more.
+/// Session over: no band back to the Main any more; a picture or files copied here go to it.
 impl Drop for EngineSink {
     fn drop(&mut self) {
-        self.app.state::<AppState>().lock().unwrap().session = None;
+        let to = {
+            let state = self.app.state::<AppState>();
+            let mut s = state.lock().unwrap();
+            let to = s.drop_target().map(|p| SocketAddr::new(p.addr, p.info.transfer_port));
+            s.session = None;
+            to
+        };
+        if let Some(to) = to {
+            sync_clipboard(self.app.clone(), to);
+        }
         if let Some(w) = self.app.get_webview_window(OVERLAY) {
             let _ = w.hide();
         }
@@ -325,6 +342,9 @@ impl kvm::Sink for EngineSink {
     }
     fn set_clipboard(&mut self, text: String) {
         platform::set_clipboard_text(&text);
+    }
+    fn drag(&mut self, batch: u64) {
+        hold_drag(&self.app, batch);
     }
 }
 
@@ -384,6 +404,9 @@ pub fn run() {
                 target: None,
                 last_y: 0.0,
                 session: None,
+                hover: None,
+                handoff: false,
+                carry: Default::default(),
                 pending: HashMap::new(),
                 next_request: 0,
             }));
@@ -438,6 +461,8 @@ fn spawn_discovery(app: AppHandle, state: AppState, me: watch::Receiver<DeviceIn
 
 fn spawn_transfer_server(app: &AppHandle, state: AppState) -> tauri::Result<()> {
     let dir = app.path().download_dir().or_else(|_| app.path().app_data_dir())?.join("LOKA");
+    let clip_dir = app.path().app_cache_dir()?.join("clipboard");
+    let _ = std::fs::remove_dir_all(&clip_dir); // last run's clipboard files are no longer on any clipboard
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
         // paired devices only: a Main pushes to its Clients, a Client drops back to its Main
@@ -445,17 +470,45 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState) -> tauri::Result<()> 
             let s = state.lock().unwrap();
             s.paired_peer_at(ip, Role::Main).or(s.paired_peer_at(ip, Role::Client)).is_some()
         };
-        let r = transfer::serve(transfer::PORT, dir, allow, move |e| {
-            // one notification per burst, not one per file of a dropped folder
-            static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-            if let transfer::TransferEvent::File { path, .. } = &e {
-                let mut last = LAST.lock().unwrap();
-                if last.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3)) {
-                    use tauri_plugin_notification::NotificationExt;
-                    let name = transfer::file_name(path);
-                    let _ = h.notification().builder().title("LOKA").body(format!("{name} saved to Downloads/LOKA")).show();
+        let clip_root = clip_dir.clone();
+        let r = transfer::serve(transfer::PORT, dir, clip_dir, allow, move |e| {
+            match e {
+                transfer::TransferEvent::ClipImage { png } => {
+                    tauri::async_runtime::spawn_blocking(move || clip::apply_image(&png));
+                    return;
                 }
-                *last = Some(std::time::Instant::now());
+                transfer::TransferEvent::ClipFiles { roots, batch } if batch.drag => {
+                    let down = h.try_state::<Arc<dyn SpatialPlatformEngine>>().and_then(|e| e.cursor()).is_some_and(|c| c.button_down);
+                    let step = h.state::<AppState>().lock().unwrap().carry.files(batch.id, roots, down);
+                    carry_out(&h, step);
+                    return;
+                }
+                transfer::TransferEvent::ClipFiles { roots, .. } => {
+                    let root = clip_root.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        clip::apply_files(&roots);
+                        // only the newest copy is on the clipboard; earlier batches can go (drags in flight stay)
+                        let keep = roots.first().and_then(|p| p.strip_prefix(&root).ok()?.components().next().map(|c| root.join(c)));
+                        for old in std::fs::read_dir(&root).into_iter().flatten().flatten().map(|e| e.path()) {
+                            if Some(&old) != keep.as_ref() && !old.file_name().is_some_and(|n| n.to_string_lossy().starts_with("drag-")) {
+                                let _ = std::fs::remove_dir_all(old);
+                            }
+                        }
+                    });
+                    return;
+                }
+                // one notification per burst, not one per file of a dropped folder; none for clipboard files
+                transfer::TransferEvent::File { ref path, .. } if !path.starts_with(&clip_root) => {
+                    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+                    let mut last = LAST.lock().unwrap();
+                    if last.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3)) {
+                        use tauri_plugin_notification::NotificationExt;
+                        let name = transfer::file_name(path);
+                        let _ = h.notification().builder().title("LOKA").body(format!("{name} saved to Downloads/LOKA")).show();
+                    }
+                    *last = Some(std::time::Instant::now());
+                }
+                _ => {}
             }
             let _ = h.emit("transfer", e);
         })
@@ -465,6 +518,109 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState) -> tauri::Result<()> 
         }
     });
     Ok(())
+}
+
+/// Send files 4 at a time like LocalSend's parallel uploads (small files don't queue behind each other's
+/// handshakes), reporting progress as `transfer` events.
+async fn send_files(app: AppHandle, to: SocketAddr, files: Vec<(std::path::PathBuf, String)>, clip: Option<transfer::ClipBatch>) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(4));
+    for (path, name) in files {
+        let (h, slot) = (app.clone(), slots.clone().acquire_owned().await.unwrap());
+        tauri::async_runtime::spawn(async move {
+            let id = transfer::next_id();
+            let r = transfer::send_file(to, &path, name.clone(), clip, id, |done, total| {
+                let _ = h.emit("transfer", transfer::TransferEvent::Progress { id, outgoing: true, name: name.clone(), done, total });
+            })
+            .await;
+            drop(slot);
+            let _ = h.emit("transfer", match r {
+                Ok(()) => transfer::TransferEvent::Sent { id },
+                Err(e) => transfer::TransferEvent::Failed { id, outgoing: true, name, error: e.to_string() },
+            });
+        });
+    }
+}
+
+/// Hand this computer's clipboard picture or files to `to` (the device the cursor is moving to), if they
+/// changed. Runs beside the crossing, never delaying it.
+fn sync_clipboard(app: AppHandle, to: SocketAddr) {
+    tauri::async_runtime::spawn(async move {
+        match tokio::task::spawn_blocking(clip::outgoing).await.ok().flatten() {
+            Some(clip::Outgoing::Image(png)) => {
+                if let Err(e) = transfer::send_bytes(to, transfer::Kind::Image, &png).await {
+                    eprintln!("clipboard picture: {e}");
+                }
+            }
+            Some(clip::Outgoing::Files(files)) => {
+                let batch = transfer::ClipBatch { id: uuid::Uuid::new_v4().as_u128() as u64, files: files.len() as u32, drag: false };
+                send_files(app, to, files, Some(batch)).await;
+            }
+            None => {}
+        }
+    });
+}
+
+/// Hand an OS file drag hovering the portal edge to the other device: end it here (a marked button-up
+/// drops it on our own overlay, ignored as `handoff`), send its files as drag batch, and return the batch
+/// for the cursor to carry along.
+fn hand_off_drag(app: &AppHandle, engine: &Arc<dyn SpatialPlatformEngine>, state: &AppState, to: SocketAddr) -> Option<u64> {
+    let paths = {
+        let mut s = state.lock().unwrap();
+        let paths = s.hover.take()?;
+        s.handoff = true;
+        paths
+    };
+    engine.inject(Injected::Button { button: 1, down: false });
+    let id = uuid::Uuid::new_v4().as_u128() as u64;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let files = tokio::task::spawn_blocking(move || transfer::expand(&paths)).await.unwrap_or_default();
+        let batch = transfer::ClipBatch { id, files: files.len() as u32, drag: true };
+        send_files(app, to, files, Some(batch)).await;
+    });
+    Some(id)
+}
+
+/// The cursor arrived here with drag `batch`, its button still held: hold it on this OS too (pressed on our
+/// own overlay, which sits under the cursor at the edge) until the files are here.
+fn hold_drag(app: &AppHandle, batch: u64) {
+    let engine = app.state::<Arc<dyn SpatialPlatformEngine>>().inner().clone();
+    if let Some(w) = app.get_webview_window(OVERLAY) {
+        let _ = engine.set_click_through(&w, false);
+    }
+    engine.inject(Injected::Button { button: 1, down: true });
+    let step = app.state::<AppState>().lock().unwrap().carry.held(batch);
+    carry_out(app, step);
+}
+
+fn carry_out(app: &AppHandle, step: carry::Step) {
+    match step {
+        carry::Step::Start(files) => {
+            let Some(w) = app.get_webview_window(OVERLAY) else { return };
+            // AppKit/OLE drag sessions belong on the main thread
+            let _ = app.run_on_main_thread(move || {
+                let icon = drag::Image::Raw(include_bytes!("../icons/64x64.png").to_vec());
+                if let Err(e) = drag::start_drag(&w, drag::DragItem::Files(files), icon, |_, _| {}, Default::default()) {
+                    eprintln!("drag: {e}");
+                }
+            });
+        }
+        carry::Step::Save(files) => {
+            let Ok(dir) = app.path().download_dir().map(|d| d.join("LOKA")) else { return };
+            let _ = std::fs::create_dir_all(&dir);
+            for f in &files {
+                let name = transfer::file_name(f);
+                let dest = (0..1000).map(|i| if i == 0 { dir.join(&name) } else { dir.join(format!("{name} ({i})")) }).find(|p| !p.exists());
+                // shortcut: rename only; cache and Downloads on different volumes leave the files in the cache
+                if let Some(Err(e)) = dest.map(|d| std::fs::rename(f, d)) {
+                    eprintln!("saving dragged {name}: {e}");
+                }
+            }
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app.notification().builder().title("LOKA").body("Let go before the files arrived: saved to Downloads/LOKA").show();
+        }
+        carry::Step::Wait => {}
+    }
 }
 
 #[cfg(desktop)]
@@ -526,36 +682,41 @@ fn setup_overlay(app: &mut tauri::App, state: AppState) -> tauri::Result<()> {
     engine.prepare_overlay(&overlay)?;
 
     let (h, s) = (app.handle().clone(), state.clone());
+    let own = app.path().app_cache_dir()?.join("clipboard");
     overlay.on_window_event(move |e| {
-        let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = e else { return };
+        let WindowEvent::DragDrop(e) = e else { return };
+        let paths = match e {
+            DragDropEvent::Enter { paths, .. } => {
+                s.lock().unwrap().hover = Some(paths.clone());
+                return;
+            }
+            DragDropEvent::Leave => {
+                s.lock().unwrap().hover = None;
+                return;
+            }
+            DragDropEvent::Drop { paths, .. } => paths,
+            _ => return,
+        };
+        {
+            let mut st = s.lock().unwrap();
+            st.hover = None;
+            // our own hand-off, or a drag that just came over from the other device let go at the edge
+            if std::mem::take(&mut st.handoff) || paths.iter().any(|p| p.starts_with(&own)) {
+                return;
+            }
+        }
         let Some(to) = transfer_addr(&s) else { return };
         let tele = telemetry_addr(&s); // none on a Client: the Main has no glow for us
         let y = s.lock().unwrap().last_y;
         let (h, paths) = (h.clone(), paths.clone());
         tauri::async_runtime::spawn(async move {
-            let drop = SpatialPacket { kind: PacketType::Drop, normalized_y: y, proximity: 1.0, payload: PayloadKind::File };
+            let packet = SpatialPacket { kind: PacketType::Drop, normalized_y: y, proximity: 1.0, payload: PayloadKind::File };
             if let (Ok(sock), Some(tele)) = (telemetry::sender().await, tele) {
-                telemetry::send(&sock, tele, &drop).await;
+                telemetry::send(&sock, tele, &packet).await;
             }
-            let _ = h.emit_to(OVERLAY, "spatial", drop);
+            let _ = h.emit_to(OVERLAY, "spatial", packet);
             let files = tokio::task::spawn_blocking(move || transfer::expand(&paths)).await.unwrap_or_default();
-            // 4 at a time like LocalSend's parallel uploads: small files don't queue behind each other's handshakes
-            let slots = Arc::new(tokio::sync::Semaphore::new(4));
-            for (path, name) in files {
-                let (h, slot) = (h.clone(), slots.clone().acquire_owned().await.unwrap());
-                tauri::async_runtime::spawn(async move {
-                    let id = transfer::next_id();
-                    let r = transfer::send_file(to, &path, name.clone(), id, |done, total| {
-                        let _ = h.emit("transfer", transfer::TransferEvent::Progress { id, outgoing: true, name: name.clone(), done, total });
-                    })
-                    .await;
-                    std::mem::drop(slot); // `drop` is the packet above
-                    let _ = h.emit("transfer", match r {
-                        Ok(()) => transfer::TransferEvent::Sent { id },
-                        Err(e) => transfer::TransferEvent::Failed { id, outgoing: true, name, error: e.to_string() },
-                    });
-                });
-            }
+            send_files(h, to, files, None).await;
         });
     });
 
@@ -657,21 +818,46 @@ async fn track(app: AppHandle, overlay: tauri::WebviewWindow, engine: Arc<dyn Sp
             continue;
         }
         let sample = portal.sample(c.x, c.y);
+        let on_edge = matches!(sample, Some((_, p)) if p >= 1.0) && !locked;
+        {
+            // the button of a carried drag went up before its files came: they get saved instead
+            let mut s = state.lock().unwrap();
+            if !c.button_down && s.carry.waiting() {
+                s.carry.released();
+            }
+        }
+        // a file drag pushed against the edge goes over with the cursor (Main), or back with it (Client)
+        let mut drag = None;
+        if on_edge && c.button_down && state.lock().unwrap().hover.is_some() {
+            if let Some(t) = transfer_addr(&state) {
+                drag = hand_off_drag(&app, &engine, &state, t);
+                if let (Some(batch), None) = (drag, kvm_addr(&state)) {
+                    kvm::DRAG_OUT.store(batch, Ordering::SeqCst); // rides back with the next push through the edge
+                    continue;
+                }
+            }
+        }
         // resting against the portal edge (no drag, not locked) hands mouse & keyboard to the paired device
-        let at_edge = matches!(sample, Some((_, p)) if p >= 1.0) && !c.button_down && !locked;
+        let at_edge = on_edge && (!c.button_down || drag.is_some());
         if !at_edge {
             resting = None;
         }
         if let (true, Some((y, _)), Some(to)) = (at_edge, sample, kvm_addr(&state)) {
             let since = *resting.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() >= Duration::from_millis(prefs.edge_delay_ms.into()) {
+            if drag.is_some() || since.elapsed() >= Duration::from_millis(prefs.edge_delay_ms.into()) {
                 resting = None;
                 remote.store(true, Ordering::SeqCst);
                 let (engine, remote, app) = (engine.clone(), remote.clone(), app.clone());
+                if let Some(t) = transfer_addr(&state) {
+                    sync_clipboard(app.clone(), t);
+                }
                 let tune = kvm::Tune::new(prefs.speed, prefs.swap_ctrl_cmd && peer_is_mac != cfg!(target_os = "macos"));
                 tauri::async_runtime::spawn(async move {
                     let _ = app.emit("kvm", serde_json::json!({ "active": true, "y": y }));
-                    let r = kvm::send_session(engine, to, portal, y, tune).await;
+                    let r = kvm::send_session(engine, to, portal, y, tune, drag).await;
+                    if let Ok(Some(batch)) = r {
+                        hold_drag(&app, batch); // a drag came back with the cursor
+                    }
                     let error = r.as_ref().err().map(|e| e.to_string());
                     let _ = app.emit("kvm", serde_json::json!({ "active": false, "error": error }));
                     if error.is_some() {

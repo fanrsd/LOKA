@@ -101,7 +101,8 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
     let dir = app.path().app_cache_dir()?.join("sim-received");
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
-        let r = transfer::serve(TRANSFER_PORT, dir, |ip| ip.is_loopback(), move |e| {
+        // the simulated phone has no clipboard: copied pictures/files from the host just land in a folder
+        let r = transfer::serve(TRANSFER_PORT, dir.clone(), dir.join("clipboard"), |ip| ip.is_loopback(), move |e| {
             let _ = h.emit_to(LABEL, "transfer", e);
         })
         .await;

@@ -249,6 +249,15 @@ fn show_cursors() {
     }
 }
 
+/// Password managers (KeePass, 1Password, Bitwarden…) tag secrets with these formats.
+pub fn clipboard_concealed() -> bool {
+    use windows_sys::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
+    ["ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore"].iter().any(|name| {
+        let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        unsafe { IsClipboardFormatAvailable(RegisterClipboardFormatW(wide.as_ptr())) != 0 }
+    })
+}
+
 fn hiword(v: u32) -> i32 {
     (v >> 16) as u16 as i16 as i32
 }

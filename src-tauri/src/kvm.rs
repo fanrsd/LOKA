@@ -10,7 +10,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -54,6 +54,9 @@ pub enum Msg {
     Refuse(Refusal),
     /// Main → Client: cursor lock on/off; while on, the way back is not watched.
     Lock { on: bool },
+    /// A file drag crosses with the cursor: its files come as transfer batch `batch` and become a
+    /// native drag on the other side. Main → Client right after Enter; Client → Main right before Return.
+    Drag { batch: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -120,6 +123,10 @@ impl Msg {
             }
             Msg::Refuse(r) => put(0, &[11, r as u8]),
             Msg::Lock { on } => put(0, &[12, on as u8]),
+            Msg::Drag { batch } => {
+                put(0, &[13]);
+                put(1, &batch.to_le_bytes());
+            }
         }
         b
     }
@@ -154,6 +161,7 @@ impl Msg {
                 _ => return None,
             }),
             12 => Msg::Lock { on: b[1] != 0 },
+            13 => Msg::Drag { batch: u64::from_le_bytes(b[1..9].try_into().unwrap()) },
             _ => return None,
         })
     }
@@ -190,6 +198,8 @@ pub struct Receiver {
     keys: Vec<u16>,
     /// cursor lock: the way back is not watched
     locked: bool,
+    /// a file drag here is going back to the Main with the cursor (transfer batch)
+    drag_out: Option<u64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -199,12 +209,16 @@ pub enum Applied {
     Return(f32),
 }
 
+/// Client: a file drag here was handed to the Main (transfer batch id); the next push through the
+/// entry edge returns even with the button held. 0 = none.
+pub static DRAG_OUT: AtomicU64 = AtomicU64::new(0);
+
 impl Receiver {
     /// The sender's right edge meets our left edge, etc.
     pub fn enter(area: Rect, sender_edge: Edge, y: f32) -> (Self, Injected) {
         let edge = sender_edge.opposite();
         let (x, y) = edge_point(area, edge, y as f64, ENTER_INSET);
-        (Self { area, edge, x, y, buttons: 0, keys: Vec::new(), locked: false }, Injected::MoveTo { x, y })
+        (Self { area, edge, x, y, buttons: 0, keys: Vec::new(), locked: false, drag_out: None }, Injected::MoveTo { x, y })
     }
 
     pub fn apply(&mut self, e: InputEvent) -> Applied {
@@ -220,8 +234,9 @@ impl Receiver {
                 };
                 self.x = nx.clamp(a.x, a.x + a.w - 1.0);
                 self.y = ny.clamp(a.y, a.y + a.h - 1.0);
-                // never hand back mid-drag (the button-up would land on the wrong machine) or while locked
-                if crossed && self.buttons == 0 && !self.locked {
+                // never hand back mid-drag (the button-up would land on the wrong machine) unless the drag
+                // itself goes along, and never while locked
+                if crossed && (self.buttons == 0 || self.drag_out.is_some()) && !self.locked {
                     let along = match self.edge {
                         Edge::Left | Edge::Right => (self.y - a.y) / a.h,
                         Edge::Top | Edge::Bottom => (self.x - a.x) / a.w,
@@ -314,12 +329,16 @@ impl Tune {
 }
 
 /// Sender side: capture local input and stream it until the peer returns control, Ctrl+Alt+Esc, or an error.
-/// Local input is always restored before returning.
-pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr, portal: Portal, y: f32, mut tune: Tune) -> io::Result<()> {
+/// Local input is always restored before returning. `drag`: a file drag crossing along (its transfer batch).
+/// Returns the batch of a file drag the peer sent back with the cursor, if any.
+pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr, portal: Portal, y: f32, mut tune: Tune, drag: Option<u64>) -> io::Result<Option<u64>> {
     let s = timeout(Duration::from_secs(2), TcpStream::connect(to)).await??;
     s.set_nodelay(true)?;
     let (mut rd, mut wr) = s.into_split();
     wr.write_all(&Msg::Enter { edge: portal.edge, y }.encode()).await?;
+    if let Some(batch) = drag {
+        wr.write_all(&Msg::Drag { batch }.encode()).await?;
+    }
     let fresh = clipboard_text().filter(|t| LAST_SHARED.lock().unwrap().as_ref() != Some(t));
     timeout(WRITE_TIMEOUT, write_clipboard(&mut wr, fresh.clone())).await??;
     if fresh.is_some() {
@@ -334,9 +353,11 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
     // shortcut: the Client's clipboard only comes back on an edge return, not on Ctrl+Alt+Esc; add a Leave ack if needed.
     let closed = || io::Error::new(io::ErrorKind::ConnectionAborted, "peer closed the session");
     let mut returned = tokio::spawn(async move {
+        let mut drag = None;
         loop {
             match read_msg(&mut rd).await {
-                Ok(Msg::Return { y }) => return Ok(y),
+                Ok(Msg::Return { y }) => return Ok((y, drag)),
+                Ok(Msg::Drag { batch }) => drag = Some(batch),
                 Ok(Msg::Refuse(r)) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, r.text())),
                 Ok(Msg::Clipboard { len }) => match read_clipboard(&mut rd, len).await {
                     Ok(Some(text)) => {
@@ -351,7 +372,7 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
             }
         }
     });
-    let mut back_y = y;
+    let (mut back_y, mut back_drag) = (y, None);
     let result: io::Result<()> = async {
         // an event read past a run of moves, handled next turn
         let mut held: Option<Captured> = None;
@@ -361,7 +382,7 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
                 None => tokio::select! {
                     c = rx.recv() => c,
                     r = &mut returned => {
-                        back_y = r.unwrap_or_else(|_| Err(closed()))?;
+                        (back_y, back_drag) = r.unwrap_or_else(|_| Err(closed()))?;
                         return Ok(());
                     }
                 },
@@ -398,7 +419,7 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
     LOCKED.store(false, Ordering::SeqCst);
     returned.abort();
     engine.stop_capture(portal.point(back_y, RETURN_INSET));
-    result
+    result.map(|()| back_drag)
 }
 
 /// Where received input goes: the real OS, or the simulator window.
@@ -410,6 +431,8 @@ pub trait Sink: Send {
         None
     }
     fn set_clipboard(&mut self, _text: String) {}
+    /// A file drag came along with the cursor; its files arrive as transfer batch `batch`.
+    fn drag(&mut self, _batch: u64) {}
 }
 
 /// Main side of pairing: resolves once the client's user answers (or the request times out).
@@ -470,23 +493,36 @@ pub async fn serve<S: Sink, F: Future<Output = bool>>(
 async fn session(mut s: TcpStream, sink: &mut impl Sink, edge: Edge, y: f32) -> io::Result<()> {
     let (mut rcv, first) = Receiver::enter(sink.area(), edge, y);
     sink.inject(first);
+    DRAG_OUT.store(0, Ordering::SeqCst);
     // hand the clipboard back only if it changed here, so the Main's own (maybe an image) survives
     let mut seen = sink.clipboard();
     let result = loop {
         match read_msg(&mut s).await {
-            Ok(Msg::Input(e)) => match rcv.apply(e) {
-                Applied::Inject(i) => sink.inject(i),
-                Applied::Return(y) => {
-                    // clipboard first: the Main stops reading once it sees Return
-                    let now = sink.clipboard();
-                    if now != seen {
-                        if let Err(e) = write_clipboard(&mut s, now).await {
-                            break Err(e);
-                        }
-                    }
-                    break s.write_all(&Msg::Return { y }.encode()).await;
+            Ok(Msg::Input(e)) => {
+                let out = DRAG_OUT.load(Ordering::SeqCst);
+                if out != 0 {
+                    rcv.drag_out = Some(out);
                 }
-            },
+                match rcv.apply(e) {
+                    Applied::Inject(i) => sink.inject(i),
+                    Applied::Return(y) => {
+                        // clipboard first: the Main stops reading once it sees Return
+                        let now = sink.clipboard();
+                        if now != seen {
+                            if let Err(e) = write_clipboard(&mut s, now).await {
+                                break Err(e);
+                            }
+                        }
+                        if let Some(batch) = rcv.drag_out {
+                            DRAG_OUT.store(0, Ordering::SeqCst);
+                            if let Err(e) = s.write_all(&Msg::Drag { batch }.encode()).await {
+                                break Err(e);
+                            }
+                        }
+                        break s.write_all(&Msg::Return { y }.encode()).await;
+                    }
+                }
+            }
             Ok(Msg::Clipboard { len }) => match read_clipboard(&mut s, len).await {
                 Ok(Some(text)) => {
                     sink.set_clipboard(text.clone());
@@ -497,6 +533,10 @@ async fn session(mut s: TcpStream, sink: &mut impl Sink, edge: Edge, y: f32) -> 
             },
             Ok(Msg::Leave) => break Ok(()),
             Ok(Msg::Lock { on }) => rcv.locked = on,
+            Ok(Msg::Drag { batch }) => {
+                rcv.buttons |= 1; // the Main's button is still held: no return until it's released
+                sink.drag(batch);
+            }
             Ok(_) => {}
             Err(e) => break Err(e),
         }
@@ -526,6 +566,7 @@ mod tests {
             Msg::Leave,
             Msg::Refuse(Refusal::NoScreen),
             Msg::Lock { on: true },
+            Msg::Drag { batch: u64::MAX - 1 },
             Msg::PairRequest,
             Msg::PairResponse { accepted: true },
             Msg::Clipboard { len: MAX_CLIPBOARD },
@@ -701,9 +742,42 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
-        let e = send_session(engine.clone(), ([127, 0, 0, 1], port).into(), portal, 0.5, Tune::new(1.0, false)).await.unwrap_err();
+        let e = send_session(engine.clone(), ([127, 0, 0, 1], port).into(), portal, 0.5, Tune::new(1.0, false), None).await.unwrap_err();
         assert_eq!(e.to_string(), Refusal::NotClient.text());
         assert_eq!(*engine.warped.lock().unwrap(), Some(portal.point(0.5, RETURN_INSET)));
+    }
+
+    struct Drags(Arc<Mutex<Vec<u64>>>);
+    impl Sink for Drags {
+        fn area(&self) -> Rect {
+            AREA
+        }
+        fn inject(&mut self, _: Injected) {}
+        fn drag(&mut self, batch: u64) {
+            self.0.lock().unwrap().push(batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn file_drags_cross_with_the_cursor_both_ways() {
+        let port = 53392;
+        let drags = Arc::new(Mutex::new(Vec::new()));
+        let d = drags.clone();
+        tokio::spawn(serve(port, |_| Ok(()), |_| async { false }, move |_, _| Some(Drags(d.clone()))));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let engine = Arc::new(Captor::default());
+        let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
+        let main = tokio::spawn(send_session(engine.clone(), ([127, 0, 0, 1], port).into(), portal, 0.5, Tune::new(1.0, false), Some(5)));
+        // other sessions in this test binary reset DRAG_OUT when they start; let them settle first
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(*drags.lock().unwrap(), vec![5], "the Client was told a drag came along");
+        let push = |dx| engine.out.lock().unwrap().as_ref().unwrap().send(Captured::Input(InputEvent::Move { dx, dy: 0 })).unwrap();
+        push(-50);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!main.is_finished(), "the dragged button is still held: no way back yet");
+        DRAG_OUT.store(9, Ordering::SeqCst); // the Client hands its own drag back
+        push(-50);
+        assert_eq!(timeout(Duration::from_secs(2), main).await.unwrap().unwrap().unwrap(), Some(9));
     }
 
     /// Receiver's clipboard; records what the Main sent.

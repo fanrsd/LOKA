@@ -207,6 +207,12 @@ fn set_cursor_hidden(hide: bool) {
     }
 }
 
+/// Password managers mark secrets with this (nspasteboard.org convention).
+pub fn clipboard_concealed() -> bool {
+    let pb = objc2_app_kit::NSPasteboard::generalPasteboard();
+    pb.types().is_some_and(|types| types.iter().any(|t| t.to_string() == "org.nspasteboard.ConcealedType"))
+}
+
 /// Receiver-side state CoreGraphics does not track for synthetic events.
 struct Injection {
     at: CGPoint,
@@ -330,6 +336,12 @@ impl SpatialPlatformEngine for MacEngine {
                         (n, true) => (OTHER_DOWN, n as u32 - 1),
                         (n, false) => (OTHER_UP, n as u32 - 1),
                     };
+                    // where the cursor really is: a carried drag presses or lets go on a cursor we never moved
+                    let probe = CGEventCreate(null());
+                    if !probe.is_null() {
+                        st.at = CGEventGetLocation(probe);
+                        CFRelease(probe);
+                    }
                     CGEventCreateMouseEvent(null(), ty, st.at, cg_button)
                 }
                 Injected::Wheel { dx, dy } => {
