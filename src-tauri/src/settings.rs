@@ -1,14 +1,17 @@
-//! Per-install state that must survive restarts: identity, chosen role, paired devices.
+//! Per-install state that must survive restarts: paired devices, their portals, preferences.
+//! The device's identity is its TLS certificate (`network::secure::Identity`), stored next to this file.
 
-use crate::network::discovery::Role;
+use crate::platform::Portal;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     net::IpAddr,
     path::{Path, PathBuf},
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PairedDevice {
+    /// certificate fingerprint
     pub fingerprint: String,
     pub alias: String,
 }
@@ -31,36 +34,25 @@ impl Default for CursorPrefs {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct Settings {
-    /// Stable identity; pairings are remembered against it.
-    pub fingerprint: String,
-    pub role: Option<Role>,
+    /// Pairings made before devices had certificates have UUID fingerprints that never match: re-pair.
     pub paired: Vec<PairedDevice>,
+    /// The device map: which stretch of which monitor edge leads to which paired device.
+    pub portals: HashMap<String, Portal>,
     /// Addresses added by hand, for networks that drop discovery multicast.
-    #[serde(default)]
     pub hosts: Vec<IpAddr>,
-    #[serde(default)]
     pub cursor: CursorPrefs,
     #[serde(skip)]
     path: PathBuf,
 }
 
 impl Settings {
-    /// Missing or corrupt file → fresh identity (pairings must be redone).
+    /// Missing or corrupt file → nothing paired.
     pub fn load(dir: &Path) -> Self {
         let path = dir.join("settings.json");
-        let mut s = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
-            .unwrap_or_else(|| Settings {
-                fingerprint: uuid::Uuid::new_v4().to_string(),
-                role: None,
-                paired: Vec::new(),
-                hosts: Vec::new(),
-                cursor: CursorPrefs::default(),
-                path: PathBuf::new(),
-            });
+        let mut s: Settings = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         s.path = path;
         s.save();
         s
@@ -86,8 +78,10 @@ impl Settings {
         self.save();
     }
 
+    /// Forgets the device and its portal.
     pub fn unpair(&mut self, fingerprint: &str) {
         self.paired.retain(|p| p.fingerprint != fingerprint);
+        self.portals.remove(fingerprint);
         self.save();
     }
 }
@@ -95,23 +89,26 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{Edge, Rect};
 
     #[test]
-    fn identity_and_pairings_survive_reload() {
+    fn pairings_and_portals_survive_reload_and_go_together() {
         let dir = std::env::temp_dir().join(format!("loka-settings-{}", uuid::Uuid::new_v4()));
         let mut s = Settings::load(&dir);
-        s.role = Some(Role::Main);
         s.pair(PairedDevice { fingerprint: "a".into(), alias: "Laptop".into() });
         s.pair(PairedDevice { fingerprint: "a".into(), alias: "Laptop renamed".into() });
+        let portal = Portal { edge: Edge::Left, monitor: Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 }, start: 0.1, end: 0.5, reach: 120.0 };
+        s.portals.insert("a".into(), portal);
         s.save();
 
-        let r = Settings::load(&dir);
-        assert_eq!(r.fingerprint, s.fingerprint);
-        assert_eq!(r.role, Some(Role::Main));
+        let mut r = Settings::load(&dir);
         assert_eq!(r.paired, vec![PairedDevice { fingerprint: "a".into(), alias: "Laptop renamed".into() }]);
+        assert_eq!(r.portals.get("a"), Some(&portal));
+        r.unpair("a");
+        assert!(Settings::load(&dir).portals.is_empty(), "unpairing removes the door too");
 
         std::fs::write(dir.join("settings.json"), b"{broken").unwrap();
-        assert_ne!(Settings::load(&dir).fingerprint, s.fingerprint);
+        assert!(Settings::load(&dir).paired.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

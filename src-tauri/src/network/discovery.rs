@@ -22,26 +22,18 @@ pub enum DeviceType {
     Mobile,
 }
 
-/// Main shares its mouse & keyboard; Client is controlled. `None` until the user picks.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Main,
-    Client,
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
     pub alias: String,
     pub device_type: DeviceType,
     pub os: String,
+    /// SHA-256 of the device's TLS certificate (`secure`): checked on every connection
     pub fingerprint: String,
     pub aspect_ratio: f32,
     pub telemetry_port: u16,
     pub transfer_port: u16,
     pub kvm_port: u16,
-    pub role: Option<Role>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -183,12 +175,10 @@ mod tests {
             telemetry_port: 1,
             transfer_port: 2,
             kvm_port: 3,
-            role: Some(Role::Client),
         };
         let v: serde_json::Value = serde_json::to_value(Announcement { info, announce: true }).unwrap();
         assert_eq!(v["deviceType"], "desktop");
         assert_eq!(v["telemetryPort"], 1);
         assert_eq!(v["announce"], true);
-        assert_eq!(v["role"], "client");
     }
 }

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { type Look, loadLook } from "./look";
 
 type Packet = { kind: "proximity" | "drop" | "leave"; normalizedY: number; proximity: number };
@@ -43,7 +44,8 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
     };
 
     const unlisteners = [
-      listen<Packet>(event, ({ payload }) => {
+      // packets are addressed to this window: with several portals each glows only for its own
+      getCurrentWebviewWindow().listen<Packet>(event, ({ payload }) => {
         if (payload.kind === "leave") target.p = 0;
         else {
           target.y = payload.normalizedY;

@@ -4,11 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 import { About, useUpdate } from "./About";
 import { Calibrate } from "./Calibrate";
 import { Face, type Mood } from "./Face";
-import { PairPrompt, osLabel, quietButton, type Device, type Peer, type Role } from "./Pairing";
+import { PairPrompt, osLabel, quietButton, type Device, type Peer } from "./Pairing";
 import { Pointer } from "./Pointer";
 import { Transfers } from "./Transfers";
 
-const TARGET_KEY = "loka.target";
+const SELECTED_KEY = "loka.selected";
 
 export function Home() {
   const [device, setDevice] = useState<Device | null>(null);
@@ -35,18 +35,7 @@ export function Home() {
   }, []);
 
   if (!device) return null;
-  const setRole = (role: Role) =>
-    invoke("set_role", { role }).then(() => setDevice({ ...device, info: { ...device.info, role } }));
-
-  const { alias, fingerprint, role } = device.info;
-  const sheet = about && <About update={update} seed={fingerprint} windows={device.info.os === "windows"} onClose={() => setAbout(false)} />;
-  if (!role)
-    return (
-      <>
-        <RolePicker device={device} onPick={setRole} />
-        {sheet}
-      </>
-    );
+  const { alias, fingerprint } = device.info;
 
   return (
     <main className="mx-auto flex min-h-full max-w-3xl flex-col px-8 pb-6 pt-6">
@@ -56,7 +45,6 @@ export function Home() {
           <p className="truncate font-display text-[15px] font-semibold">{alias}</p>
           <p className="text-xs text-muted">This computer</p>
         </div>
-        <RoleSwitch role={role!} onChange={setRole} />
         <button
           onClick={() => setAbout(true)}
           aria-label={update.available ? `About LOKA, ${update.available.name} available` : "About LOKA"}
@@ -66,87 +54,26 @@ export function Home() {
           {update.available && <span aria-hidden className="absolute right-2 top-2 h-2 w-2 rounded-full bg-accent" />}
         </button>
       </header>
-      {role === "main" ? <MainHome device={device} peers={peers} onHosts={refreshDevice} /> : <ClientHome device={device} peers={peers} />}
+      <Devices device={device} peers={peers} onChange={refreshDevice} />
       <Transfers />
-      {sheet}
+      <PairPrompt selfSeed={fingerprint} />
+      {about && <About update={update} seed={fingerprint} windows={device.info.os === "windows"} onClose={() => setAbout(false)} />}
     </main>
   );
 }
 
-/** Apple-style segmented control with a sliding thumb. */
-function RoleSwitch({ role, onChange }: { role: Role; onChange: (r: Role) => void }) {
-  const roles: Role[] = ["main", "client"];
-  return (
-    <div role="radiogroup" aria-label="Role of this computer" className="relative grid grid-cols-2 rounded-full bg-white/[0.06] p-1 text-sm">
-      <span
-        aria-hidden
-        className="absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-full bg-fg transition-transform duration-500 ease-[var(--ease-spring)]"
-        style={{ transform: role === "client" ? "translateX(100%)" : undefined }}
-      />
-      {roles.map((r) => (
-        <button
-          key={r}
-          role="radio"
-          aria-checked={role === r}
-          onClick={() => role !== r && onChange(r)}
-          className={`relative z-[1] rounded-full px-4 py-1.5 font-medium capitalize transition-colors duration-300 focus-visible:outline-2 focus-visible:outline-accent ${role === r ? "text-ink" : "text-muted hover:text-fg"}`}
-        >
-          {r}
-        </button>
-      ))}
-    </div>
-  );
-}
+type PairState = { state: "waiting"; code: string } | { state: "declined" } | { state: "error"; message: string };
 
-function RolePicker({ device, onPick }: { device: Device; onPick: (role: Role) => void }) {
-  const options: { role: Role; title: string; body: string; look: "left" | "right" }[] = [
-    { role: "main", title: "Main", body: "Its mouse and keyboard reach the devices around it.", look: "right" },
-    { role: "client", title: "Client", body: "It gets controlled by a Main sitting next to it.", look: "left" },
-  ];
-  return (
-    <main className="grid min-h-full place-items-center px-8 py-10">
-      <div className="w-full max-w-xl">
-        <div className="rise">
-          <Face seed={device.info.fingerprint} size={56} />
-        </div>
-        <h1 className="rise mt-6 font-display text-5xl font-extrabold leading-[0.95] tracking-[-0.04em]" style={{ "--i": 1 } as React.CSSProperties}>
-          Hi, I'm {device.info.alias}.
-          <br />
-          <span className="text-muted">What's my job?</span>
-        </h1>
-        <p className="rise mt-4 max-w-[46ch] text-[15px] leading-relaxed text-muted" style={{ "--i": 2 } as React.CSSProperties}>
-          Pick Main on the computer whose mouse and keyboard you want to share. You can change this any time.
-        </p>
-        <div className="mt-8 grid gap-3 sm:grid-cols-2">
-          {options.map((o, i) => (
-            <button
-              key={o.role}
-              onClick={() => onPick(o.role)}
-              className="rise group rounded-[24px] bg-raised p-6 text-left ring-1 ring-line transition-[transform,box-shadow] duration-300 ease-[var(--ease-spring)] hover:-translate-y-1 hover:ring-white/20 active:scale-[0.98] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-              style={{ "--i": 3 + i } as React.CSSProperties}
-            >
-              <Face seed={o.role === "main" ? "main-role" : "client-role"} size={44} look={o.look} />
-              <span className="mt-5 block font-display text-2xl font-bold tracking-[-0.02em]">{o.title}</span>
-              <span className="mt-1 block text-sm leading-relaxed text-muted">{o.body}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-    </main>
-  );
-}
-
-type PairState = "waiting" | "declined" | string; // any other string is an error message
-
-function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; onHosts: () => void }) {
-  const [target, setTarget] = useState<string | null>(() => localStorage.getItem(TARGET_KEY));
+/** Every LOKA nearby. Any of them can be paired and placed around this computer's screens; any paired one can drive this one too. */
+function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; onChange: () => void }) {
+  const [selected, setSelected] = useState<string | null>(() => localStorage.getItem(SELECTED_KEY));
   const [pairing, setPairing] = useState<Record<string, PairState>>({});
-  const [kvm, setKvm] = useState<{ active: boolean; error?: string | null }>({ active: false });
+  const [kvm, setKvm] = useState<{ active: boolean; error?: string | null; device?: string }>({ active: false });
   const [locked, setLocked] = useState(false);
   const mac = device.info.os === "macos";
 
   useEffect(() => {
-    const un = listen<{ active: boolean; error?: string | null }>("kvm", (e) => setKvm(e.payload));
+    const un = listen<{ active: boolean; error?: string | null; device?: string }>("kvm", (e) => setKvm(e.payload));
     const unLock = listen<boolean>("lock", (e) => setLocked(e.payload));
     return () => {
       un.then((f) => f());
@@ -156,57 +83,61 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
 
   const isPaired = (f: string) => device.paired.some((p) => p.fingerprint === f);
   const select = (f: string | null) => {
-    setTarget(f);
-    if (f) localStorage.setItem(TARGET_KEY, f);
-    else localStorage.removeItem(TARGET_KEY);
+    setSelected(f);
+    if (f) localStorage.setItem(SELECTED_KEY, f);
+    else localStorage.removeItem(SELECTED_KEY);
   };
 
-  const clients = peers.filter((p) => p.info.role === "client");
-  const offlinePaired = device.paired.filter((p) => !clients.some((c) => c.info.fingerprint === p.fingerprint));
-  const selected = clients.find((c) => c.info.fingerprint === target && isPaired(target));
+  const offlinePaired = device.paired.filter((p) => !peers.some((c) => c.info.fingerprint === p.fingerprint));
+  const current = peers.find((c) => c.info.fingerprint === selected && isPaired(selected));
+  const placed = (f: string) => f in device.portals;
 
   const pair = async (p: Peer) => {
     const f = p.info.fingerprint;
-    setPairing((s) => ({ ...s, [f]: "waiting" }));
+    const code = await invoke<string>("pair_code", { fingerprint: f });
+    setPairing((s) => ({ ...s, [f]: { state: "waiting", code } }));
     try {
       const accepted = await invoke<boolean>("pair", { fingerprint: f });
-      setPairing((s) => ({ ...s, [f]: accepted ? "" : "declined" }));
+      setPairing(({ [f]: _, ...rest }) => (accepted ? rest : { ...rest, [f]: { state: "declined" } }));
       if (accepted) select(f);
     } catch (e) {
-      setPairing((s) => ({ ...s, [f]: String(e) }));
+      setPairing((s) => ({ ...s, [f]: { state: "error", message: String(e) } }));
     }
   };
 
   const view = (p: Peer): { mood: Mood; note: string; tone: "fg" | "muted" | "danger" } => {
     const f = p.info.fingerprint;
     const s = pairing[f];
-    if (s === "waiting") return { mood: "waiting", note: "Accept on it…", tone: "fg" };
-    if (isPaired(f)) return { mood: target === f ? "happy" : "idle", note: target === f ? "Connected" : "Paired", tone: target === f ? "fg" : "muted" };
-    if (s === "declined") return { mood: "sad", note: "Declined", tone: "danger" };
-    if (s) return { mood: "sad", note: "Couldn't reach it", tone: "danger" };
+    if (s?.state === "waiting") return { mood: "waiting", note: `Code ${s.code}`, tone: "fg" };
+    if (isPaired(f)) return { mood: selected === f ? "happy" : "idle", note: placed(f) ? "Paired" : "Paired · place it", tone: selected === f ? "fg" : "muted" };
+    if (s?.state === "declined") return { mood: "sad", note: "Declined", tone: "danger" };
+    if (s?.state === "error") return { mood: "sad", note: "Couldn't reach it", tone: "danger" };
     return { mood: "idle", note: "Click to pair", tone: "muted" };
   };
 
-  const empty = clients.length === 0 && offlinePaired.length === 0;
+  const empty = peers.length === 0 && offlinePaired.length === 0;
+  const waiting = Object.entries(pairing).find(([, s]) => s.state === "waiting");
 
   return (
     <>
       <section aria-labelledby="nearby" className="mt-12">
         <h1 id="nearby" className="rise font-display text-[44px] font-extrabold leading-[0.95] tracking-[-0.04em]">
-          {selected ? (
+          {current ? (
             <>
               Paired with
               <br />
-              <span className="text-accent">{selected.info.alias}</span>
+              <span className="text-accent">{current.info.alias}</span>
             </>
           ) : (
             "Nearby"
           )}
         </h1>
         <p className="rise mt-3 max-w-[52ch] text-[15px] leading-relaxed text-muted" style={{ "--i": 1 } as React.CSSProperties}>
-          {selected
-            ? "Push your cursor off the glowing edge to move over. Push it back out the far side to come home."
-            : "Devices running LOKA as Client show up here. Click one to pair."}
+          {waiting
+            ? `Check that the other device shows ${(waiting[1] as { code: string }).code}, then accept there.`
+            : current
+              ? "Push your cursor off the glowing edge to move over. Push it back out the far side to come home. The other device can reach this one the same way."
+              : "Every computer running LOKA shows up here. Click one to pair, then place it around your screens."}
         </p>
 
         {empty ? (
@@ -214,19 +145,19 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
             <Face seed={device.info.fingerprint} size={56} mood="searching" />
             <div>
               <p className="font-display text-lg font-semibold">Looking around your network…</p>
-              <p className="mt-1 text-sm text-muted">Open LOKA on the other computer and choose Client.</p>
+              <p className="mt-1 text-sm text-muted">Open LOKA on the other computer.</p>
             </div>
           </div>
         ) : (
           <ul className="mt-9 flex flex-wrap gap-x-4 gap-y-6">
-            {clients.map((p, i) => {
+            {peers.map((p, i) => {
               const f = p.info.fingerprint;
               const v = view(p);
-              const active = target === f && isPaired(f);
+              const active = selected === f && isPaired(f);
               return (
                 <li key={f} className="rise" style={{ "--i": 2 + i } as React.CSSProperties}>
                   <button
-                    disabled={pairing[f] === "waiting"}
+                    disabled={pairing[f]?.state === "waiting"}
                     onClick={() => (isPaired(f) ? select(f) : pair(p))}
                     aria-pressed={active}
                     aria-label={`${p.info.alias}, ${osLabel(p.info.os)}. ${v.note}`}
@@ -236,13 +167,13 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
                       <Face seed={f} size={68} mood={v.mood} />
                     </span>
                     <span className="mt-3 w-full truncate text-center text-sm font-semibold">{p.info.alias}</span>
-                    <span className={`mt-0.5 text-xs ${v.tone === "danger" ? "text-danger" : v.tone === "fg" ? "text-fg" : "text-muted"}`}>{v.note}</span>
+                    <span className={`mt-0.5 text-xs tabular-nums ${v.tone === "danger" ? "text-danger" : v.tone === "fg" ? "text-fg" : "text-muted"}`}>{v.note}</span>
                   </button>
                 </li>
               );
             })}
             {offlinePaired.map((p, i) => (
-              <li key={p.fingerprint} className="rise flex w-32 flex-col items-center px-2 pb-3 pt-4 opacity-60" style={{ "--i": 2 + clients.length + i } as React.CSSProperties}>
+              <li key={p.fingerprint} className="rise flex w-32 flex-col items-center px-2 pb-3 pt-4 opacity-60" style={{ "--i": 2 + peers.length + i } as React.CSSProperties}>
                 <span className="p-1 grayscale">
                   <Face seed={p.fingerprint} size={68} mood="sad" />
                 </span>
@@ -255,22 +186,22 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
             ))}
           </ul>
         )}
-        <AddHost hosts={device.hosts} onChange={onHosts} />
+        <AddHost hosts={device.hosts} ips={device.ips} onChange={onChange} />
       </section>
 
-      {selected && target && (
+      {current && selected && (
         <>
-          <Calibrate target={target} />
+          <Calibrate key={selected} fingerprint={selected} alias={current.info.alias} saved={device.portals[selected]} />
           <Pointer initial={device.cursor} mac={mac} />
           <div className="mt-4 flex justify-end">
             <button
               onClick={() => {
-                invoke("unpair", { fingerprint: target });
+                invoke("unpair", { fingerprint: selected });
                 select(null);
               }}
               className="text-xs text-faint underline-offset-2 hover:text-danger hover:underline"
             >
-              Unpair {selected.info.alias}
+              Unpair {current.info.alias}
             </button>
           </div>
         </>
@@ -282,17 +213,17 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
         </button>
       </footer>
 
-      {/* status toast while input is on the other device, locked, or why it couldn't move */}
+      {/* status toast while input is on another device, locked, or why it couldn't move */}
       {(kvm.active || kvm.error || locked) && (
         <div
           role="status"
           className="fixed bottom-5 left-1/2 flex -translate-x-1/2 items-center gap-3 rounded-full bg-raised py-2 pl-2 pr-4 text-sm ring-1 ring-line"
           style={{ animation: "sheet-in 0.4s var(--ease-spring)" }}
         >
-          {kvm.active && selected ? <Face seed={selected.info.fingerprint} size={26} mood="happy" /> : <Face seed={kvm.error ? "error" : device.info.fingerprint} size={26} mood={kvm.error ? "sad" : "idle"} />}
+          {kvm.active && kvm.device ? <Face seed={kvm.device} size={26} mood="happy" /> : <Face seed={kvm.error ? "error" : device.info.fingerprint} size={26} mood={kvm.error ? "sad" : "idle"} />}
           {kvm.active ? (
             <span>
-              Using {selected?.info.alias ?? "the other device"}
+              Using {peers.find((p) => p.info.fingerprint === kvm.device)?.info.alias ?? "the other device"}
               {locked && " · locked"} · <kbd className="rounded-md bg-white/10 px-1.5 py-0.5 font-sans text-xs text-muted">{mac ? "⌃ ⌥ Esc" : "Ctrl Alt Esc"}</kbd> to return
             </span>
           ) : kvm.error ? (
@@ -308,62 +239,8 @@ function MainHome({ device, peers, onHosts }: { device: Device; peers: Peer[]; o
   );
 }
 
-function ClientHome({ device, peers }: { device: Device; peers: Peer[] }) {
-  const mains = peers.filter((p) => p.info.role === "main");
-  const isPaired = (f: string) => device.paired.some((p) => p.fingerprint === f);
-  const pairedMain = mains.find((m) => isPaired(m.info.fingerprint));
-
-  return (
-    <>
-      <section className="flex flex-1 flex-col items-center justify-center py-10 text-center">
-        <div className="rise">
-          <Face seed={device.info.fingerprint} size={120} mood={pairedMain ? "happy" : "searching"} label={device.info.alias} />
-        </div>
-        <h1 className="rise mt-8 font-display text-[40px] font-extrabold leading-[0.95] tracking-[-0.04em]" style={{ "--i": 1 } as React.CSSProperties}>
-          {pairedMain ? `Ready for ${pairedMain.info.alias}` : "Waiting for a Main"}
-        </h1>
-        <p className="rise mt-3 max-w-[42ch] text-[15px] leading-relaxed text-muted" style={{ "--i": 2 } as React.CSSProperties}>
-          {pairedMain
-            ? `Push the cursor off ${pairedMain.info.alias}'s glowing edge and it lands here.`
-            : "On your main computer, open LOKA and click this face to pair. You'll confirm it here."}
-        </p>
-        {device.ips.length > 0 && (
-          <p className="rise mt-5 text-sm text-faint" style={{ "--i": 3 } as React.CSSProperties}>
-            This computer's address: <span className="select-text font-mono text-fg">{device.ips.join(", ")}</span>
-          </p>
-        )}
-      </section>
-
-      {mains.length > 0 && (
-        <section aria-labelledby="mains" className="rise" style={{ "--i": 3 } as React.CSSProperties}>
-          <h2 id="mains" className="text-xs font-medium text-faint">Main computers nearby</h2>
-          <ul className="mt-2 divide-y divide-line rounded-[20px] bg-raised ring-1 ring-line">
-            {mains.map((p) => (
-              <li key={p.info.fingerprint} className="flex items-center gap-3 px-4 py-3">
-                <Face seed={p.info.fingerprint} size={32} mood={isPaired(p.info.fingerprint) ? "happy" : "idle"} />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-semibold">{p.info.alias}</span>
-                  <span className="text-xs text-muted">
-                    {osLabel(p.info.os)} · {isPaired(p.info.fingerprint) ? "Paired" : "Not paired"}
-                  </span>
-                </span>
-                {isPaired(p.info.fingerprint) && (
-                  <button onClick={() => invoke("unpair", { fingerprint: p.info.fingerprint })} className={quietButton}>
-                    Unpair
-                  </button>
-                )}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-      <PairPrompt selfSeed={device.info.fingerprint} />
-    </>
-  );
-}
-
-/** Fallback for networks that drop discovery (guest Wi-Fi, client isolation): reach a Client by its address. */
-function AddHost({ hosts, onChange }: { hosts: string[]; onChange: () => void }) {
+/** Fallback for networks that drop discovery (guest Wi-Fi, client isolation): reach a device by its address. */
+function AddHost({ hosts, ips, onChange }: { hosts: string[]; ips: string[]; onChange: () => void }) {
   const [ip, setIp] = useState("");
   const [error, setError] = useState("");
 
@@ -399,6 +276,11 @@ function AddHost({ hosts, onChange }: { hosts: string[]; onChange: () => void })
           Add
         </button>
       </form>
+      {ips.length > 0 && (
+        <p className="mt-2 text-xs text-faint">
+          This computer's address: <span className="select-text font-mono text-fg">{ips.join(", ")}</span>
+        </p>
+      )}
       {error && (
         <p id="add-ip-error" role="alert" className="mt-2 text-xs text-danger">
           {error}

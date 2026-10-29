@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Face } from "./Face";
+import type { Portal } from "./calibration";
 
-export type Role = "main" | "client";
-export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string; role: Role | null };
+export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string };
 export type Peer = { info: DeviceInfo; addr: string };
 export type PairedDevice = { fingerprint: string; alias: string };
 export type CursorPrefs = { speed: number; edgeDelayMs: number; swapCtrlCmd: boolean };
-export type Device = { info: DeviceInfo; paired: PairedDevice[]; ips: string[]; hosts: string[]; cursor: CursorPrefs };
+export type Device = { info: DeviceInfo; paired: PairedDevice[]; portals: Record<string, Portal>; ips: string[]; hosts: string[]; cursor: CursorPrefs };
 
 const OS_LABEL: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux", android: "Android", ios: "iOS", sim: "Simulator" };
 export const osLabel = (os: string) => OS_LABEL[os] ?? os;
@@ -21,12 +21,13 @@ export const quietButton =
 
 /** Accept/decline sheet for an incoming pairing request addressed to this window. */
 export function PairPrompt({ selfSeed }: { selfSeed: string }) {
-  const [req, setReq] = useState<{ id: number; peer: Peer } | null>(null);
+  const [req, setReq] = useState<{ id: number; peer: Peer; code: string } | null>(null);
 
   useEffect(() => {
-    const open = listen<{ id: number; peer: Peer }>("pair-request", (e) => setReq(e.payload));
+    const win = getCurrentWebviewWindow(); // the simulated phone's prompts are its own
+    const open = win.listen<{ id: number; peer: Peer; code: string }>("pair-request", (e) => setReq(e.payload));
     // the backend times requests out; close the sheet with it
-    const closed = listen<number>("pair-request-closed", (e) => setReq((r) => (r?.id === e.payload ? null : r)));
+    const closed = win.listen<number>("pair-request-closed", (e) => setReq((r) => (r?.id === e.payload ? null : r)));
     return () => {
       open.then((f) => f());
       closed.then((f) => f());
@@ -64,8 +65,9 @@ export function PairPrompt({ selfSeed }: { selfSeed: string }) {
           Pair with {alias}?
         </h2>
         <p id="pair-body" className="mx-auto mt-2 max-w-[30ch] text-sm leading-relaxed text-muted">
-          {alias} ({osLabel(os)}, {req.peer.addr}) will be able to use this device's mouse and keyboard and send it files.
+          {alias} ({osLabel(os)}, {req.peer.addr}) will be able to use this device's mouse and keyboard and send it files. Pair only if it shows the same code:
         </p>
+        <p className="mt-4 font-display text-[34px] font-bold tabular-nums tracking-[0.06em] text-fg">{req.code}</p>
         <div className="mt-7 flex flex-col gap-1">
           <button onClick={() => answer(true)} className={primaryButton}>
             Pair

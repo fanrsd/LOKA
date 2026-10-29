@@ -15,14 +15,14 @@ Dorong kursor melewati tepi layar yang menyala, dan kursor langsung pindah ke pe
 
 ## Fitur
 
-- **Berbagi mouse dan keyboard.** Satu komputer menjadi **Main**: mouse dan keyboard-nya mengendalikan perangkat lain. Setiap perangkat di sekitarnya menjalankan LOKA sebagai **Client**.
+- **Berbagi mouse dan keyboard, ke arah mana pun.** Setiap komputer yang menjalankan LOKA bisa mengendalikan yang lain dan dikendalikan olehnya: dorong kursor dari komputer mana pun yang sedang kamu pegang.
 - **Bezel Portal.** Tandai bagian tepi layar tempat perangkat lain berada di mejamu. Dorong kursor ke garis yang menyala itu, dan kursor pindah ke sana. Dorong keluar dari sisi seberang perangkat itu untuk kembali. **Ctrl+Alt+Esc** selalu mengembalikannya.
 - **Terasa seperti satu komputer.** Kursor menghilang dari layar komputer yang sedang mengendalikan. Ctrl berfungsi sebagai ⌘ di Mac (dan ⌘ sebagai Ctrl di PC), jadi shortcut tetap jalan. Atur kecepatan pointer di seberang dan jeda tepi opsional supaya kursor tidak menyeberang saat lewat sekilas. **Scroll Lock** (F14 di Mac) mengunci pointer di layar tempat dia berada.
 - **Keyboard dan clipboard ikut kursor.** Ketikan selalu masuk ke perangkat tempat kursor berada. Salin di satu komputer, pindah, lalu tempel di komputer lain, dua arah: teks, gambar (termasuk screenshot, sampai 10 MB), dan file yang kamu salin di Explorer atau Finder. Isi yang ditandai rahasia oleh password manager tidak ikut dikirim.
 - **Seret file menyeberang.** Ambil file di Explorer atau Finder lalu terus seret melewati tepi yang menyala: kursor membawanya ke seberang, dan kamu bisa melepasnya di folder atau aplikasi mana pun di komputer lain.
-- **Lempar file ke tepi layar, dua arah.** Seret file atau folder ke garis yang menyala lalu lepaskan. Semuanya masuk ke `Downloads/LOKA` di perangkat pasangan, folder lengkap dengan isinya, beberapa file sekaligus. Saat kamu sedang mengendalikan Client, tepi Client yang mengarah ke Main juga menyala: seret file ke sana untuk mengirim ke arah sebaliknya. File lama tidak pernah ditimpa.
+- **Lempar file ke tepi layar, dua arah.** Seret file atau folder ke garis yang menyala lalu lepaskan. Semuanya masuk ke `Downloads/LOKA` di perangkat pasangan, folder lengkap dengan isinya, beberapa file sekaligus. Saat kamu sedang mengendalikan komputer lain, tepinya yang mengarah balik juga menyala: seret file ke sana untuk mengirim ke arah sebaliknya. File lama tidak pernah ditimpa.
  Garis yang menyala terisi seiring file berjalan, dan kedua komputer menampilkan progres, kecepatan, serta sisa waktunya. Transfer bisa dibatalkan, foldernya bisa langsung dibuka saat file tiba, dan ada notifikasi sistem ketika file masuk.
-- **Pairing ala LocalSend.** Perangkat di jaringan yang sama saling menemukan. Klik salah satunya, lalu konfirmasi di perangkat itu. Di jaringan yang memblokir pencarian perangkat (Wi-Fi tamu), tambahkan Client lewat alamat IP-nya.
+- **Pairing ala LocalSend.** Perangkat di jaringan yang sama saling menemukan. Klik salah satunya, lalu konfirmasi di perangkat itu. Di jaringan yang memblokir pencarian perangkat (Wi-Fi tamu), tambahkan komputer lain lewat alamat IP-nya. Saat pairing, kedua layar menampilkan kode 6 digit yang sama, jadi kamu tahu perangkatnya benar.
 - **Selalu terbaru.** Menu **About** menampilkan versi, isi tiap rilis, dan memberi tahu jika ada versi baru di GitHub.
 - **Sesuaikan sendiri.** Pilih warna glow (sekaligus jadi warna aksen aplikasi), seberapa transparan glow-nya, dan animasi saat menyeberang: Ripple, Pulse, atau Calm.
 - **Tinggal di tray.** Menutup jendela tidak menghentikan LOKA; berbagi tetap jalan di latar belakang. Klik ikon di tray untuk membukanya lagi, atau pilih **Quit LOKA** di sana untuk berhenti.
@@ -32,13 +32,13 @@ Kenalan dengan **Oka**, si kecil dari LOKA: sebuah kursor, benda yang memang ber
 | | |
 |---|---|
 | <img src="docs/screenshots/home.webp" alt="Perangkat di sekitar, masing-masing tampil sebagai Oka"> | <img src="docs/screenshots/pairing.webp" alt="Permintaan pairing dengan dua Oka saling berhadapan"> |
-| <img src="docs/screenshots/client-waiting.webp" alt="Client menunggu Main"> | <img src="docs/screenshots/glow-violet.webp" alt="Layar yang sama dengan glow ungu"> |
+| <img src="docs/screenshots/client-waiting.webp" alt="Perangkat menunggu di-pairing"> | <img src="docs/screenshots/glow-violet.webp" alt="Layar yang sama dengan glow ungu"> |
 
 ## Platform
 
 | Platform | Status |
 |---|---|
-| Windows 10/11 | Berjalan (Main dan Client) |
+| Windows 10/11 | Berjalan |
 | macOS | Kode lengkap, masih diuji di perangkat asli. Perlu izin **Accessibility**. |
 | Android | Direncanakan |
 | iOS | Tidak direncanakan: iOS tidak mengizinkan aplikasi mengendalikan input perangkat |
@@ -57,15 +57,15 @@ Unduh installer dari [Releases](https://github.com/fanrsd/LOKA/releases/latest):
     xattr -dr com.apple.quarantine /Applications/LOKA.app
     ```
 
-  Izinkan **Accessibility** saat diminta (System Settings → Privacy & Security → Accessibility), di Main maupun Client; di macOS 15+ izinkan juga **Local Network**. Setelah update, jika mouse tidak bisa pindah lagi, hapus LOKA dari daftar Accessibility dengan tombol **−** lalu aktifkan lagi.
+  Izinkan **Accessibility** saat diminta (System Settings → Privacy & Security → Accessibility), di setiap Mac; di macOS 15+ izinkan juga **Local Network**. Setelah update, jika mouse tidak bisa pindah lagi, hapus LOKA dari daftar Accessibility dengan tombol **−** lalu aktifkan lagi.
 
 Lalu:
 
-1. Buka LOKA di kedua komputer dan pilih peran: **Main** untuk komputer yang punya mouse dan keyboard, **Client** untuk yang lain.
-2. Di Main, klik Oka milik Client. Terima di Client.
+1. Buka LOKA di kedua komputer.
+2. Di salah satunya, klik Oka komputer lain. Pastikan kedua layar menampilkan kode yang sama, lalu terima di komputer lain.
 3. Pilih tepi layar, lalu geser bar yang menyala sampai sejajar dengan letak perangkat lain.
 
-Kedua perangkat harus berada di jaringan lokal yang sama. LOKA memakai UDP 53318 (pencarian perangkat) dan TCP 53319–53321 (telemetri, file, input). Wi-Fi tamu atau router dengan client isolation memblokir pencarian: di Client, LOKA menampilkan **This computer's address**; ketik alamat itu di **Add by IP** pada Main.
+Kedua perangkat harus berada di jaringan lokal yang sama. LOKA memakai UDP 53318 (pencarian perangkat) dan TCP 53319–53321 (telemetri, file, input). Wi-Fi tamu atau router dengan client isolation memblokir pencarian: LOKA menampilkan **This computer's address** di bawah **Add by IP**; ketik alamat itu di **Add by IP** pada komputer lain.
 
 ## Build dari source
 
@@ -74,13 +74,13 @@ Kebutuhan: [Node.js](https://nodejs.org) 20+, [Rust](https://rustup.rs) (stable)
 ```bash
 npm install
 npm run tauri dev        # jalankan
-npm run sim              # jalankan dengan simulasi Client di ponsel
+npm run sim              # jalankan dengan simulasi ponsel
 npm run tauri build      # installer ada di src-tauri/target/release/bundle
 ```
 
 ## Keamanan
 
-LOKA dibuat untuk jaringan rumah atau kantor yang tepercaya. Hanya perangkat yang sudah di-pairing yang bisa mengirim input atau file, tetapi lalu lintasnya belum dienkripsi. Hindari Wi-Fi publik.
+LOKA dibuat untuk jaringan rumah atau kantor. Setiap koneksi antarperangkat dienkripsi (TLS 1.3) dan setiap perangkat punya sertifikat sendiri: setelah di-pairing, hanya perangkat itu yang bisa mengirim input atau file, meskipun ada yang meniru nama atau alamatnya di jaringan.
 
 ## Lisensi
 

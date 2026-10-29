@@ -28,13 +28,16 @@ function Overlay() {
   return <BezelPortal side={useEdge()} event="spatial" />;
 }
 
+// the band (being driven) and one window per portal of the device map
+const overlay = label === "edge-overlay" || label.startsWith("portal-");
+
 function App() {
-  if (label === "edge-overlay") return <Overlay />;
+  if (overlay) return <Overlay />;
   if (label === "mobile-view" || isPhone) return <PhoneView />;
   return <Home />;
 }
 
-if (label === "edge-overlay") document.body.classList.add("transparent");
+if (overlay) document.body.classList.add("transparent");
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <App />

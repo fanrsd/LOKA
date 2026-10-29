@@ -1,13 +1,15 @@
-//! Payload transfer: one TCP connection per payload.
+//! Payload transfer: one pinned TLS connection (`secure`) per payload.
 //! `u32 LE header_len | JSON Header | size bytes`.
 //! Also carries the clipboard when it is a picture or files (too big for a KVM frame): pictures as one
 //! PNG payload, files as a batch the receiver puts on its clipboard once every file arrived.
+
+use super::secure::Tls;
 
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     io,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -17,8 +19,8 @@ use std::{
 };
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpListener,
 };
 
 pub const PORT: u16 = 53320;
@@ -110,17 +112,18 @@ impl Throttle {
     }
 }
 
-async fn write_header(s: &mut TcpStream, h: &Header) -> io::Result<()> {
+async fn write_header(s: &mut (impl AsyncWrite + Unpin), h: &Header) -> io::Result<()> {
     let json = serde_json::to_vec(h)?;
     s.write_all(&(json.len() as u32).to_le_bytes()).await?;
     s.write_all(&json).await
 }
 
-pub async fn send_file(to: SocketAddr, path: &Path, name: String, clip: Option<ClipBatch>, id: u64, mut progress: impl FnMut(u64, u64)) -> io::Result<()> {
+/// Send one file to the device at `to`, which must be `expect` (its fingerprint).
+#[allow(clippy::too_many_arguments)]
+pub async fn send_file(tls: &Tls, to: SocketAddr, expect: &str, path: &Path, name: String, clip: Option<ClipBatch>, id: u64, mut progress: impl FnMut(u64, u64)) -> io::Result<()> {
     let mut f = File::open(path).await?;
     let size = f.metadata().await?.len();
-    let mut s = TcpStream::connect(to).await?;
-    s.set_nodelay(true)?;
+    let (mut s, _) = tls.connect(to, Some(expect)).await?;
     write_header(&mut s, &Header { kind: Kind::File, name, size, clip }).await?;
     let mut buf = vec![0u8; CHUNK];
     let (mut done, mut tick) = (0, Throttle(None));
@@ -163,12 +166,13 @@ pub fn expand(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
     out
 }
 
-pub async fn send_text(to: SocketAddr, kind: Kind, text: &str) -> io::Result<()> {
-    send_bytes(to, kind, text.as_bytes()).await
+#[cfg(test)]
+pub async fn send_text(tls: &Tls, to: SocketAddr, expect: &str, kind: Kind, text: &str) -> io::Result<()> {
+    send_bytes(tls, to, expect, kind, text.as_bytes()).await
 }
 
-pub async fn send_bytes(to: SocketAddr, kind: Kind, bytes: &[u8]) -> io::Result<()> {
-    let mut s = TcpStream::connect(to).await?;
+pub async fn send_bytes(tls: &Tls, to: SocketAddr, expect: &str, kind: Kind, bytes: &[u8]) -> io::Result<()> {
+    let (mut s, _) = tls.connect(to, Some(expect)).await?;
     write_header(&mut s, &Header { kind, name: String::new(), size: bytes.len() as u64, clip: None }).await?;
     s.write_all(bytes).await?;
     s.shutdown().await
@@ -177,25 +181,27 @@ pub async fn send_bytes(to: SocketAddr, kind: Kind, bytes: &[u8]) -> io::Result<
 /// Per clipboard batch: files arrived so far and the top-level entries they sit under.
 type Batches = Arc<Mutex<HashMap<u64, (u32, BTreeSet<PathBuf>)>>>;
 
-/// Accept payloads forever. Connections from IPs where `allow` is false are dropped unread.
+/// Accept payloads forever, only from devices whose fingerprint passes `allow`.
 /// Dropped files land in `dir`, clipboard files in `clip_dir/<batch>`.
 pub async fn serve(
+    tls: Arc<Tls>,
     port: u16,
     dir: PathBuf,
     clip_dir: PathBuf,
-    allow: impl Fn(IpAddr) -> bool + Send + Sync + 'static,
+    allow: impl Fn(&str) -> bool + Send + Sync + 'static,
     on_event: impl Fn(TransferEvent) + Send + Sync + 'static,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    let on_event = Arc::new(on_event);
+    let (on_event, allow) = (Arc::new(on_event), Arc::new(allow));
     let batches = Batches::default();
     loop {
-        let (s, from) = listener.accept().await?;
-        if !allow(from.ip()) {
-            continue;
-        }
-        let (dir, clip_dir, on_event, batches) = (dir.clone(), clip_dir.clone(), on_event.clone(), batches.clone());
+        let (tcp, from) = listener.accept().await?;
+        let (tls, allow, dir, clip_dir, on_event, batches) = (tls.clone(), allow.clone(), dir.clone(), clip_dir.clone(), on_event.clone(), batches.clone());
         tokio::spawn(async move {
+            let Ok((s, who)) = tls.accept(tcp).await else { return };
+            if !allow(&who) {
+                return;
+            }
             if let Err(e) = receive(s, &dir, &clip_dir, &batches, &*on_event).await {
                 eprintln!("transfer from {from} failed: {e}");
             }
@@ -203,7 +209,7 @@ pub async fn serve(
     }
 }
 
-async fn receive(mut s: TcpStream, dir: &Path, clip_dir: &Path, batches: &Batches, on_event: &(impl Fn(TransferEvent) + ?Sized)) -> io::Result<()> {
+async fn receive(mut s: impl AsyncRead + Unpin, dir: &Path, clip_dir: &Path, batches: &Batches, on_event: &(impl Fn(TransferEvent) + ?Sized)) -> io::Result<()> {
     let len = s.read_u32_le().await?;
     if len > MAX_HEADER {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "header too large"));
@@ -311,6 +317,7 @@ async fn create_unique(dir: &Path, name: &str) -> io::Result<(PathBuf, File)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::secure::Identity;
     use std::sync::Mutex;
 
     #[tokio::test]
@@ -323,25 +330,29 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let ev = events.clone();
         let port = 53399;
-        tokio::spawn(serve(port, dir.clone(), dir.join("clip"), |_| true, move |e| ev.lock().unwrap().push(e)));
+        let (them, me, stranger) = (Arc::new(Tls::new(&Identity::generate())), Tls::new(&Identity::generate()), Tls::new(&Identity::generate()));
+        let (fp, mine) = (them.me.clone(), me.me.clone());
+        tokio::spawn(serve(them, port, dir.clone(), dir.join("clip"), move |who| who == mine, move |e| ev.lock().unwrap().push(e)));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
 
         let mut last = 0;
-        send_file(to, &src, file_name(&src), None, next_id(), |d, _| last = d).await.unwrap();
-        send_file(to, &src, file_name(&src), None, next_id(), |_, _| {}).await.unwrap();
+        send_file(&me, to, &fp, &src, file_name(&src), None, next_id(), |d, _| last = d).await.unwrap();
+        send_file(&me, to, &fp, &src, file_name(&src), None, next_id(), |_, _| {}).await.unwrap();
         // a cancelled send stops and the receiver deletes its partial copy
         let id = next_id();
         cancel(id);
-        assert!(send_file(to, &src, file_name(&src), None, id, |_, _| {}).await.is_err());
+        assert!(send_file(&me, to, &fp, &src, file_name(&src), None, id, |_, _| {}).await.is_err());
         // hostile name must stay inside `dir`
         for name in ["../../evil.txt", "C:/Photos/./../2024/a.jpg"] {
-            let mut s = TcpStream::connect(to).await.unwrap();
+            let (mut s, _) = me.connect(to, Some(&fp)).await.unwrap();
             write_header(&mut s, &Header { kind: Kind::File, name: name.into(), size: 2, clip: None }).await.unwrap();
             s.write_all(b"hi").await.unwrap();
             s.shutdown().await.unwrap();
         }
-        send_text(to, Kind::Url, "https://loka.dev").await.unwrap();
+        send_text(&me, to, &fp, Kind::Url, "https://loka.dev").await.unwrap();
+        // an unpaired device's file never lands
+        let _ = send_text(&stranger, to, &fp, Kind::Text, "spam").await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         assert_eq!(last, data.len() as u64);
@@ -354,6 +365,7 @@ mod tests {
         assert!(!dir.join(format!("{stem} (2).bin")).exists());
         assert!(events.lock().unwrap().iter().any(|e| matches!(e, TransferEvent::Failed { outgoing: false, .. })));
         assert!(events.lock().unwrap().iter().any(|e| matches!(e, TransferEvent::Text { kind: Kind::Url, text } if text == "https://loka.dev")));
+        assert!(!events.lock().unwrap().iter().any(|e| matches!(e, TransferEvent::Text { text, .. } if text == "spam")));
 
         // a dropped folder expands to its files, named relative to the drop
         let tree = std::env::temp_dir().join(format!("loka-tree-{}", uuid::Uuid::new_v4()));
@@ -381,18 +393,20 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let ev = events.clone();
         let port = 53393;
-        tokio::spawn(serve(port, dir.join("drops"), dir.join("clip"), |_| true, move |e| ev.lock().unwrap().push(e)));
+        let (them, me) = (Arc::new(Tls::new(&Identity::generate())), Tls::new(&Identity::generate()));
+        let fp = them.me.clone();
+        tokio::spawn(serve(them, port, dir.join("drops"), dir.join("clip"), |_| true, move |e| ev.lock().unwrap().push(e)));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
         let roots = |events: &Vec<TransferEvent>| events.iter().find_map(|e| match e { TransferEvent::ClipFiles { roots, .. } => Some(roots.clone()), _ => None });
 
         let files = expand(&[src.join("Folder"), src.join("a.txt")]);
         let batch = ClipBatch { id: 7, files: files.len() as u32, drag: false };
-        send_file(to, &files[0].0, files[0].1.clone(), Some(batch), next_id(), |_, _| {}).await.unwrap();
+        send_file(&me, to, &fp, &files[0].0, files[0].1.clone(), Some(batch), next_id(), |_, _| {}).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(roots(&events.lock().unwrap()), None, "not on the clipboard until every file arrived");
-        send_file(to, &files[1].0, files[1].1.clone(), Some(batch), next_id(), |_, _| {}).await.unwrap();
-        send_bytes(to, Kind::Image, b"\x89PNG fake").await.unwrap();
+        send_file(&me, to, &fp, &files[1].0, files[1].1.clone(), Some(batch), next_id(), |_, _| {}).await.unwrap();
+        send_bytes(&me, to, &fp, Kind::Image, b"\x89PNG fake").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         let got = events.lock().unwrap();

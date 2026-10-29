@@ -1,17 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { availableMonitors, type Monitor } from "@tauri-apps/api/window";
-import { type Calibration, type Edge, REACH, loadCalibration, saveCalibration } from "./calibration";
+import { type Edge, type Portal, REACH } from "./calibration";
 import { type Look, MOTIONS, SWATCHES, loadLook, saveLook } from "./look";
 
 const EDGES: Edge[] = ["left", "top", "bottom", "right"];
 const MAP_W = 560, MAP_H = 240;
 
-/** Where on this monitor the paired client sits; every change moves the real portal live. */
-export function Calibrate({ target }: { target: string }) {
+type Calibration = { monitor: number; edge: Edge; start: number; length: number };
+const DEFAULT: Calibration = { monitor: 0, edge: "right", start: 0.35, length: 0.3 };
+
+/** Where on this computer's screens device `fingerprint` sits; every change moves its real portal live. */
+export function Calibrate({ fingerprint, alias, saved }: { fingerprint: string; alias: string; saved?: Portal }) {
   const [monitors, setMonitors] = useState<Monitor[]>([]);
-  const [cal, setCal] = useState<Calibration>(loadCalibration);
-  const update = (patch: Partial<Calibration>) => setCal((c) => ({ ...c, ...patch }));
+  // null until the monitors are known, so the saved portal maps onto the right screen
+  const [cal, setCal] = useState<Calibration | null>(null);
+  const update = (patch: Partial<Calibration>) => setCal((c) => c && { ...c, ...patch });
   const [look, setLook] = useState<Look>(loadLook);
   const restyle = (patch: Partial<Look>) => {
     const next = { ...look, ...patch };
@@ -20,24 +24,31 @@ export function Calibrate({ target }: { target: string }) {
   };
 
   useEffect(() => {
-    availableMonitors().then(setMonitors);
-  }, []);
+    availableMonitors().then((ms) => {
+      setMonitors(ms);
+      const i = saved ? ms.findIndex((m) => m.position.x === saved.monitor.x && m.position.y === saved.monitor.y) : -1;
+      setCal(saved && i >= 0 ? { monitor: i, edge: saved.edge, start: saved.start, length: saved.end - saved.start } : DEFAULT);
+    });
+    // another device chosen: start from its own portal
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fingerprint]);
 
-  const mon = monitors[cal.monitor] ?? monitors[0];
+  const mon = cal && (monitors[cal.monitor] ?? monitors[0]);
 
   // live-apply: the real overlay jumps to the new segment while the bar is dragged
   useEffect(() => {
-    saveCalibration(cal);
-    if (!mon) return;
-    const portal = {
+    if (!cal || !mon) return;
+    const portal: Portal = {
       edge: cal.edge,
       monitor: { x: mon.position.x, y: mon.position.y, w: mon.size.width, h: mon.size.height },
       start: cal.start,
       end: cal.start + cal.length,
       reach: REACH,
     };
-    invoke("set_portal", { portal, target });
-  }, [cal, mon, target]);
+    invoke("set_portal", { fingerprint, portal });
+  }, [cal, mon, fingerprint]);
+
+  if (!cal) return null;
 
   // fit every monitor into the map box
   const minX = Math.min(...monitors.map((m) => m.position.x));
@@ -49,7 +60,7 @@ export function Calibrate({ target }: { target: string }) {
   return (
     <section aria-labelledby="cal-title" className="rise mt-12 rounded-[28px] bg-raised p-7 ring-1 ring-line" style={{ "--i": 3 } as React.CSSProperties}>
       <h2 id="cal-title" className="font-display text-2xl font-bold tracking-[-0.025em]">
-        Where does it sit?
+        Where does {alias} sit?
       </h2>
       <p className="mt-1.5 max-w-[56ch] text-sm leading-relaxed text-muted">
         Pick the screen and the edge it's next to, then slide the glowing bar until it lines up with the device on your desk.

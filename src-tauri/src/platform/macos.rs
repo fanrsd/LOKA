@@ -81,6 +81,7 @@ extern "C" {
     fn CGEventGetLocation(event: Ref) -> CGPoint;
     fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
     fn CGGetDisplaysWithPoint(point: CGPoint, max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGDisplayCopyDisplayMode(display: u32) -> Ref;
     fn CGDisplayModeGetPixelWidth(mode: Ref) -> usize;
@@ -276,8 +277,7 @@ impl SpatialPlatformEngine for MacEngine {
             CGEventTapEnable(tap, true);
             TAP.store(tap, Ordering::SeqCst);
             RUN_LOOP.store(rl, Ordering::SeqCst);
-            let s = main_scale();
-            CGWarpMouseCursorPosition(CGPoint { x: park.0 / s, y: park.1 / s });
+            CGWarpMouseCursorPosition(to_points(park.0, park.1));
             CGAssociateMouseAndMouseCursorPosition(0); // freeze the cursor; deltas still arrive
             set_cursor_hidden(true); // parked in the middle of this screen, it would only distract
             let _ = ready_tx.send(true);
@@ -303,8 +303,7 @@ impl SpatialPlatformEngine for MacEngine {
                 CFRunLoopStop(rl);
             }
             CGAssociateMouseAndMouseCursorPosition(1);
-            let s = main_scale();
-            CGWarpMouseCursorPosition(CGPoint { x: warp_to.0 / s, y: warp_to.1 / s });
+            CGWarpMouseCursorPosition(to_points(warp_to.0, warp_to.1));
         }
         set_cursor_hidden(false);
     }
@@ -314,8 +313,7 @@ impl SpatialPlatformEngine for MacEngine {
         unsafe {
             let ev = match event {
                 Injected::MoveTo { x, y } => {
-                    let s = main_scale();
-                    st.at = CGPoint { x: x / s, y: y / s };
+                    st.at = to_points(x, y);
                     // macOS needs *Dragged* while a button is held or apps never see the drag
                     let (ty, button) = match st.buttons {
                         b if b & 1 != 0 => (LEFT_DRAGGED, 0),
@@ -418,8 +416,20 @@ unsafe extern "C" fn tap_callback(_proxy: Ref, ty: u32, event: Ref, _info: Ref) 
     null_mut() // swallow
 }
 
-fn main_scale() -> f64 {
-    unsafe { display_scale(CGMainDisplayID()) }
+/// Global physical px (tao's space: each display at `origin_points * scale`) → global points.
+unsafe fn to_points(x: f64, y: f64) -> CGPoint {
+    let (mut ids, mut n) = ([0u32; 16], 0u32);
+    if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
+        for &id in &ids[..n as usize] {
+            let (b, s) = (CGDisplayBounds(id), display_scale(id));
+            let (l, t) = (b.origin.x * s, b.origin.y * s);
+            if x >= l && x < l + b.size.width * s && y >= t && y < t + b.size.height * s {
+                return CGPoint { x: x / s, y: y / s };
+            }
+        }
+    }
+    let s = display_scale(CGMainDisplayID());
+    CGPoint { x: x / s, y: y / s }
 }
 
 unsafe fn display_scale(id: u32) -> f64 {

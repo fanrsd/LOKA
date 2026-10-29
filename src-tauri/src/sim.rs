@@ -1,23 +1,24 @@
-//! `--sim-mobile`: a phone window on the same host, reached through the real UDP/TCP stack on loopback.
+//! `--sim-mobile`: a phone window on the same host, reached through the real UDP/TLS stack on loopback.
+//! It is a device of its own: its own certificate (kept in the cache dir), so it pairs like any other.
 
 use crate::{
     ask_user, kvm,
     network::{
-        discovery::{DeviceInfo, DeviceType, Peer, Role},
+        discovery::{DeviceInfo, DeviceType, Peer},
+        secure::{Identity, Tls},
         telemetry, transfer,
     },
     platform::{Edge, Injected, Portal, Rect},
     AppState,
 };
 use std::{
-    net::{IpAddr, Ipv4Addr},
+    net::Ipv4Addr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindowBuilder};
-use tokio::sync::watch;
 
 pub const LABEL: &str = "mobile-view";
-const FINGERPRINT: &str = "sim-mobile";
 // offset so the simulated phone never collides with this host's own listeners
 const TELEMETRY_PORT: u16 = telemetry::PORT + 10;
 const TRANSFER_PORT: u16 = transfer::PORT + 10;
@@ -30,8 +31,8 @@ const SCREEN: Rect = Rect { x: 0.0, y: 0.0, w: 300.0, h: 620.0 };
 struct WindowSink(AppHandle);
 
 impl kvm::Sink for WindowSink {
-    fn area(&self) -> Rect {
-        SCREEN
+    fn screens(&self) -> Vec<Rect> {
+        vec![SCREEN]
     }
     fn inject(&mut self, e: Injected) {
         let _ = self.0.emit_to(LABEL, "kvm-input", e);
@@ -55,33 +56,35 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
         .always_on_top(true)
         .build()?;
 
+    let tls = Arc::new(Tls::new(&Identity::load_or_create(&app.path().app_cache_dir()?.join("sim"))));
+    let me = tls.me.clone();
+    let host = app.state::<Arc<Tls>>().me.clone();
     let peer = Peer {
         info: DeviceInfo {
             alias: "Simulated phone".into(),
             device_type: DeviceType::Mobile,
             os: "sim".into(),
-            fingerprint: FINGERPRINT.into(),
+            fingerprint: me.clone(),
             aspect_ratio: 300.0 / 620.0,
             telemetry_port: TELEMETRY_PORT,
             transfer_port: TRANSFER_PORT,
             kvm_port: KVM_PORT,
-            role: Some(Role::Client),
         },
         addr: Ipv4Addr::LOCALHOST.into(),
         seen: Instant::now(),
     };
-    let portal = state.lock().unwrap().portal;
+    let portal = state.lock().unwrap().settings.portals.get(&me).copied();
     if let Some(p) = portal {
         place(app, &p)?;
     }
     // the simulated device "heartbeats" like a real one so it never goes stale
-    let (h, st) = (app.clone(), state.clone());
+    let (h, st, fp) = (app.clone(), state.clone(), me.clone());
     tauri::async_runtime::spawn(async move {
         let mut beat = tokio::time::interval(Duration::from_secs(5));
         loop {
             beat.tick().await;
             let fresh = Peer { seen: Instant::now(), ..peer.clone() };
-            if st.lock().unwrap().peers.insert(FINGERPRINT.into(), fresh.clone()).is_none() {
+            if st.lock().unwrap().peers.insert(fp.clone(), fresh.clone()).is_none() {
                 let _ = h.emit("peer", fresh);
             }
         }
@@ -98,11 +101,16 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
         }
     });
 
+    // only this host may reach the simulated phone, and only once paired with it
+    let paired = {
+        let (st, me, host) = (state.clone(), me.clone(), host.clone());
+        move |fp: &str| fp == host && st.lock().unwrap().settings.is_paired(&me)
+    };
     let dir = app.path().app_cache_dir()?.join("sim-received");
-    let h = app.clone();
+    let (h, t, allow) = (app.clone(), tls.clone(), paired.clone());
     tauri::async_runtime::spawn(async move {
         // the simulated phone has no clipboard: copied pictures/files from the host just land in a folder
-        let r = transfer::serve(TRANSFER_PORT, dir.clone(), dir.join("clipboard"), |ip| ip.is_loopback(), move |e| {
+        let r = transfer::serve(t, TRANSFER_PORT, dir.clone(), dir.join("clipboard"), allow, move |e| {
             let _ = h.emit_to(LABEL, "transfer", e);
         })
         .await;
@@ -111,25 +119,22 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
         }
     });
 
-    // Pairing prompts appear in the phone window; the pairing itself is stored by this host's Main side.
-    let (h, st) = (app.clone(), state.clone());
-    let allow = move |ip: IpAddr| match ip.is_loopback() && st.lock().unwrap().settings.is_paired(FINGERPRINT) {
-        true => Ok(()),
-        false => Err(kvm::Refusal::NotPaired),
-    };
+    // Pairing prompts appear in the phone window; the pairing itself is stored by this host's side.
+    let allow = move |fp: &str| if paired(fp) { Ok(()) } else { Err(kvm::Refusal::NotPaired) };
     let (a, st) = (app.clone(), state.clone());
-    let ask = move |ip: IpAddr| {
-        let (app, state) = (a.clone(), st.clone());
+    let ask = move |ip: std::net::IpAddr, fp: String| {
+        let (app, state, host, me) = (a.clone(), st.clone(), host.clone(), me.clone());
         async move {
-            if !ip.is_loopback() {
+            if fp != host {
                 return false;
             }
-            let host = Peer { info: app.state::<watch::Sender<DeviceInfo>>().borrow().clone(), addr: ip, seen: Instant::now() };
-            ask_user(&app, &state, LABEL, &host).await
+            let info = app.state::<tokio::sync::watch::Sender<DeviceInfo>>().borrow().clone();
+            ask_user(&app, &state, LABEL, &Peer { info, addr: ip, seen: Instant::now() }, &me).await
         }
     };
+    let h = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = kvm::serve(KVM_PORT, allow, ask, move |_, _| Some(WindowSink(h.clone()))).await {
+        if let Err(e) = kvm::serve(tls, KVM_PORT, allow, ask, move |_, _| Some(WindowSink(h.clone()))).await {
             eprintln!("sim kvm receiver stopped: {e}");
         }
     });
@@ -140,6 +145,7 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
 /// so dragging toward the portal never crosses the simulated phone.
 pub fn place(app: &AppHandle, portal: &Portal) -> tauri::Result<()> {
     let Some(w) = app.get_webview_window(LABEL) else { return Ok(()) };
+    let _ = w.emit_to(LABEL, "portal", portal.edge);
     let s = w.outer_size()?;
     let (sw, sh) = (s.width as f64, s.height as f64);
     let (m, b) = (portal.monitor, portal.hit_box());

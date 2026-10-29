@@ -1,10 +1,14 @@
-//! Shared mouse & keyboard. Pushing the cursor into the portal hands input to the paired device over TCP;
-//! pushing it out of that device's opposite edge (or Ctrl+Alt+Esc) hands it back.
+//! Shared mouse & keyboard. Pushing the cursor into a portal hands input to the paired device behind it;
+//! pushing it out of that device's opposite edge (or Ctrl+Alt+Esc) hands it back. Any paired device can
+//! drive any other; links are pinned TLS (`network::secure`).
 //!
 //! Wire: fixed 9-byte frames `tag | payload (8 bytes, LE)`. A Clipboard frame is followed by `len` bytes
-//! of UTF-8: the clipboard travels with the cursor (Main → Client on Enter, Client → Main on Return).
+//! of UTF-8: the clipboard travels with the cursor (driver → driven on Enter, back on Return).
 
-use crate::platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine, LOCK_SCAN};
+use crate::{
+    network::secure::Tls,
+    platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine, LOCK_SCAN},
+};
 use std::{
     future::Future,
     io,
@@ -17,7 +21,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::mpsc::unbounded_channel,
     time::timeout,
 };
@@ -45,31 +49,29 @@ pub enum Msg {
     /// Receiver → sender: cursor left through the entry edge at `y` (fraction along that edge).
     Return { y: f32 },
     Leave,
-    /// Main → client: ask the client's user to pair with this device.
+    /// Ask the other device's user to pair with this one.
     PairRequest,
     PairResponse { accepted: bool },
     /// Clipboard text follows: `len` bytes of UTF-8.
     Clipboard { len: u32 },
-    /// Client → Main: session turned down, so the Main can say why instead of "closed".
+    /// Driven → driver: session turned down, so the driver can say why instead of "closed".
     Refuse(Refusal),
-    /// Main → Client: cursor lock on/off; while on, the way back is not watched.
+    /// Driver → driven: cursor lock on/off; while on, the way back is not watched.
     Lock { on: bool },
     /// A file drag crosses with the cursor: its files come as transfer batch `batch` and become a
-    /// native drag on the other side. Main → Client right after Enter; Client → Main right before Return.
+    /// native drag on the other side. Driver → driven right after Enter; back right before Return.
     Drag { batch: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Refusal {
-    NotClient,
-    NotPaired,
-    NoScreen,
+    NotPaired = 1,
+    NoScreen = 2,
 }
 
 impl Refusal {
     fn text(self) -> &'static str {
         match self {
-            Refusal::NotClient => "the other device is set as Main, switch it to Client",
             Refusal::NotPaired => "the other device isn't paired with this one, pair them again",
             Refusal::NoScreen => "the other device has no screen to show the cursor on",
         }
@@ -155,7 +157,6 @@ impl Msg {
             9 => Msg::PairResponse { accepted: b[1] != 0 },
             10 => Msg::Clipboard { len: Some(u32::from_le_bytes(b[1..5].try_into().unwrap())).filter(|l| *l <= MAX_CLIPBOARD)? },
             11 => Msg::Refuse(match b[1] {
-                0 => Refusal::NotClient,
                 1 => Refusal::NotPaired,
                 2 => Refusal::NoScreen,
                 _ => return None,
@@ -178,7 +179,8 @@ async fn write_clipboard(w: &mut (impl AsyncWrite + Unpin), text: Option<String>
     let Some(text) = text.filter(|t| t.len() <= MAX_CLIPBOARD as usize) else { return Ok(()) };
     let mut frame = Msg::Clipboard { len: text.len() as u32 }.encode().to_vec();
     frame.extend_from_slice(text.as_bytes());
-    w.write_all(&frame).await
+    w.write_all(&frame).await?;
+    w.flush().await
 }
 
 /// The bytes after a Clipboard frame; `None` if they are not UTF-8 (still consumed, so framing holds).
@@ -188,8 +190,11 @@ async fn read_clipboard(r: &mut (impl AsyncRead + Unpin), len: u32) -> io::Resul
     Ok(String::from_utf8(b).ok())
 }
 
-/// Receiver-side cursor: absolute position inside `area`, entered through `edge`.
+/// Receiver-side cursor: absolute position on `screens` (all of the receiver's monitors), entered through
+/// `edge` of their bounding box.
 pub struct Receiver {
+    screens: Vec<Rect>,
+    /// bounding box of `screens`: its `edge` is the way back
     area: Rect,
     edge: Edge,
     x: f64,
@@ -213,12 +218,32 @@ pub enum Applied {
 /// entry edge returns even with the button held. 0 = none.
 pub static DRAG_OUT: AtomicU64 = AtomicU64::new(0);
 
+/// Bounding box of `screens`.
+pub fn bounds(screens: &[Rect]) -> Rect {
+    let x = screens.iter().map(|s| s.x).fold(f64::INFINITY, f64::min);
+    let y = screens.iter().map(|s| s.y).fold(f64::INFINITY, f64::min);
+    let r = screens.iter().map(|s| s.x + s.w).fold(f64::NEG_INFINITY, f64::max);
+    let b = screens.iter().map(|s| s.y + s.h).fold(f64::NEG_INFINITY, f64::max);
+    Rect { x, y, w: r - x, h: b - y }
+}
+
+/// The pixel on some screen closest to `(x, y)`: the cursor never sits in the gaps between monitors.
+fn nearest(screens: &[Rect], x: f64, y: f64) -> (f64, f64) {
+    screens
+        .iter()
+        .map(|s| (x.clamp(s.x, s.x + s.w - 1.0), y.clamp(s.y, s.y + s.h - 1.0)))
+        .min_by(|a, b| ((a.0 - x).powi(2) + (a.1 - y).powi(2)).total_cmp(&((b.0 - x).powi(2) + (b.1 - y).powi(2))))
+        .unwrap_or((x, y))
+}
+
 impl Receiver {
     /// The sender's right edge meets our left edge, etc.
-    pub fn enter(area: Rect, sender_edge: Edge, y: f32) -> (Self, Injected) {
+    pub fn enter(screens: Vec<Rect>, sender_edge: Edge, y: f32) -> (Self, Injected) {
         let edge = sender_edge.opposite();
+        let area = bounds(&screens);
         let (x, y) = edge_point(area, edge, y as f64, ENTER_INSET);
-        (Self { area, edge, x, y, buttons: 0, keys: Vec::new(), locked: false, drag_out: None }, Injected::MoveTo { x, y })
+        let (x, y) = nearest(&screens, x, y);
+        (Self { screens, area, edge, x, y, buttons: 0, keys: Vec::new(), locked: false, drag_out: None }, Injected::MoveTo { x, y })
     }
 
     pub fn apply(&mut self, e: InputEvent) -> Applied {
@@ -232,8 +257,7 @@ impl Receiver {
                     Edge::Top => ny < a.y,
                     Edge::Bottom => ny > a.y + a.h - 1.0,
                 };
-                self.x = nx.clamp(a.x, a.x + a.w - 1.0);
-                self.y = ny.clamp(a.y, a.y + a.h - 1.0);
+                (self.x, self.y) = nearest(&self.screens, nx, ny);
                 // never hand back mid-drag (the button-up would land on the wrong machine) unless the drag
                 // itself goes along, and never while locked
                 if crossed && (self.buttons == 0 || self.drag_out.is_some()) && !self.locked {
@@ -331,13 +355,21 @@ impl Tune {
 /// Sender side: capture local input and stream it until the peer returns control, Ctrl+Alt+Esc, or an error.
 /// Local input is always restored before returning. `drag`: a file drag crossing along (its transfer batch).
 /// Returns the batch of a file drag the peer sent back with the cursor, if any.
-pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr, portal: Portal, y: f32, mut tune: Tune, drag: Option<u64>) -> io::Result<Option<u64>> {
-    let s = timeout(Duration::from_secs(2), TcpStream::connect(to)).await??;
-    s.set_nodelay(true)?;
-    let (mut rd, mut wr) = s.into_split();
-    wr.write_all(&Msg::Enter { edge: portal.edge, y }.encode()).await?;
+pub async fn send_session(
+    tls: &Tls,
+    engine: Arc<dyn SpatialPlatformEngine>,
+    to: SocketAddr,
+    expect: &str,
+    portal: Portal,
+    y: f32,
+    mut tune: Tune,
+    drag: Option<u64>,
+) -> io::Result<Option<u64>> {
+    let (s, _) = tls.connect(to, Some(expect)).await?;
+    let (mut rd, mut wr) = tokio::io::split(s);
+    send(&mut wr, Msg::Enter { edge: portal.edge, y }).await?;
     if let Some(batch) = drag {
-        wr.write_all(&Msg::Drag { batch }.encode()).await?;
+        send(&mut wr, Msg::Drag { batch }).await?;
     }
     let fresh = clipboard_text().filter(|t| LAST_SHARED.lock().unwrap().as_ref() != Some(t));
     timeout(WRITE_TIMEOUT, write_clipboard(&mut wr, fresh.clone())).await??;
@@ -403,7 +435,7 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
                 }
                 Some(Captured::Input(e)) => e,
                 Some(Captured::Escape) | None => {
-                    let _ = timeout(WRITE_TIMEOUT, wr.write_all(&Msg::Leave.encode())).await;
+                    let _ = timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Leave)).await;
                     return Ok(());
                 }
             };
@@ -411,7 +443,7 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
                 if let Msg::Lock { on } = msg {
                     LOCKED.store(on, Ordering::SeqCst);
                 }
-                timeout(WRITE_TIMEOUT, wr.write_all(&msg.encode())).await??;
+                timeout(WRITE_TIMEOUT, send(&mut wr, msg)).await??;
             }
         }
     }
@@ -424,7 +456,8 @@ pub async fn send_session(engine: Arc<dyn SpatialPlatformEngine>, to: SocketAddr
 
 /// Where received input goes: the real OS, or the simulator window.
 pub trait Sink: Send {
-    fn area(&self) -> Rect;
+    /// Every monitor of this device, global physical px.
+    fn screens(&self) -> Vec<Rect>;
     fn inject(&mut self, e: Injected);
     /// Clipboard text to hand back with control; the simulator has none of its own.
     fn clipboard(&self) -> Option<String> {
@@ -435,10 +468,17 @@ pub trait Sink: Send {
     fn drag(&mut self, _batch: u64) {}
 }
 
-/// Main side of pairing: resolves once the client's user answers (or the request times out).
-pub async fn request_pair(to: SocketAddr) -> io::Result<bool> {
-    let mut s = timeout(Duration::from_secs(2), TcpStream::connect(to)).await??;
-    s.write_all(&Msg::PairRequest.encode()).await?;
+/// One frame, pushed out now: TLS would otherwise hold small frames back.
+async fn send(w: &mut (impl AsyncWrite + Unpin), m: Msg) -> io::Result<()> {
+    w.write_all(&m.encode()).await?;
+    w.flush().await
+}
+
+/// Ask the device at `to` (which must be `expect`, its discovered fingerprint) to pair; resolves once
+/// its user answers (or the request times out).
+pub async fn request_pair(tls: &Tls, to: SocketAddr, expect: &str) -> io::Result<bool> {
+    let (mut s, _) = tls.connect(to, Some(expect)).await?;
+    send(&mut s, Msg::PairRequest).await?;
     match timeout(PAIR_TIMEOUT + Duration::from_secs(5), read_msg(&mut s)).await? {
         Ok(Msg::PairResponse { accepted }) => Ok(accepted),
         Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected reply to pair request")),
@@ -446,40 +486,41 @@ pub async fn request_pair(to: SocketAddr) -> io::Result<bool> {
     }
 }
 
-/// How long a client's user has to accept a pairing request.
+/// How long the other device's user has to accept a pairing request.
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Client side. One connection at a time: a pairing request (answered by `ask_pair`) or an input
-/// session, which only peers passing `allow_session` (paired mains) may start. `make_sink` gets the
-/// Main's address and the edge the cursor enters (and leaves) through.
+/// Receiving side. One connection at a time: a pairing request (answered by `ask_pair` with the address
+/// and fingerprint of the asking device) or an input session, which only devices passing `allow_session`
+/// (paired fingerprints) may start. `make_sink` gets the driving device's fingerprint and the edge the
+/// cursor enters (and leaves) through.
 pub async fn serve<S: Sink, F: Future<Output = bool>>(
+    tls: Arc<Tls>,
     port: u16,
-    allow_session: impl Fn(IpAddr) -> Result<(), Refusal>,
-    ask_pair: impl Fn(IpAddr) -> F,
-    mut make_sink: impl FnMut(IpAddr, Edge) -> Option<S>,
+    allow_session: impl Fn(&str) -> Result<(), Refusal>,
+    ask_pair: impl Fn(IpAddr, String) -> F,
+    mut make_sink: impl FnMut(&str, Edge) -> Option<S>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     loop {
-        let (mut s, from) = listener.accept().await?;
-        let ip = from.ip();
-        let _ = s.set_nodelay(true);
-        // a silent connection must not block the (sequential) accept loop
+        let (tcp, from) = listener.accept().await?;
+        // a silent or broken connection must not block the (sequential) accept loop
+        let Ok((mut s, who)) = tls.accept(tcp).await else { continue };
         let Ok(Ok(first)) = timeout(Duration::from_secs(5), read_msg(&mut s)).await else { continue };
         match first {
             Msg::PairRequest => {
-                let accepted = ask_pair(ip).await;
-                let _ = s.write_all(&Msg::PairResponse { accepted }.encode()).await;
+                let accepted = ask_pair(from.ip(), who).await;
+                let _ = send(&mut s, Msg::PairResponse { accepted }).await;
             }
-            Msg::Enter { edge, y } => match allow_session(ip).and_then(|()| make_sink(ip, edge.opposite()).ok_or(Refusal::NoScreen)) {
+            Msg::Enter { edge, y } => match allow_session(&who).and_then(|()| make_sink(&who, edge.opposite()).ok_or(Refusal::NoScreen)) {
                 Ok(mut sink) => {
                     if let Err(e) = session(s, &mut sink, edge, y).await {
                         eprintln!("kvm session from {from} ended: {e}");
                     }
                 }
                 Err(r) => {
-                    // let the Main hang up first: closing with its clipboard frame unread resets the link and loses the Refuse
+                    // let the driver hang up first: closing with its clipboard frame unread resets the link and loses the Refuse
                     let _ = timeout(WRITE_TIMEOUT, async {
-                        s.write_all(&Msg::Refuse(r).encode()).await?;
+                        send(&mut s, Msg::Refuse(r)).await?;
                         tokio::io::copy(&mut s, &mut tokio::io::sink()).await
                     })
                     .await;
@@ -490,8 +531,8 @@ pub async fn serve<S: Sink, F: Future<Output = bool>>(
     }
 }
 
-async fn session(mut s: TcpStream, sink: &mut impl Sink, edge: Edge, y: f32) -> io::Result<()> {
-    let (mut rcv, first) = Receiver::enter(sink.area(), edge, y);
+async fn session(mut s: impl AsyncRead + AsyncWrite + Unpin, sink: &mut impl Sink, edge: Edge, y: f32) -> io::Result<()> {
+    let (mut rcv, first) = Receiver::enter(sink.screens(), edge, y);
     sink.inject(first);
     DRAG_OUT.store(0, Ordering::SeqCst);
     // hand the clipboard back only if it changed here, so the Main's own (maybe an image) survives
@@ -515,11 +556,11 @@ async fn session(mut s: TcpStream, sink: &mut impl Sink, edge: Edge, y: f32) -> 
                         }
                         if let Some(batch) = rcv.drag_out {
                             DRAG_OUT.store(0, Ordering::SeqCst);
-                            if let Err(e) = s.write_all(&Msg::Drag { batch }.encode()).await {
+                            if let Err(e) = send(&mut s, Msg::Drag { batch }).await {
                                 break Err(e);
                             }
                         }
-                        break s.write_all(&Msg::Return { y }.encode()).await;
+                        break send(&mut s, Msg::Return { y }).await;
                     }
                 }
             }
@@ -585,7 +626,7 @@ mod tests {
     #[test]
     fn enters_on_opposite_edge_and_returns_through_it() {
         // sender's portal is its right edge → we enter on our left edge
-        let (mut r, first) = Receiver::enter(AREA, Edge::Right, 0.5);
+        let (mut r, first) = Receiver::enter(vec![AREA], Edge::Right, 0.5);
         assert_eq!(first, Injected::MoveTo { x: 8.0, y: 250.0 });
         // jitter back toward the edge right after entering must not hand control back
         assert_eq!(r.apply(InputEvent::Move { dx: -3, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 5.0, y: 250.0 }));
@@ -596,8 +637,21 @@ mod tests {
     }
 
     #[test]
+    fn receiver_spans_every_monitor_but_never_their_gaps() {
+        // a wide screen and a taller one to its right; the sender sits to our right
+        let screens = vec![AREA, Rect { x: 1000.0, y: 0.0, w: 800.0, h: 1000.0 }];
+        let (mut r, first) = Receiver::enter(screens, Edge::Left, 0.75);
+        assert_eq!(first, Injected::MoveTo { x: 1791.0, y: 750.0 });
+        // moving left below the short screen stops at the tall one's edge, not in the empty corner
+        assert_eq!(r.apply(InputEvent::Move { dx: -900, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 1000.0, y: 750.0 }));
+        assert_eq!(r.apply(InputEvent::Move { dx: -500, dy: -600 }), Applied::Inject(Injected::MoveTo { x: 500.0, y: 150.0 }));
+        // the way back is the right edge of the whole desk
+        assert_eq!(r.apply(InputEvent::Move { dx: 2000, dy: 0 }), Applied::Return(0.15));
+    }
+
+    #[test]
     fn no_return_while_dragging_and_release_all_unsticks() {
-        let (mut r, _) = Receiver::enter(AREA, Edge::Right, 0.5);
+        let (mut r, _) = Receiver::enter(vec![AREA], Edge::Right, 0.5);
         r.apply(InputEvent::Key { scan: 0x1D, down: true });
         r.apply(InputEvent::Key { scan: 0x2E, down: true });
         r.apply(InputEvent::Button { button: 1, down: true });
@@ -614,7 +668,7 @@ mod tests {
 
     #[test]
     fn locked_receiver_keeps_the_cursor_until_unlocked() {
-        let (mut r, _) = Receiver::enter(AREA, Edge::Right, 0.5);
+        let (mut r, _) = Receiver::enter(vec![AREA], Edge::Right, 0.5);
         r.locked = true;
         assert_eq!(r.apply(InputEvent::Move { dx: -50, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 0.0, y: 250.0 }));
         r.locked = false;
@@ -646,12 +700,22 @@ mod tests {
 
     struct Recorder(Arc<Mutex<Vec<Injected>>>);
     impl Sink for Recorder {
-        fn area(&self) -> Rect {
-            AREA
+        fn screens(&self) -> Vec<Rect> {
+            vec![AREA]
         }
         fn inject(&mut self, e: Injected) {
             self.0.lock().unwrap().push(e);
         }
+    }
+
+    /// The device listening (behind `serve`) and the one connecting to it.
+    fn devices() -> (Arc<Tls>, Tls) {
+        use crate::network::secure::Identity;
+        (Arc::new(Tls::new(&Identity::generate())), Tls::new(&Identity::generate()))
+    }
+
+    async fn dial(t: &Tls, port: u16) -> crate::network::secure::ClientStream {
+        t.connect(([127, 0, 0, 1], port).into(), None).await.unwrap().0
     }
 
     #[tokio::test]
@@ -659,15 +723,16 @@ mod tests {
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
         let port = 53398;
-        tokio::spawn(serve(port, |_| Ok(()), |_| async { false }, move |_, _| Some(Recorder(g.clone()))));
+        let (them, me) = devices();
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut s = dial(&me, port).await;
         for m in [
             Msg::Enter { edge: Edge::Left, y: 0.0 },
             Msg::Input(InputEvent::Key { scan: 0x1D, down: true }),
             Msg::Leave,
         ] {
-            s.write_all(&m.encode()).await.unwrap();
+            send(&mut s, m).await.unwrap();
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
@@ -681,35 +746,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpaired_main_is_ignored_until_the_user_accepts_pairing() {
+    async fn unpaired_device_is_refused_until_the_user_accepts_pairing() {
         let got = Arc::new(Mutex::new(Vec::new()));
-        let paired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paired = Arc::new(Mutex::new(None::<String>));
         let (g, p1, p2) = (got.clone(), paired.clone(), paired.clone());
         let port = 53397;
-        let allow = move |_| if p1.load(std::sync::atomic::Ordering::SeqCst) { Ok(()) } else { Err(Refusal::NotPaired) };
-        let ask = move |_| {
+        let (them, me) = devices();
+        let them_fp = them.me.clone();
+        let allow = move |fp: &str| if p1.lock().unwrap().as_deref() == Some(fp) { Ok(()) } else { Err(Refusal::NotPaired) };
+        let ask = move |_, fp: String| {
             let p = p2.clone();
             async move {
-                p.store(true, std::sync::atomic::Ordering::SeqCst); // user taps "Accept"
+                *p.lock().unwrap() = Some(fp); // user taps "Pair": remembers who asked, by certificate
                 true
             }
         };
-        tokio::spawn(serve(port, allow, ask, move |_, _| Some(Recorder(g.clone()))));
+        tokio::spawn(serve(them, port, allow, ask, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
-        let enter = Msg::Enter { edge: Edge::Left, y: 0.0 }.encode();
+        let enter = Msg::Enter { edge: Edge::Left, y: 0.0 };
 
-        let mut s = TcpStream::connect(to).await.unwrap();
-        s.write_all(&enter).await.unwrap();
-        assert_eq!(read_msg(&mut s).await.unwrap(), Msg::Refuse(Refusal::NotPaired), "the Main is told why");
+        let mut s = dial(&me, port).await;
+        send(&mut s, enter).await.unwrap();
+        assert_eq!(read_msg(&mut s).await.unwrap(), Msg::Refuse(Refusal::NotPaired), "the driver is told why");
         assert!(got.lock().unwrap().is_empty(), "session before pairing must be dropped");
 
-        assert!(request_pair(to).await.unwrap());
-        let mut s = TcpStream::connect(to).await.unwrap();
-        s.write_all(&enter).await.unwrap();
-        s.write_all(&Msg::Leave.encode()).await.unwrap();
+        assert!(request_pair(&me, to, &them_fp).await.unwrap());
+        assert_eq!(paired.lock().unwrap().as_deref(), Some(me.me.as_str()));
+        let mut s = dial(&me, port).await;
+        send(&mut s, enter).await.unwrap();
+        send(&mut s, Msg::Leave).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(*got.lock().unwrap(), vec![Injected::MoveTo { x: 991.0, y: 0.0 }]);
+        // a third device with its own certificate is still a stranger
+        let (_, other) = devices();
+        let mut s = dial(&other, port).await;
+        send(&mut s, enter).await.unwrap();
+        assert_eq!(read_msg(&mut s).await.unwrap(), Msg::Refuse(Refusal::NotPaired));
     }
 
     /// Main-side engine: capture "works" (holds the input channel open, like a real hook) and
@@ -738,19 +811,21 @@ mod tests {
     #[tokio::test]
     async fn refused_session_says_why_and_gives_input_back() {
         let port = 53394;
-        tokio::spawn(serve(port, |_| Err(Refusal::NotClient), |_| async { false }, |_, _| None::<Recorder>));
+        let (them, me) = devices();
+        let them_fp = them.me.clone();
+        tokio::spawn(serve(them, port, |_| Err(Refusal::NotPaired), |_, _| async { false }, |_, _| None::<Recorder>));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
-        let e = send_session(engine.clone(), ([127, 0, 0, 1], port).into(), portal, 0.5, Tune::new(1.0, false), None).await.unwrap_err();
-        assert_eq!(e.to_string(), Refusal::NotClient.text());
+        let e = send_session(&me, engine.clone(), ([127, 0, 0, 1], port).into(), &them_fp, portal, 0.5, Tune::new(1.0, false), None).await.unwrap_err();
+        assert_eq!(e.to_string(), Refusal::NotPaired.text());
         assert_eq!(*engine.warped.lock().unwrap(), Some(portal.point(0.5, RETURN_INSET)));
     }
 
     struct Drags(Arc<Mutex<Vec<u64>>>);
     impl Sink for Drags {
-        fn area(&self) -> Rect {
-            AREA
+        fn screens(&self) -> Vec<Rect> {
+            vec![AREA]
         }
         fn inject(&mut self, _: Injected) {}
         fn drag(&mut self, batch: u64) {
@@ -763,11 +838,15 @@ mod tests {
         let port = 53392;
         let drags = Arc::new(Mutex::new(Vec::new()));
         let d = drags.clone();
-        tokio::spawn(serve(port, |_| Ok(()), |_| async { false }, move |_, _| Some(Drags(d.clone()))));
+        let (them, me) = devices();
+        let them_fp = them.me.clone();
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, move |_, _| Some(Drags(d.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
-        let main = tokio::spawn(send_session(engine.clone(), ([127, 0, 0, 1], port).into(), portal, 0.5, Tune::new(1.0, false), Some(5)));
+        let to: SocketAddr = ([127, 0, 0, 1], port).into();
+        let e = engine.clone();
+        let main = tokio::spawn(async move { send_session(&me, e, to, &them_fp, portal, 0.5, Tune::new(1.0, false), Some(5)).await });
         // other sessions in this test binary reset DRAG_OUT when they start; let them settle first
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(*drags.lock().unwrap(), vec![5], "the Client was told a drag came along");
@@ -785,8 +864,8 @@ mod tests {
         own: Arc<Mutex<Option<String>>>,
     }
     impl Sink for Clip {
-        fn area(&self) -> Rect {
-            AREA
+        fn screens(&self) -> Vec<Rect> {
+            vec![AREA]
         }
         fn inject(&mut self, _: Injected) {}
         fn clipboard(&self) -> Option<String> {
@@ -797,19 +876,20 @@ mod tests {
         }
     }
 
-    async fn crossing(port: u16, own: Arc<Mutex<Option<String>>>, send: Option<&str>, copy_on_client: Option<&str>) -> Option<String> {
+    async fn crossing(port: u16, own: Arc<Mutex<Option<String>>>, text: Option<&str>, copy_on_client: Option<&str>) -> Option<String> {
         let o = own.clone();
-        tokio::spawn(serve(port, |_| Ok(()), |_| async { false }, move |_, _| Some(Clip { own: o.clone() })));
+        let (them, me) = devices();
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, move |_, _| Some(Clip { own: o.clone() })));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        s.write_all(&Msg::Enter { edge: Edge::Left, y: 0.5 }.encode()).await.unwrap();
-        write_clipboard(&mut s, send.map(String::from)).await.unwrap();
+        let mut s = dial(&me, port).await;
+        send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.5 }).await.unwrap();
+        write_clipboard(&mut s, text.map(String::from)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Some(c) = copy_on_client {
             *own.lock().unwrap() = Some(c.into()); // user copies something on the Client
         }
         // entered on the receiver's right edge; pushing right crosses back
-        s.write_all(&Msg::Input(InputEvent::Move { dx: 5000, dy: 0 }).encode()).await.unwrap();
+        send(&mut s, Msg::Input(InputEvent::Move { dx: 5000, dy: 0 })).await.unwrap();
         let mut back = None;
         loop {
             match read_msg(&mut s).await.unwrap() {

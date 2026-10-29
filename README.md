@@ -15,13 +15,13 @@ Push the cursor through a glowing edge of your screen and it lands on the device
 
 ## What it does
 
-- **Shared mouse & keyboard.** One computer is the **Main**: its mouse and keyboard drive the others. Each device nearby runs LOKA as a **Client**.
+- **Shared mouse & keyboard, any direction.** Every computer running LOKA can drive the others and be driven by them: push the cursor over from whichever one your hands are on.
 - **The Bezel Portal.** You mark the stretch of your screen edge where the other device physically sits. Push the cursor into that glowing segment and it moves over. Push it out the far side of that device and it comes home. **Ctrl+Alt+Esc** always brings it back.
 - **Feels like one computer.** The cursor disappears from the screen you're driving from. Ctrl works as ⌘ on a Mac (and ⌘ as Ctrl on a PC), so shortcuts just work. Set the pointer speed over there and an optional edge delay so a quick flick past the edge stays put. **Scroll Lock** (F14 on a Mac) locks the pointer on the screen it's on.
 - **The keyboard and clipboard follow the cursor.** Whatever you type goes to the device the cursor is on. Copy on one computer, move over, and paste on the other, both directions: text, pictures (screenshots too, up to 10 MB) and files you copied in Explorer or Finder. Anything a password manager marks as secret stays home.
 - **Drag files across the edge.** Pick up files in Explorer or Finder and keep dragging past the glowing edge: the cursor carries them over, and you drop them in any folder or app on the other computer.
-- **Drop files on the edge, both ways.** Drag files or whole folders to the glowing edge and let go. They arrive in `Downloads/LOKA` on the paired device, folders with their structure, several files at once. While you control the Client, its edge back to the Main glows too: drag files there to send them the other way. Existing files are never overwritten. The glow fills up as the files travel, and both computers show progress, speed and time left. You can cancel, open the folder when it lands, and get a system notification on arrival.
-- **LocalSend-style pairing.** Devices on the same network find each other. Click one, then confirm on the other device. On networks that block discovery (guest Wi-Fi), add the Client by its IP address.
+- **Drop files on the edge, both ways.** Drag files or whole folders to the glowing edge and let go. They arrive in `Downloads/LOKA` on the paired device, folders with their structure, several files at once. While you control another computer, its edge leading back glows too: drag files there to send them the other way. Existing files are never overwritten. The glow fills up as the files travel, and both computers show progress, speed and time left. You can cancel, open the folder when it lands, and get a system notification on arrival.
+- **LocalSend-style pairing.** Devices on the same network find each other. Click one, then confirm on the other device. On networks that block discovery (guest Wi-Fi), add the other computer by its IP address. Pairing shows the same 6-digit code on both screens, so you know you paired the right one.
 - **Stays up to date.** **About** shows the version, what's new in each release, and tells you when a newer one is on GitHub.
 - **Make it yours.** Pick the glow colour, which also becomes the app's accent, how see-through the glow is, and the crossing animation: Ripple, Pulse or Calm.
 - **Lives in the tray.** Closing the window keeps LOKA sharing in the background. Click the tray icon to open it again, or choose **Quit LOKA** there to stop it.
@@ -31,13 +31,13 @@ Meet **Oka**, the little one from LOKA: a cursor, the thing that actually travel
 | | |
 |---|---|
 | <img src="docs/screenshots/home.webp" alt="Nearby devices, each shown as an Oka"> | <img src="docs/screenshots/pairing.webp" alt="Pairing prompt with two Okas facing each other"> |
-| <img src="docs/screenshots/client-waiting.webp" alt="A Client waiting for a Main"> | <img src="docs/screenshots/glow-violet.webp" alt="The same screen with a violet glow"> |
+| <img src="docs/screenshots/client-waiting.webp" alt="A device waiting to be paired"> | <img src="docs/screenshots/glow-violet.webp" alt="The same screen with a violet glow"> |
 
 ## Platforms
 
 | Platform | Status |
 |---|---|
-| Windows 10/11 | Works (Main and Client) |
+| Windows 10/11 | Works |
 | macOS | Code complete, still being tested on real hardware. Needs the **Accessibility** permission. |
 | Android | Planned |
 | iOS | Not planned: iOS does not allow apps to control the device's input |
@@ -56,15 +56,15 @@ Download the installer from [Releases](https://github.com/fanrsd/LOKA/releases/l
     xattr -dr com.apple.quarantine /Applications/LOKA.app
     ```
 
-  Allow **Accessibility** when asked (System Settings → Privacy & Security → Accessibility), on both Main and Client; on macOS 15+ also allow **Local Network**. After updating, if the mouse stops crossing, remove LOKA from the Accessibility list with **−** and turn it on again.
+  Allow **Accessibility** when asked (System Settings → Privacy & Security → Accessibility), on every Mac; on macOS 15+ also allow **Local Network**. After updating, if the mouse stops crossing, remove LOKA from the Accessibility list with **−** and turn it on again.
 
 Then:
 
-1. Open LOKA on both computers and pick a role: **Main** on the computer with the mouse and keyboard, **Client** on the other.
-2. On the Main, click the Client's Oka. Accept on the Client.
+1. Open LOKA on both computers.
+2. On one, click the other's Oka. Check that both show the same code, then accept on the other.
 3. Pick the edge and slide the glowing bar until it lines up with where the other device sits.
 
-Both devices must be on the same local network. LOKA uses UDP 53318 (discovery) and TCP 53319–53321 (telemetry, files, input). Guest Wi-Fi or routers with client isolation block discovery: on the Client, LOKA shows **This computer's address**; type it into **Add by IP** on the Main.
+Both devices must be on the same local network. LOKA uses UDP 53318 (discovery) and TCP 53319–53321 (telemetry, files, input). Guest Wi-Fi or routers with client isolation block discovery: LOKA shows **This computer's address** under **Add by IP**; type it into **Add by IP** on the other computer.
 
 ## Build from source
 
@@ -79,7 +79,7 @@ npm run tauri build      # installers in src-tauri/target/release/bundle
 
 ## Security
 
-LOKA is built for a trusted home or office network. Only paired devices can send input or files, but the traffic is not encrypted yet. Avoid public Wi-Fi.
+LOKA is built for a home or office network. Every connection between devices is encrypted (TLS 1.3), and each device has its own certificate: once paired, only that exact device can send input or files, even if someone else on the network copies its name or address.
 
 ## License
 
