@@ -34,6 +34,9 @@ pub struct DeviceInfo {
     pub telemetry_port: u16,
     pub transfer_port: u16,
     pub kvm_port: u16,
+    /// hardware address, so paired devices can wake this one (Wake-on-LAN)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -175,6 +178,7 @@ mod tests {
             telemetry_port: 1,
             transfer_port: 2,
             kvm_port: 3,
+            mac: None,
         };
         let v: serde_json::Value = serde_json::to_value(Announcement { info, announce: true }).unwrap();
         assert_eq!(v["deviceType"], "desktop");

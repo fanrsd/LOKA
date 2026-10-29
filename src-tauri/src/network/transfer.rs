@@ -2,6 +2,9 @@
 //! `u32 LE header_len | JSON Header | size bytes`.
 //! Also carries the clipboard when it is a picture or files (too big for a KVM frame): pictures as one
 //! PNG payload, files as a batch the receiver puts on its clipboard once every file arrived.
+//! A drag batch first sends a `manifest`: `size` bytes of JSON `[{name, size}]` (≤ 1 MiB, exactly
+//! `clip.files` entries, each name ≤ 259 UTF-16 units once made safe), so the receiver can start a
+//! native drag of files that are still arriving.
 
 use super::secure::Tls;
 
@@ -27,6 +30,8 @@ pub const PORT: u16 = 53320;
 const CHUNK: usize = 256 * 1024;
 const MAX_HEADER: u32 = 64 * 1024;
 const MAX_TEXT: u64 = 1024 * 1024;
+/// Longest relative path of a streamed drag file: a Windows `FILEDESCRIPTORW.cFileName` minus its NUL.
+const MAX_NAME: usize = 259;
 /// Clipboard picture cap (PNG bytes).
 pub const MAX_IMAGE: u64 = 10 << 20;
 
@@ -38,6 +43,8 @@ pub enum Kind {
     Url,
     /// clipboard picture, PNG
     Image,
+    /// names and sizes of a drag batch, sent before its files
+    Manifest,
 }
 
 /// Files sent together: copied on the sender's clipboard, or (`drag`) carried by a file drag across the edge.
@@ -56,6 +63,21 @@ pub struct Header {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip: Option<ClipBatch>,
+}
+
+/// One file a drag batch announced, resolved to where it lands here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Promised {
+    /// safe relative path, '/'-separated ("Photos/a.jpg")
+    pub name: String,
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Entry {
+    name: String,
+    size: u64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -79,6 +101,13 @@ pub enum TransferEvent {
         #[serde(skip)]
         batch: ClipBatch,
     },
+    /// a drag batch announced its files: a native drag of them can start before they arrive
+    Manifest {
+        #[serde(skip)]
+        batch: ClipBatch,
+        #[serde(skip)]
+        files: Vec<Promised>,
+    },
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -98,6 +127,27 @@ fn take_cancel(id: u64) -> io::Result<()> {
         true => Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
         false => Ok(()),
     }
+}
+
+/// Drag batches announced by a manifest and not complete yet: when a byte of them last arrived and
+/// whether a file failed, so a streamed drag waits for files still queued yet gives up on a dead sender.
+static STREAMED: Mutex<Option<HashMap<u64, (Instant, bool)>>> = Mutex::new(None);
+
+fn with_streamed<R>(f: impl FnOnce(&mut HashMap<u64, (Instant, bool)>) -> R) -> R {
+    f(STREAMED.lock().unwrap().get_or_insert_with(HashMap::new))
+}
+
+/// `None` once drag `batch` is complete (or was never announced).
+pub fn streamed(batch: u64) -> Option<(Instant, bool)> {
+    with_streamed(|m| m.get(&batch).copied())
+}
+
+pub(crate) fn announce(batch: u64) {
+    with_streamed(|m| m.insert(batch, (Instant::now(), false)));
+}
+
+pub(crate) fn fail(batch: u64) {
+    with_streamed(|m| m.get_mut(&batch).map(|e| e.1 = true));
 }
 
 /// Progress at most every 100 ms (plus the final chunk) so a 4 GB file doesn't flood the UI.
@@ -172,8 +222,21 @@ pub async fn send_text(tls: &Tls, to: SocketAddr, expect: &str, kind: Kind, text
 }
 
 pub async fn send_bytes(tls: &Tls, to: SocketAddr, expect: &str, kind: Kind, bytes: &[u8]) -> io::Result<()> {
+    send_raw(tls, to, expect, kind, None, bytes).await
+}
+
+/// Announce drag `batch`'s files (as `expand` named them) before sending them.
+pub async fn send_manifest(tls: &Tls, to: SocketAddr, expect: &str, batch: ClipBatch, files: &[(PathBuf, String)]) -> io::Result<()> {
+    let mut entries = Vec::with_capacity(files.len());
+    for (path, name) in files {
+        entries.push(Entry { name: name.clone(), size: tokio::fs::metadata(path).await?.len() });
+    }
+    send_raw(tls, to, expect, Kind::Manifest, Some(batch), &serde_json::to_vec(&entries)?).await
+}
+
+async fn send_raw(tls: &Tls, to: SocketAddr, expect: &str, kind: Kind, clip: Option<ClipBatch>, bytes: &[u8]) -> io::Result<()> {
     let (mut s, _) = tls.connect(to, Some(expect)).await?;
-    write_header(&mut s, &Header { kind, name: String::new(), size: bytes.len() as u64, clip: None }).await?;
+    write_header(&mut s, &Header { kind, name: String::new(), size: bytes.len() as u64, clip }).await?;
     s.write_all(bytes).await?;
     s.shutdown().await
 }
@@ -182,17 +245,17 @@ pub async fn send_bytes(tls: &Tls, to: SocketAddr, expect: &str, kind: Kind, byt
 type Batches = Arc<Mutex<HashMap<u64, (u32, BTreeSet<PathBuf>)>>>;
 
 /// Accept payloads forever, only from devices whose fingerprint passes `allow`.
-/// Dropped files land in `dir`, clipboard files in `clip_dir/<batch>`.
+/// Dropped files land in `dir()` (read per payload: it's a setting), clipboard files in `clip_dir/<batch>`.
 pub async fn serve(
     tls: Arc<Tls>,
     port: u16,
-    dir: PathBuf,
+    dir: impl Fn() -> PathBuf + Send + Sync + 'static,
     clip_dir: PathBuf,
     allow: impl Fn(&str) -> bool + Send + Sync + 'static,
     on_event: impl Fn(TransferEvent) + Send + Sync + 'static,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    let (on_event, allow) = (Arc::new(on_event), Arc::new(allow));
+    let (on_event, allow, dir) = (Arc::new(on_event), Arc::new(allow), Arc::new(dir));
     let batches = Batches::default();
     loop {
         let (tcp, from) = listener.accept().await?;
@@ -202,7 +265,7 @@ pub async fn serve(
             if !allow(&who) {
                 return;
             }
-            if let Err(e) = receive(s, &dir, &clip_dir, &batches, &*on_event).await {
+            if let Err(e) = receive(s, &dir(), &clip_dir, &batches, &*on_event).await {
                 eprintln!("transfer from {from} failed: {e}");
             }
         });
@@ -227,6 +290,18 @@ async fn receive(mut s: impl AsyncRead + Unpin, dir: &Path, clip_dir: &Path, bat
         on_event(TransferEvent::ClipImage { png });
         return Ok(());
     }
+    if h.kind == Kind::Manifest {
+        let batch = h.clip.filter(|b| b.drag).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "manifest outside a drag"))?;
+        if h.size > MAX_TEXT {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest too large"));
+        }
+        let mut json = vec![0u8; h.size as usize];
+        s.read_exact(&mut json).await?;
+        let files = manifest(&drag_dir(clip_dir, batch.id), batch, &json)?;
+        announce(batch.id);
+        on_event(TransferEvent::Manifest { batch, files });
+        return Ok(());
+    }
     if h.kind != Kind::File {
         if h.size > MAX_TEXT {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "text too large"));
@@ -240,7 +315,7 @@ async fn receive(mut s: impl AsyncRead + Unpin, dir: &Path, clip_dir: &Path, bat
 
     let id = next_id();
     let base = match h.clip {
-        Some(b) if b.drag => clip_dir.join(format!("drag-{}", b.id)),
+        Some(b) if b.drag => drag_dir(clip_dir, b.id),
         Some(b) => clip_dir.join(b.id.to_string()),
         None => dir.to_path_buf(),
     };
@@ -260,6 +335,9 @@ async fn receive(mut s: impl AsyncRead + Unpin, dir: &Path, clip_dir: &Path, bat
             done += n as u64;
             if tick.due(done, h.size) {
                 on_event(TransferEvent::Progress { id, outgoing: false, name: h.name.clone(), done, total: h.size });
+                if let Some(b) = h.clip.filter(|b| b.drag) {
+                    with_streamed(|m| m.get_mut(&b.id).map(|e| e.0 = Instant::now()));
+                }
             }
         }
         f.flush().await
@@ -279,6 +357,7 @@ async fn receive(mut s: impl AsyncRead + Unpin, dir: &Path, clip_dir: &Path, bat
                     (*arrived >= b.files).then(|| all.remove(&b.id)).flatten()
                 };
                 if let Some((_, roots)) = done {
+                    with_streamed(|m| m.remove(&b.id));
                     on_event(TransferEvent::ClipFiles { roots: roots.into_iter().collect(), batch: b });
                 }
             }
@@ -286,6 +365,9 @@ async fn receive(mut s: impl AsyncRead + Unpin, dir: &Path, clip_dir: &Path, bat
         Err(e) => {
             drop(f);
             let _ = tokio::fs::remove_file(&path).await; // don't leave a truncated file behind
+            if let Some(b) = h.clip.filter(|b| b.drag) {
+                fail(b.id);
+            }
             on_event(TransferEvent::Failed { id, outgoing: false, name: h.name, error: e.to_string() });
             return Err(e);
         }
@@ -293,10 +375,41 @@ async fn receive(mut s: impl AsyncRead + Unpin, dir: &Path, clip_dir: &Path, bat
     Ok(())
 }
 
+fn drag_dir(clip_dir: &Path, batch: u64) -> PathBuf {
+    clip_dir.join(format!("drag-{batch}"))
+}
+
+/// The parts of a sent relative path that can't climb out of the folder it lands in ("file" if none).
+fn safe_parts(name: &str) -> Vec<&str> {
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != "." && *p != ".." && !p.contains(':')).collect();
+    if parts.is_empty() { vec!["file"] } else { parts }
+}
+
+/// Where each announced file of drag `batch` will land under `base`, as `receive` names it.
+/// shortcut: two entries with the same name would collide (the second lands as "name (1)"); one OS drag can't hold both.
+fn manifest(base: &Path, batch: ClipBatch, json: &[u8]) -> io::Result<Vec<Promised>> {
+    let entries: Vec<Entry> = serde_json::from_slice(json)?;
+    if entries.len() != batch.files as usize {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest doesn't match its batch"));
+    }
+    entries
+        .into_iter()
+        .map(|e| {
+            let parts = safe_parts(&e.name);
+            let name = parts.join("/");
+            if name.encode_utf16().count() > MAX_NAME {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "name too long to stream"));
+            }
+            Ok(Promised { path: parts.iter().fold(base.to_path_buf(), |d, p| d.join(p)), name, size: e.size })
+        })
+        .collect()
+}
+
 /// Keep a relative path ("Photos/a.jpg") but nothing that climbs out of `dir`, and never overwrite.
 async fn create_unique(dir: &Path, name: &str) -> io::Result<(PathBuf, File)> {
-    let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != "." && *p != ".." && !p.contains(':')).collect();
-    let (base, folders) = parts.split_last().map(|(b, f)| (*b, f)).unwrap_or(("file", &[]));
+    let parts = safe_parts(name);
+    let (base, folders) = parts.split_last().unwrap();
+    let base = *base;
     let dir = &folders.iter().fold(dir.to_path_buf(), |d, p| d.join(p));
     let (stem, ext) = match base.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
@@ -332,7 +445,8 @@ mod tests {
         let port = 53399;
         let (them, me, stranger) = (Arc::new(Tls::new(&Identity::generate())), Tls::new(&Identity::generate()), Tls::new(&Identity::generate()));
         let (fp, mine) = (them.me.clone(), me.me.clone());
-        tokio::spawn(serve(them, port, dir.clone(), dir.join("clip"), move |who| who == mine, move |e| ev.lock().unwrap().push(e)));
+        let d = dir.clone();
+        tokio::spawn(serve(them, port, move || d.clone(), dir.join("clip"), move |who| who == mine, move |e| ev.lock().unwrap().push(e)));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
 
@@ -395,7 +509,8 @@ mod tests {
         let port = 53393;
         let (them, me) = (Arc::new(Tls::new(&Identity::generate())), Tls::new(&Identity::generate()));
         let fp = them.me.clone();
-        tokio::spawn(serve(them, port, dir.join("drops"), dir.join("clip"), |_| true, move |e| ev.lock().unwrap().push(e)));
+        let drops = dir.join("drops");
+        tokio::spawn(serve(them, port, move || drops.clone(), dir.join("clip"), |_| true, move |e| ev.lock().unwrap().push(e)));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
         let roots = |events: &Vec<TransferEvent>| events.iter().find_map(|e| match e { TransferEvent::ClipFiles { roots, .. } => Some(roots.clone()), _ => None });
@@ -415,6 +530,64 @@ mod tests {
         assert_eq!(std::fs::read(b.join("Folder").join("in.txt")).unwrap(), b"in");
         assert!(!dir.join("drops").exists(), "clipboard files never land with dropped ones");
         assert!(got.iter().any(|e| matches!(e, TransferEvent::ClipImage { png } if png == b"\x89PNG fake")));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[tokio::test]
+    async fn drag_manifest_comes_first_and_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("loka-manifest-{}", uuid::Uuid::new_v4()));
+        let src = std::env::temp_dir().join(format!("loka-mansrc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(src.join("Folder")).unwrap();
+        std::fs::write(src.join("Folder").join("in.txt"), b"inside").unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let port = 53388;
+        let (them, me) = (Arc::new(Tls::new(&Identity::generate())), Tls::new(&Identity::generate()));
+        let fp = them.me.clone();
+        let drops = dir.join("drops");
+        tokio::spawn(serve(them, port, move || drops.clone(), dir.join("clip"), |_| true, move |e| ev.lock().unwrap().push(e)));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let to: SocketAddr = ([127, 0, 0, 1], port).into();
+
+        let mut files = expand(&[src.join("Folder"), src.join("a.txt")]);
+        files.sort_by(|a, b| a.1.cmp(&b.1));
+        let batch = ClipBatch { id: 99, files: 2, drag: true };
+        send_manifest(&me, to, &fp, batch, &files).await.unwrap();
+        // a manifest outside a drag batch is refused
+        let _ = send_manifest(&me, to, &fp, ClipBatch { id: 98, files: 2, drag: false }, &files).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let base = dir.join("clip").join("drag-99");
+        let want = vec![
+            Promised { name: "Folder/in.txt".into(), path: base.join("Folder").join("in.txt"), size: 6 },
+            Promised { name: "a.txt".into(), path: base.join("a.txt"), size: 1 },
+        ];
+        {
+            let got = events.lock().unwrap();
+            let announced: Vec<_> = got.iter().filter_map(|e| match e { TransferEvent::Manifest { batch, files } => Some((*batch, files.clone())), _ => None }).collect();
+            assert_eq!(announced, vec![(batch, want)]);
+        }
+        assert!(streamed(99).is_some_and(|(_, failed)| !failed), "streaming until every file is here");
+        assert!(streamed(98).is_none());
+
+        for (path, name) in &files {
+            send_file(&me, to, &fp, path, name.clone(), Some(batch), next_id(), |_, _| {}).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(events.lock().unwrap().iter().any(|e| matches!(e, TransferEvent::ClipFiles { batch: b, .. } if b.id == 99)));
+        assert!(streamed(99).is_none(), "complete batches stop streaming");
+        assert_eq!(std::fs::read(base.join("Folder").join("in.txt")).unwrap(), b"inside");
+
+        // bounds: entry count must match the batch, names stay inside and fit a Windows file descriptor
+        let b = ClipBatch { id: 1, files: 1, drag: true };
+        let one = |name: &str| format!(r#"[{{"name":{},"size":3}}]"#, serde_json::to_string(name).unwrap());
+        assert_eq!(manifest(&base, b, one("../../x/./y.txt").as_bytes()).unwrap()[0].path, base.join("x").join("y.txt"));
+        assert!(manifest(&base, b, one(&"n".repeat(MAX_NAME)).as_bytes()).is_ok());
+        assert!(manifest(&base, b, one(&"n".repeat(MAX_NAME + 1)).as_bytes()).is_err());
+        assert!(manifest(&base, ClipBatch { files: 2, ..b }, one("a").as_bytes()).is_err());
+        assert!(manifest(&base, b, b"not json").is_err());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&src);
     }

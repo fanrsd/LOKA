@@ -4,5 +4,23 @@
 <dict>
   <key>NSLocalNetworkUsageDescription</key>
   <string>LOKA finds your other computers on this network and shares the mouse, keyboard and files with them.</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Files and folders to send</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.item</string>
+        <string>public.folder</string>
+      </array>
+    </dict>
+  </array>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>LOKA plays this Mac's sound on your other computer when you turn on sharing its sound.</string>
 </dict>
 </plist>

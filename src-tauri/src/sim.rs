@@ -69,6 +69,7 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
             telemetry_port: TELEMETRY_PORT,
             transfer_port: TRANSFER_PORT,
             kvm_port: KVM_PORT,
+            mac: None,
         },
         addr: Ipv4Addr::LOCALHOST.into(),
         seen: Instant::now(),
@@ -110,7 +111,8 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
     let (h, t, allow) = (app.clone(), tls.clone(), paired.clone());
     tauri::async_runtime::spawn(async move {
         // the simulated phone has no clipboard: copied pictures/files from the host just land in a folder
-        let r = transfer::serve(t, TRANSFER_PORT, dir.clone(), dir.join("clipboard"), allow, move |e| {
+        let (clip, drops) = (dir.join("clipboard"), dir.clone());
+        let r = transfer::serve(t, TRANSFER_PORT, move || drops.clone(), clip, allow, move |e| {
             let _ = h.emit_to(LABEL, "transfer", e);
         })
         .await;
@@ -134,7 +136,8 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
     };
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = kvm::serve(tls, KVM_PORT, allow, ask, move |_, _| Some(WindowSink(h.clone()))).await {
+        let sink = move |_: &str, _| Some(WindowSink(h.clone()));
+        if let Err(e) = kvm::serve(tls, KVM_PORT, allow, ask, |_, _| false, |_, _, _| {}, sink).await {
             eprintln!("sim kvm receiver stopped: {e}");
         }
     });

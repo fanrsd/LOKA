@@ -26,6 +26,29 @@ pub enum InputEvent {
     Button { button: u8, down: bool },
     Wheel { dx: i32, dy: i32 },
     Key { scan: u16, down: bool },
+    /// a Mac trackpad's system gesture, replayed as the receiving OS's shortcut
+    Gesture { gesture: Gesture },
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+pub enum Gesture {
+    /// the desktop (Space) to the left / right
+    SpaceLeft = 1,
+    SpaceRight = 2,
+    /// Mission Control / Task View
+    Overview = 3,
+    /// the front app's windows (App Exposé)
+    AppWindows = 4,
+    ShowDesktop = 5,
+    ZoomIn = 6,
+    ZoomOut = 7,
+}
+
+impl Gesture {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        use Gesture::*;
+        [SpaceLeft, SpaceRight, Overview, AppWindows, ShowDesktop, ZoomIn, ZoomOut].into_iter().find(|g| *g as u8 == b)
+    }
 }
 
 /// Scroll Lock (set-1), the cursor-lock key as in Synergy; a Mac's F14 maps to it.

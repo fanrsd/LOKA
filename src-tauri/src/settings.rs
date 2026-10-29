@@ -44,8 +44,24 @@ pub struct Settings {
     /// Addresses added by hand, for networks that drop discovery multicast.
     pub hosts: Vec<IpAddr>,
     pub cursor: CursorPrefs,
+    /// What paired devices may open on this one (all off until the user turns them on).
+    pub sharing: Sharing,
+    /// Where received files go; `None` = Downloads/LOKA.
+    pub received: Option<PathBuf>,
+    /// Paired devices' hardware addresses as they announced them, to wake them up (Wake-on-LAN).
+    pub macs: HashMap<String, String>,
     #[serde(skip)]
     path: PathBuf,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Sharing {
+    pub terminal: bool,
+    /// the folder paired devices can open as a network drive
+    pub folder: Option<PathBuf>,
+    pub sound: bool,
+    pub notifications: bool,
 }
 
 impl Settings {

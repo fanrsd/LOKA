@@ -8,7 +8,18 @@ export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: 
 export type Peer = { info: DeviceInfo; addr: string };
 export type PairedDevice = { fingerprint: string; alias: string };
 export type CursorPrefs = { speed: number; edgeDelayMs: number; swapCtrlCmd: boolean };
-export type Device = { info: DeviceInfo; paired: PairedDevice[]; portals: Record<string, Portal>; ips: string[]; hosts: string[]; cursor: CursorPrefs };
+export type Sharing = { terminal: boolean; folder: string | null; sound: boolean; notifications: boolean };
+export type Device = {
+  info: DeviceInfo;
+  paired: PairedDevice[];
+  portals: Record<string, Portal>;
+  ips: string[];
+  hosts: string[];
+  cursor: CursorPrefs;
+  sharing: Sharing;
+  received: string;
+  wakeable: string[];
+};
 
 const OS_LABEL: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux", android: "Android", ios: "iOS", sim: "Simulator" };
 export const osLabel = (os: string) => OS_LABEL[os] ?? os;

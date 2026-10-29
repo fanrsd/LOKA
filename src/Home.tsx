@@ -5,7 +5,11 @@ import { About, useUpdate } from "./About";
 import { Calibrate } from "./Calibrate";
 import { Face, type Mood } from "./Face";
 import { PairPrompt, osLabel, quietButton, type Device, type Peer } from "./Pairing";
+import { ClipHistory } from "./ClipHistory";
+import { Outbox } from "./Outbox";
 import { Pointer } from "./Pointer";
+import { Remote } from "./Remote";
+import { Sharing } from "./Sharing";
 import { Transfers } from "./Transfers";
 
 const SELECTED_KEY = "loka.selected";
@@ -24,11 +28,13 @@ export function Home() {
     const unPeer = listen("peer", refreshPeers);
     unPeer.then(refreshPeers);
     const unPaired = listen("paired", refreshDevice);
+    const unDevice = listen("device", refreshDevice);
     const unAbout = listen("about", () => setAbout(true)); // tray menu
     const prune = setInterval(refreshPeers, 5000); // devices that went quiet drop off
     return () => {
       unPeer.then((f) => f());
       unPaired.then((f) => f());
+      unDevice.then((f) => f());
       unAbout.then((f) => f());
       clearInterval(prune);
     };
@@ -55,8 +61,17 @@ export function Home() {
         </button>
       </header>
       <Devices device={device} peers={peers} onChange={refreshDevice} />
+      <Sharing key={String(device.sharing.folder)} initial={device.sharing} received={device.received} mac={device.info.os === "macos"} onChange={refreshDevice} />
+      <ClipHistory />
       <Transfers />
       <PairPrompt selfSeed={fingerprint} />
+      <footer className="mt-auto flex justify-end pt-10">
+        <button onClick={() => invoke("start_sim")} className="text-xs text-faint underline-offset-2 hover:text-muted hover:underline">
+          Developer: open phone simulator
+        </button>
+      </footer>
+
+      <Outbox device={device} peers={peers} />
       {about && <About update={update} seed={fingerprint} windows={device.info.os === "windows"} onClose={() => setAbout(false)} />}
     </main>
   );
@@ -179,6 +194,11 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
                 </span>
                 <span className="mt-3 w-full truncate text-center text-sm font-semibold">{p.alias}</span>
                 <span className="mt-0.5 text-xs text-muted">Offline</span>
+                {device.wakeable.includes(p.fingerprint) && (
+                  <button onClick={() => invoke("wake", { fingerprint: p.fingerprint })} className="mt-1 text-xs text-accent underline-offset-2 hover:underline">
+                    Wake up
+                  </button>
+                )}
                 <button onClick={() => invoke("unpair", { fingerprint: p.fingerprint })} className="mt-1 text-xs text-faint underline-offset-2 hover:text-danger hover:underline">
                   Forget
                 </button>
@@ -193,6 +213,7 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
         <>
           <Calibrate key={selected} fingerprint={selected} alias={current.info.alias} saved={device.portals[selected]} />
           <Pointer initial={device.cursor} mac={mac} />
+          <Remote key={selected} fingerprint={selected} alias={current.info.alias} />
           <div className="mt-4 flex justify-end">
             <button
               onClick={() => {
@@ -206,12 +227,6 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
           </div>
         </>
       )}
-
-      <footer className="mt-auto flex justify-end pt-10">
-        <button onClick={() => invoke("start_sim")} className="text-xs text-faint underline-offset-2 hover:text-muted hover:underline">
-          Developer: open phone simulator
-        </button>
-      </footer>
 
       {/* status toast while input is on another device, locked, or why it couldn't move */}
       {(kvm.active || kvm.error || locked) && (

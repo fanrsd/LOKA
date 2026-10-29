@@ -77,7 +77,7 @@ export function Pointer({ initial, mac }: { initial: CursorPrefs; mac: boolean }
 
       <p className="mt-6 text-xs leading-relaxed text-faint">
         <kbd className={kbd}>{mac ? "F14" : "Scroll Lock"}</kbd> keeps the pointer on the screen it's on.{" "}
-        <kbd className={kbd}>{mac ? "⌃ ⌥ Esc" : "Ctrl Alt Esc"}</kbd> always brings it home.
+        Tap <kbd className={kbd}>{mac ? "⌃" : "Ctrl"}</kbd> twice, or <kbd className={kbd}>{mac ? "⌃ ⌥ Esc" : "Ctrl Alt Esc"}</kbd>, to bring it home. Trackpad swipes between desktops, Mission Control and pinch-to-zoom work over there too.
       </p>
     </section>
   );

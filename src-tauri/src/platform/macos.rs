@@ -1,4 +1,4 @@
-use super::{Captured, CursorSample, Injected, InputEvent, SpatialPlatformEngine};
+use super::{Captured, CursorSample, Gesture, Injected, InputEvent, SpatialPlatformEngine};
 use objc2_app_kit::{NSMainMenuWindowLevel, NSWindow, NSWindowCollectionBehavior};
 use std::{
     ffi::c_void,
@@ -51,6 +51,9 @@ const SCROLL: u32 = 22;
 const OTHER_DOWN: u32 = 25;
 const OTHER_UP: u32 = 26;
 const OTHER_DRAGGED: u32 = 27;
+// undocumented: trackpad gestures and the Dock's Spaces/Mission Control swipes
+const GESTURE: u32 = 29;
+const DOCK_CONTROL: u32 = 30;
 const TAP_DISABLED_TIMEOUT: u32 = 0xFFFF_FFFE;
 const TAP_DISABLED_USER: u32 = 0xFFFF_FFFF;
 
@@ -61,6 +64,16 @@ const DELTA_Y: u32 = 5;
 const KEYCODE: u32 = 9;
 const SCROLL_AXIS1: u32 = 11;
 const SCROLL_AXIS2: u32 = 12;
+// undocumented gesture fields (as used by open-source gesture tools)
+const GESTURE_HID_TYPE: u32 = 110;
+const GESTURE_ZOOM: u32 = 113;
+const SWIPE_MOTION: u32 = 123;
+const SWIPE_PROGRESS: u32 = 124;
+const GESTURE_PHASE: u32 = 132;
+const HID_ZOOM: i64 = 8;
+const HID_DOCK_SWIPE: i64 = 23;
+const PHASE_BEGAN: i64 = 1;
+const PHASE_ENDED: i64 = 4;
 
 // CGEventFlags
 const FLAG_CAPS: u64 = 0x1_0000;
@@ -90,6 +103,7 @@ extern "C" {
     fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, callback: TapCallback, info: Ref) -> Ref;
     fn CGEventTapEnable(tap: Ref, enable: bool);
     fn CGEventGetIntegerValueField(event: Ref, field: u32) -> i64;
+    fn CGEventGetDoubleValueField(event: Ref, field: u32) -> f64;
     fn CGEventGetFlags(event: Ref) -> u64;
     fn CGEventSetFlags(event: Ref, flags: u64);
     fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32;
@@ -263,7 +277,7 @@ impl SpatialPlatformEngine for MacEngine {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || unsafe {
             let mask = [LEFT_DOWN, LEFT_UP, RIGHT_DOWN, RIGHT_UP, MOVED, LEFT_DRAGGED, RIGHT_DRAGGED, KEY_DOWN, KEY_UP,
-                FLAGS_CHANGED, SCROLL, OTHER_DOWN, OTHER_UP, OTHER_DRAGGED]
+                FLAGS_CHANGED, SCROLL, OTHER_DOWN, OTHER_UP, OTHER_DRAGGED, GESTURE, DOCK_CONTROL]
                 .iter()
                 .fold(0u64, |m, t| m | 1 << t);
             let tap = CGEventTapCreate(SESSION_TAP, HEAD_INSERT, TAP_DEFAULT, mask, tap_callback, null_mut());
@@ -408,12 +422,51 @@ unsafe extern "C" fn tap_callback(_proxy: Ref, ty: u32, event: Ref, _info: Ref) 
                 _ => None,
             }
         }
+        GESTURE | DOCK_CONTROL => gesture(event, field),
         _ => None,
     };
     if let Some(e) = input {
         let _ = c.out.send(Captured::Input(e));
     }
     null_mut() // swallow
+}
+
+/// Swipe progress summed over one Dock swipe and its motion; pinch amount since the last zoom step.
+static SWIPE: Mutex<(f64, i64, f64)> = Mutex::new((0.0, 0, 0.0));
+
+/// A Spaces/Mission Control swipe (when it ends) or a pinch (every step) as a portable gesture.
+unsafe fn gesture(event: Ref, field: impl Fn(u32) -> i64) -> Option<InputEvent> {
+    let mut s = SWIPE.lock().unwrap();
+    let phase = field(GESTURE_PHASE);
+    let g = match field(GESTURE_HID_TYPE) {
+        HID_DOCK_SWIPE => {
+            if phase == PHASE_BEGAN {
+                *s = (0.0, field(SWIPE_MOTION), 0.0);
+            }
+            s.0 += CGEventGetDoubleValueField(event, SWIPE_PROGRESS);
+            if phase != PHASE_ENDED || s.0 == 0.0 {
+                return None;
+            }
+            // shortcut: directions follow the published field notes, unverified on hardware
+            match (s.1, s.0 > 0.0) {
+                (1, true) => Gesture::SpaceRight,
+                (1, false) => Gesture::SpaceLeft,
+                (2, false) => Gesture::Overview,
+                (2, true) => Gesture::AppWindows,
+                (3, true) => Gesture::ShowDesktop,
+                _ => return None,
+            }
+        }
+        HID_ZOOM => {
+            s.2 += CGEventGetDoubleValueField(event, GESTURE_ZOOM);
+            let step = 0.15;
+            let g = if s.2 >= step { Gesture::ZoomIn } else if s.2 <= -step { Gesture::ZoomOut } else { return None };
+            s.2 = 0.0;
+            g
+        }
+        _ => return None,
+    };
+    Some(InputEvent::Gesture { gesture: g })
 }
 
 /// Global physical px (tao's space: each display at `origin_points * scale`) → global points.

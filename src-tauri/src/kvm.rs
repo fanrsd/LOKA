@@ -6,8 +6,8 @@
 //! of UTF-8: the clipboard travels with the cursor (driver → driven on Enter, back on Return).
 
 use crate::{
-    network::secure::Tls,
-    platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine, LOCK_SCAN},
+    network::secure::{ClientStream, ServerStream, Tls},
+    platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Gesture, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine, LOCK_SCAN},
 };
 use std::{
     future::Future,
@@ -17,12 +17,16 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf},
     net::TcpListener,
-    sync::mpsc::unbounded_channel,
+    sync::{
+        mpsc::{self, unbounded_channel, UnboundedReceiver},
+        Notify,
+    },
+    task::JoinHandle,
     time::timeout,
 };
 
@@ -61,6 +65,33 @@ pub enum Msg {
     /// A file drag crosses with the cursor: its files come as transfer batch `batch` and become a
     /// native drag on the other side. Driver → driven right after Enter; back right before Return.
     Drag { batch: u64 },
+    /// First frame of a connection for one of the device's services; it answers one byte (1 = shared)
+    /// and from then on the stream belongs to that service.
+    Open(Service),
+}
+
+/// What a paired device can open on this one, each only if this one's user shares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Service {
+    Shell = 1,
+    Files = 2,
+    Sound = 3,
+    Notifications = 4,
+}
+
+impl Service {
+    fn from_u8(b: u8) -> Option<Self> {
+        [Service::Shell, Service::Files, Service::Sound, Service::Notifications].into_iter().find(|s| *s as u8 == b)
+    }
+
+    fn not_shared(self) -> &'static str {
+        match self {
+            Service::Shell => "the other computer isn't sharing its terminal",
+            Service::Files => "the other computer isn't sharing a folder",
+            Service::Sound => "the other computer isn't sharing its sound",
+            Service::Notifications => "the other computer isn't sharing its notifications",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -112,6 +143,7 @@ impl Msg {
                 put(1, &scan.to_le_bytes());
                 put(3, &[down as u8]);
             }
+            Msg::Input(InputEvent::Gesture { gesture }) => put(0, &[14, gesture as u8]),
             Msg::Return { y } => {
                 put(0, &[6]);
                 put(1, &y.to_le_bytes());
@@ -129,6 +161,7 @@ impl Msg {
                 put(0, &[13]);
                 put(1, &batch.to_le_bytes());
             }
+            Msg::Open(s) => put(0, &[15, s as u8]),
         }
         b
     }
@@ -163,6 +196,8 @@ impl Msg {
             }),
             12 => Msg::Lock { on: b[1] != 0 },
             13 => Msg::Drag { batch: u64::from_le_bytes(b[1..9].try_into().unwrap()) },
+            14 => Msg::Input(InputEvent::Gesture { gesture: Gesture::from_u8(b[1])? }),
+            15 => Msg::Open(Service::from_u8(b[1])?),
             _ => return None,
         })
     }
@@ -172,6 +207,27 @@ async fn read_msg(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Msg> {
     let mut b = [0u8; FRAME];
     r.read_exact(&mut b).await?;
     Msg::decode(&b).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad kvm frame"))
+}
+
+/// Frame reader that can sit in a `select!`: a frame half-read when another branch wins stays buffered
+/// for the next call (`read` is cancel-safe, `read_exact` is not).
+#[derive(Default)]
+struct Frames {
+    buf: [u8; FRAME],
+    filled: usize,
+}
+
+impl Frames {
+    async fn next(&mut self, r: &mut (impl AsyncRead + Unpin)) -> io::Result<Msg> {
+        while self.filled < FRAME {
+            match r.read(&mut self.buf[self.filled..]).await? {
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                n => self.filled += n,
+            }
+        }
+        self.filled = 0;
+        Msg::decode(&self.buf).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad kvm frame"))
+    }
 }
 
 /// Send `text` as a Clipboard frame; nothing for an empty or oversized clipboard.
@@ -212,6 +268,8 @@ pub enum Applied {
     Inject(Injected),
     /// Hand control back; fraction along the entry edge.
     Return(f32),
+    /// several events (a gesture's shortcut)
+    Many(Vec<Injected>),
 }
 
 /// Client: a file drag here was handed to the Main (transfer batch id); the next push through the
@@ -261,11 +319,7 @@ impl Receiver {
                 // never hand back mid-drag (the button-up would land on the wrong machine) unless the drag
                 // itself goes along, and never while locked
                 if crossed && (self.buttons == 0 || self.drag_out.is_some()) && !self.locked {
-                    let along = match self.edge {
-                        Edge::Left | Edge::Right => (self.y - a.y) / a.h,
-                        Edge::Top | Edge::Bottom => (self.x - a.x) / a.w,
-                    };
-                    return Applied::Return(along as f32);
+                    return Applied::Return(self.along());
                 }
                 Applied::Inject(Injected::MoveTo { x: self.x, y: self.y })
             }
@@ -282,7 +336,24 @@ impl Receiver {
                 }
                 Applied::Inject(Injected::Key { scan, down })
             }
+            InputEvent::Gesture { gesture } => Applied::Many(gesture_keys(gesture, cfg!(target_os = "macos"))),
         }
+    }
+
+    /// Cursor position as a fraction along the entry edge.
+    fn along(&self) -> f32 {
+        let a = self.area;
+        let f = match self.edge {
+            Edge::Left | Edge::Right => (self.y - a.y) / a.h,
+            Edge::Top | Edge::Bottom => (self.x - a.x) / a.w,
+        };
+        f.clamp(0.0, 1.0) as f32
+    }
+
+    /// Put the cursor at `(x, y)` (back from a device further along the chain).
+    fn place(&mut self, x: f64, y: f64) -> Injected {
+        (self.x, self.y) = nearest(&self.screens, x, y);
+        Injected::MoveTo { x: self.x, y: self.y }
     }
 
     /// Key/button ups for everything still held, so nothing sticks when the session ends.
@@ -298,6 +369,34 @@ impl Receiver {
     }
 }
 
+/// The shortcut the receiving OS uses for a trackpad gesture.
+pub fn gesture_keys(g: Gesture, mac: bool) -> Vec<Injected> {
+    const CTRL: u16 = 0x1D;
+    const WIN: u16 = 0xE05B; // ⌘ on a Mac
+    let chord = |mods: &[u16], key: u16| {
+        let mut v: Vec<Injected> = mods.iter().map(|&scan| Injected::Key { scan, down: true }).collect();
+        v.extend([Injected::Key { scan: key, down: true }, Injected::Key { scan: key, down: false }]);
+        v.extend(mods.iter().rev().map(|&scan| Injected::Key { scan, down: false }));
+        v
+    };
+    let ctrl_wheel = |dy| vec![Injected::Key { scan: CTRL, down: true }, Injected::Wheel { dx: 0, dy }, Injected::Key { scan: CTRL, down: false }];
+    match (g, mac) {
+        (Gesture::SpaceLeft, true) => chord(&[CTRL], 0xE04B),
+        (Gesture::SpaceRight, true) => chord(&[CTRL], 0xE04D),
+        (Gesture::Overview, true) => chord(&[CTRL], 0xE048),
+        (Gesture::AppWindows, true) => chord(&[CTRL], 0xE050),
+        (Gesture::ShowDesktop, true) => chord(&[], 0x57), // F11
+        (Gesture::ZoomIn, true) => chord(&[WIN], 0x0D), // ⌘=
+        (Gesture::ZoomOut, true) => chord(&[WIN], 0x0C), // ⌘-
+        (Gesture::SpaceLeft, false) => chord(&[WIN, CTRL], 0xE04B),
+        (Gesture::SpaceRight, false) => chord(&[WIN, CTRL], 0xE04D),
+        (Gesture::Overview | Gesture::AppWindows, false) => chord(&[WIN], 0x0F), // Task View
+        (Gesture::ShowDesktop, false) => chord(&[WIN], 0x20), // Win+D
+        (Gesture::ZoomIn, false) => ctrl_wheel(120),
+        (Gesture::ZoomOut, false) => ctrl_wheel(-120),
+    }
+}
+
 /// Cursor lock (Scroll Lock / F14): the pointer stays on the device it is on. Set at home by the
 /// tracker, while driving by `send_session` from `Tune`; any session end clears it.
 pub static LOCKED: AtomicBool = AtomicBool::new(false);
@@ -309,12 +408,44 @@ pub struct Tune {
     /// sub-pixel motion left over after scaling, so slow speeds still move
     rest: (f32, f32),
     locked: bool,
+    /// double-tap Ctrl: when the Ctrl now held went down (and nothing else since), when the last clean tap ended
+    ctrl_down: Option<(Instant, bool)>,
+    tapped: Option<Instant>,
 }
+
+/// Both Ctrl taps of the "come home" double tap within this.
+const TAP: Duration = Duration::from_millis(400);
 
 impl Tune {
     /// A session never starts locked: the tracker does not cross while the lock is on.
     pub fn new(speed: f32, swap_ctrl_cmd: bool) -> Self {
-        Self { speed: speed.clamp(0.25, 4.0), swap_ctrl_cmd, rest: (0.0, 0.0), locked: false }
+        Self { speed: speed.clamp(0.25, 4.0), swap_ctrl_cmd, rest: (0.0, 0.0), locked: false, ctrl_down: None, tapped: None }
+    }
+
+    /// `true` when `e` completes a double tap of Ctrl (alone: no other key, click or scroll in between),
+    /// which brings the cursor home. Auto-repeat of a held Ctrl is not a tap.
+    pub fn home(&mut self, e: &InputEvent, now: Instant) -> bool {
+        match *e {
+            InputEvent::Move { .. } => {}
+            InputEvent::Key { scan: 0x1D | 0xE01D, down: true } => match self.ctrl_down {
+                Some(_) => {} // auto-repeat
+                None if self.tapped.is_some_and(|t| now - t < TAP) => {
+                    self.tapped = None;
+                    return true;
+                }
+                None => self.ctrl_down = Some((now, true)),
+            },
+            InputEvent::Key { scan: 0x1D | 0xE01D, down: false } => {
+                self.tapped = self.ctrl_down.take().filter(|(at, clean)| *clean && now - *at < TAP).map(|_| now);
+            }
+            _ => {
+                self.tapped = None;
+                if let Some((_, clean)) = &mut self.ctrl_down {
+                    *clean = false;
+                }
+            }
+        }
+        false
     }
 
     /// The frame for `e`, if any: moves scaled, Ctrl↔⌘ swapped, the lock key toggling the lock.
@@ -405,6 +536,9 @@ pub async fn send_session(
         }
     });
     let (mut back_y, mut back_drag) = (y, None);
+    let ended = END.notified();
+    tokio::pin!(ended);
+    ended.as_mut().enable();
     let result: io::Result<()> = async {
         // an event read past a run of moves, handled next turn
         let mut held: Option<Captured> = None;
@@ -417,6 +551,7 @@ pub async fn send_session(
                         (back_y, back_drag) = r.unwrap_or_else(|_| Err(closed()))?;
                         return Ok(());
                     }
+                    _ = &mut ended => Some(Captured::Escape),
                 },
             };
             let e = match c {
@@ -439,6 +574,10 @@ pub async fn send_session(
                     return Ok(());
                 }
             };
+            if tune.home(&e, Instant::now()) {
+                let _ = timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Leave)).await;
+                return Ok(());
+            }
             if let Some(msg) = tune.shape(e) {
                 if let Msg::Lock { on } = msg {
                     LOCKED.store(on, Ordering::SeqCst);
@@ -466,6 +605,26 @@ pub trait Sink: Send {
     fn set_clipboard(&mut self, _text: String) {}
     /// A file drag came along with the cursor; its files arrive as transfer batch `batch`.
     fn drag(&mut self, _batch: u64) {}
+    /// One of this device's own portals the cursor is pushing against at `(x, y)`: the way on to a third
+    /// device (a chain). Never back to the device driving this one.
+    fn hop(&self, _x: f64, _y: f64) -> Option<Hop> {
+        None
+    }
+}
+
+/// The next device of a chain: where it is, and the portal (and fraction along it) the cursor leaves through.
+pub struct Hop {
+    pub to: SocketAddr,
+    pub fp: String,
+    pub portal: Portal,
+    pub y: f32,
+}
+
+/// Running sessions end on this: driving ones like Ctrl+Alt+Esc, driven ones by handing the cursor back.
+static END: Notify = Notify::const_new();
+
+pub fn end_sessions() {
+    END.notify_waiters();
 }
 
 /// One frame, pushed out now: TLS would otherwise hold small frames back.
@@ -489,82 +648,279 @@ pub async fn request_pair(tls: &Tls, to: SocketAddr, expect: &str) -> io::Result
 /// How long the other device's user has to accept a pairing request.
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Receiving side. One connection at a time: a pairing request (answered by `ask_pair` with the address
-/// and fingerprint of the asking device) or an input session, which only devices passing `allow_session`
-/// (paired fingerprints) may start. `make_sink` gets the driving device's fingerprint and the edge the
-/// cursor enters (and leaves) through.
-pub async fn serve<S: Sink, F: Future<Output = bool>>(
+/// A stream to paired device `expect`'s `service`, once it answered that it shares it.
+pub async fn open(tls: &Tls, to: SocketAddr, expect: &str, service: Service) -> io::Result<ClientStream> {
+    let (mut s, _) = tls.connect(to, Some(expect)).await?;
+    send(&mut s, Msg::Open(service)).await?;
+    match timeout(Duration::from_secs(5), s.read_u8()).await?? {
+        1 => Ok(s),
+        _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, service.not_shared())),
+    }
+}
+
+/// A driver's connection waiting for the screen: stream, its fingerprint, entry edge and position.
+type Incoming = (ServerStream, String, Edge, f32);
+
+/// Receiving side. Every connection is handled on its own: a pairing request (answered by `ask_pair` with
+/// the address and fingerprint of the asking device), a service (`allow_service`, then `on_service` owns
+/// the stream), or an input session, which only devices passing `allow_session` (paired fingerprints) may
+/// start. One session at a time: a new driver takes over, handing the cursor back to the current one.
+/// `make_sink` gets the driving device's fingerprint and the edge the cursor enters (and leaves) through.
+pub async fn serve<S: Sink, F: Future<Output = bool> + Send + 'static>(
     tls: Arc<Tls>,
     port: u16,
-    allow_session: impl Fn(&str) -> Result<(), Refusal>,
-    ask_pair: impl Fn(IpAddr, String) -> F,
+    allow_session: impl Fn(&str) -> Result<(), Refusal> + Send + Sync + 'static,
+    ask_pair: impl Fn(IpAddr, String) -> F + Send + Sync + 'static,
+    allow_service: impl Fn(Service, &str) -> bool + Send + Sync + 'static,
+    on_service: impl Fn(Service, String, ServerStream) + Send + Sync + 'static,
     mut make_sink: impl FnMut(&str, Edge) -> Option<S>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    loop {
-        let (tcp, from) = listener.accept().await?;
-        // a silent or broken connection must not block the (sequential) accept loop
-        let Ok((mut s, who)) = tls.accept(tcp).await else { continue };
-        let Ok(Ok(first)) = timeout(Duration::from_secs(5), read_msg(&mut s)).await else { continue };
-        match first {
-            Msg::PairRequest => {
-                let accepted = ask_pair(from.ip(), who).await;
-                let _ = send(&mut s, Msg::PairResponse { accepted }).await;
-            }
-            Msg::Enter { edge, y } => match allow_session(&who).and_then(|()| make_sink(&who, edge.opposite()).ok_or(Refusal::NoScreen)) {
-                Ok(mut sink) => {
-                    if let Err(e) = session(s, &mut sink, edge, y).await {
-                        eprintln!("kvm session from {from} ended: {e}");
+    let (tx, mut rx) = mpsc::channel::<Incoming>(1);
+    let host = Arc::new((allow_session, ask_pair, allow_service, on_service));
+    let t = tls.clone();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, from) = match listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("kvm accept: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let (t, tx, host) = (t.clone(), tx.clone(), host.clone());
+            tokio::spawn(async move {
+                let (allow_session, ask_pair, allow_service, on_service) = &*host;
+                let Ok((mut s, who)) = t.accept(tcp).await else { return };
+                let Ok(Ok(first)) = timeout(Duration::from_secs(5), read_msg(&mut s)).await else { return };
+                match first {
+                    Msg::PairRequest => {
+                        let accepted = ask_pair(from.ip(), who).await;
+                        let _ = send(&mut s, Msg::PairResponse { accepted }).await;
                     }
+                    Msg::Enter { edge, y } => match allow_session(&who) {
+                        Ok(()) => {
+                            let _ = tx.send((s, who, edge, y)).await;
+                        }
+                        Err(r) => refuse(s, r).await,
+                    },
+                    Msg::Open(service) => {
+                        let ok = allow_service(service, &who);
+                        if s.write_all(&[ok as u8]).await.is_ok() && s.flush().await.is_ok() && ok {
+                            on_service(service, who, s);
+                        }
+                    }
+                    _ => {}
                 }
-                Err(r) => {
-                    // let the driver hang up first: closing with its clipboard frame unread resets the link and loses the Refuse
-                    let _ = timeout(WRITE_TIMEOUT, async {
-                        send(&mut s, Msg::Refuse(r)).await?;
-                        tokio::io::copy(&mut s, &mut tokio::io::sink()).await
-                    })
-                    .await;
-                }
-            },
-            _ => {}
+            });
+        }
+    });
+    let mut next = None;
+    loop {
+        let (s, who, edge, y) = match next.take() {
+            Some(i) => i,
+            None => rx.recv().await.ok_or_else(|| io::Error::other("kvm listener stopped"))?,
+        };
+        let Some(mut sink) = make_sink(&who, edge.opposite()) else {
+            tokio::spawn(refuse(s, Refusal::NoScreen));
+            continue;
+        };
+        match session(s, &mut sink, edge, y, &tls, &mut rx).await {
+            Ok(taken) => next = taken,
+            Err(e) => eprintln!("kvm session ended: {e}"),
         }
     }
 }
 
-async fn session(mut s: impl AsyncRead + AsyncWrite + Unpin, sink: &mut impl Sink, edge: Edge, y: f32) -> io::Result<()> {
+/// Turn a session down. The driver hangs up first: closing with its clipboard frame unread resets the
+/// link and loses the Refuse.
+async fn refuse(mut s: ServerStream, r: Refusal) {
+    let _ = timeout(WRITE_TIMEOUT, async {
+        send(&mut s, Msg::Refuse(r)).await?;
+        tokio::io::copy(&mut s, &mut tokio::io::sink()).await
+    })
+    .await;
+}
+
+/// The driver's input forwarded on to the next device of a chain until that one hands the cursor back.
+struct Relay {
+    wr: WriteHalf<ClientStream>,
+    back: UnboundedReceiver<Back>,
+    reader: JoinHandle<()>,
+    portal: Portal,
+    y: f32,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+enum Back {
+    Clipboard(String),
+    Return(f32),
+    Gone,
+}
+
+async fn start_relay(tls: &Tls, hop: Hop, clipboard: Option<String>) -> io::Result<Relay> {
+    let (c, _) = tls.connect(hop.to, Some(&hop.fp)).await?;
+    let (mut rd, mut wr) = tokio::io::split(c);
+    timeout(WRITE_TIMEOUT, async {
+        send(&mut wr, Msg::Enter { edge: hop.portal.edge, y: hop.y }).await?;
+        write_clipboard(&mut wr, clipboard).await
+    })
+    .await??;
+    let (tx, back) = unbounded_channel();
+    let reader = tokio::spawn(async move {
+        loop {
+            let b = match read_msg(&mut rd).await {
+                Ok(Msg::Return { y }) => Back::Return(y),
+                Ok(Msg::Clipboard { len }) => match read_clipboard(&mut rd, len).await {
+                    Ok(Some(text)) => Back::Clipboard(text),
+                    Ok(None) => continue,
+                    Err(_) => Back::Gone,
+                },
+                Ok(Msg::Refuse(_)) | Err(_) => Back::Gone,
+                Ok(_) => continue,
+            };
+            let last = !matches!(b, Back::Clipboard(_));
+            if tx.send(b).is_err() || last {
+                return;
+            }
+        }
+    });
+    Ok(Relay { wr, back, reader, portal: hop.portal, y: hop.y })
+}
+
+/// Give the cursor back to the driver at `y` along the entry edge: changed clipboard first (it stops
+/// reading once it sees Return), then a drag going along, then Return.
+async fn hand_back(s: &mut (impl AsyncWrite + Unpin), sink: &impl Sink, seen: &Option<String>, drag: Option<u64>, y: f32) -> io::Result<()> {
+    let now = sink.clipboard();
+    if now != *seen {
+        write_clipboard(s, now).await?;
+    }
+    if let Some(batch) = drag {
+        DRAG_OUT.store(0, Ordering::SeqCst);
+        send(s, Msg::Drag { batch }).await?;
+    }
+    send(s, Msg::Return { y }).await
+}
+
+/// One driven session. Ends with `Some` when another driver took over (its connection, to start next).
+async fn session(
+    mut s: impl AsyncRead + AsyncWrite + Unpin,
+    sink: &mut impl Sink,
+    edge: Edge,
+    y: f32,
+    tls: &Tls,
+    waiting: &mut mpsc::Receiver<Incoming>,
+) -> io::Result<Option<Incoming>> {
+    enum Ev {
+        Frame(io::Result<Msg>),
+        Back(Back),
+        Waiting(Option<Incoming>),
+        End,
+    }
     let (mut rcv, first) = Receiver::enter(sink.screens(), edge, y);
     sink.inject(first);
     DRAG_OUT.store(0, Ordering::SeqCst);
-    // hand the clipboard back only if it changed here, so the Main's own (maybe an image) survives
+    // hand the clipboard back only if it changed here, so the driver's own (maybe an image) survives
     let mut seen = sink.clipboard();
+    let (mut frames, mut relay, mut retry_at) = (Frames::default(), None::<Relay>, Instant::now());
+    let ended = END.notified();
+    tokio::pin!(ended);
+    ended.as_mut().enable();
     let result = loop {
-        match read_msg(&mut s).await {
-            Ok(Msg::Input(e)) => {
+        let ev = tokio::select! {
+            m = frames.next(&mut s) => Ev::Frame(m),
+            b = async {
+                match relay.as_mut() {
+                    Some(r) => r.back.recv().await.unwrap_or(Back::Gone),
+                    None => std::future::pending().await,
+                }
+            } => Ev::Back(b),
+            i = waiting.recv() => Ev::Waiting(i),
+            _ = &mut ended => Ev::End,
+        };
+        let m = match ev {
+            Ev::Frame(Ok(m)) => m,
+            Ev::Frame(Err(e)) => break Err(e),
+            Ev::Waiting(None) => break Err(io::Error::other("kvm listener stopped")),
+            // another device takes over, or the user ended it here: the cursor goes back to its driver
+            Ev::Waiting(Some(i)) => break hand_back(&mut s, sink, &seen, None, rcv.along()).await.map(|()| Some(i)),
+            Ev::End => break hand_back(&mut s, sink, &seen, None, rcv.along()).await.map(|()| None),
+            Ev::Back(Back::Clipboard(text)) => {
+                sink.set_clipboard(text);
+                continue;
+            }
+            Ev::Back(b) => {
+                let r = relay.take().expect("Back only while relaying");
+                let (x, y) = r.portal.point(if let Back::Return(y) = b { y } else { r.y }, RETURN_INSET);
+                sink.inject(rcv.place(x, y));
+                continue;
+            }
+        };
+        if let Some(r) = relay.as_mut() {
+            let sent = match m {
+                Msg::Input(_) | Msg::Lock { .. } => {
+                    if let Msg::Lock { on } = m {
+                        rcv.locked = on;
+                    }
+                    matches!(timeout(WRITE_TIMEOUT, send(&mut r.wr, m)).await, Ok(Ok(())))
+                }
+                Msg::Clipboard { len } => match read_clipboard(&mut s, len).await {
+                    Ok(Some(text)) => {
+                        sink.set_clipboard(text.clone());
+                        seen = Some(text.clone());
+                        matches!(timeout(WRITE_TIMEOUT, write_clipboard(&mut r.wr, Some(text))).await, Ok(Ok(())))
+                    }
+                    Ok(None) => true,
+                    Err(e) => break Err(e),
+                },
+                Msg::Leave => {
+                    let _ = timeout(WRITE_TIMEOUT, send(&mut r.wr, Msg::Leave)).await;
+                    break Ok(None);
+                }
+                _ => true,
+            };
+            if !sent {
+                // the next device stopped answering: the cursor comes back out of its portal here
+                let r = relay.take().expect("relaying");
+                let (x, y) = r.portal.point(r.y, RETURN_INSET);
+                sink.inject(rcv.place(x, y));
+            }
+            continue;
+        }
+        match m {
+            Msg::Input(e) => {
                 let out = DRAG_OUT.load(Ordering::SeqCst);
                 if out != 0 {
                     rcv.drag_out = Some(out);
                 }
                 match rcv.apply(e) {
-                    Applied::Inject(i) => sink.inject(i),
-                    Applied::Return(y) => {
-                        // clipboard first: the Main stops reading once it sees Return
-                        let now = sink.clipboard();
-                        if now != seen {
-                            if let Err(e) = write_clipboard(&mut s, now).await {
-                                break Err(e);
+                    Applied::Inject(i) => {
+                        sink.inject(i);
+                        let Injected::MoveTo { x, y } = i else { continue };
+                        if rcv.buttons != 0 || rcv.locked || Instant::now() < retry_at {
+                            continue;
+                        }
+                        if let Some(hop) = sink.hop(x, y) {
+                            match start_relay(tls, hop, sink.clipboard()).await {
+                                Ok(r) => relay = Some(r),
+                                Err(e) => {
+                                    eprintln!("kvm chain: {e}");
+                                    retry_at = Instant::now() + Duration::from_secs(1); // no reconnect storm at that edge
+                                }
                             }
                         }
-                        if let Some(batch) = rcv.drag_out {
-                            DRAG_OUT.store(0, Ordering::SeqCst);
-                            if let Err(e) = send(&mut s, Msg::Drag { batch }).await {
-                                break Err(e);
-                            }
-                        }
-                        break send(&mut s, Msg::Return { y }).await;
                     }
+                    Applied::Many(all) => all.into_iter().for_each(|i| sink.inject(i)),
+                    Applied::Return(y) => break hand_back(&mut s, sink, &seen, rcv.drag_out, y).await.map(|()| None),
                 }
             }
-            Ok(Msg::Clipboard { len }) => match read_clipboard(&mut s, len).await {
+            Msg::Clipboard { len } => match read_clipboard(&mut s, len).await {
                 Ok(Some(text)) => {
                     sink.set_clipboard(text.clone());
                     seen = Some(text);
@@ -572,14 +928,13 @@ async fn session(mut s: impl AsyncRead + AsyncWrite + Unpin, sink: &mut impl Sin
                 Ok(None) => {}
                 Err(e) => break Err(e),
             },
-            Ok(Msg::Leave) => break Ok(()),
-            Ok(Msg::Lock { on }) => rcv.locked = on,
-            Ok(Msg::Drag { batch }) => {
-                rcv.buttons |= 1; // the Main's button is still held: no return until it's released
+            Msg::Leave => break Ok(None),
+            Msg::Lock { on } => rcv.locked = on,
+            Msg::Drag { batch } => {
+                rcv.buttons |= 1; // the driver's button is still held: no return until it's released
                 sink.drag(batch);
             }
-            Ok(_) => {}
-            Err(e) => break Err(e),
+            _ => {}
         }
     };
     for i in rcv.release_all() {
@@ -724,7 +1079,7 @@ mod tests {
         let g = got.clone();
         let port = 53398;
         let (them, me) = devices();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, move |_, _| Some(Recorder(g.clone()))));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
         for m in [
@@ -761,7 +1116,7 @@ mod tests {
                 true
             }
         };
-        tokio::spawn(serve(them, port, allow, ask, move |_, _| Some(Recorder(g.clone()))));
+        tokio::spawn(serve(them, port, allow, ask, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
         let enter = Msg::Enter { edge: Edge::Left, y: 0.0 };
@@ -813,7 +1168,7 @@ mod tests {
         let port = 53394;
         let (them, me) = devices();
         let them_fp = them.me.clone();
-        tokio::spawn(serve(them, port, |_| Err(Refusal::NotPaired), |_, _| async { false }, |_, _| None::<Recorder>));
+        tokio::spawn(serve(them, port, |_| Err(Refusal::NotPaired), |_, _| async { false }, |_, _| false, |_, _, _| {}, |_, _| None::<Recorder>));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
@@ -840,7 +1195,7 @@ mod tests {
         let d = drags.clone();
         let (them, me) = devices();
         let them_fp = them.me.clone();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, move |_, _| Some(Drags(d.clone()))));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Drags(d.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
@@ -879,7 +1234,7 @@ mod tests {
     async fn crossing(port: u16, own: Arc<Mutex<Option<String>>>, text: Option<&str>, copy_on_client: Option<&str>) -> Option<String> {
         let o = own.clone();
         let (them, me) = devices();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, move |_, _| Some(Clip { own: o.clone() })));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Clip { own: o.clone() })));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
         send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.5 }).await.unwrap();
@@ -912,5 +1267,109 @@ mod tests {
         let back = crossing(53395, own.clone(), Some("from main"), None).await;
         assert_eq!(back, None);
         assert_eq!(own.lock().unwrap().as_deref(), Some("from main"));
+    }
+
+    #[test]
+    fn double_tap_ctrl_comes_home_but_not_shortcuts_or_repeats() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let key = |scan, down| InputEvent::Key { scan, down };
+        let mut t = Tune::new(1.0, false);
+        assert!(!t.home(&key(0x1D, true), at(0)));
+        assert!(!t.home(&key(0x1D, false), at(80)));
+        assert!(!t.home(&InputEvent::Move { dx: 3, dy: 0 }, at(100)), "the hand on the mouse doesn't break it");
+        assert!(t.home(&key(0xE01D, true), at(200)), "second tap, either Ctrl");
+        // Ctrl+C then Ctrl+V is not a double tap
+        let mut t = Tune::new(1.0, false);
+        for (e, ms) in [(key(0x1D, true), 0), (key(0x2E, true), 50), (key(0x2E, false), 90), (key(0x1D, false), 120)] {
+            assert!(!t.home(&e, at(ms)));
+        }
+        assert!(!t.home(&key(0x1D, true), at(200)));
+        // auto-repeat of a held Ctrl, Ctrl+click, and a slow second tap
+        let mut t = Tune::new(1.0, false);
+        assert!(!t.home(&key(0x1D, true), at(0)));
+        assert!(!t.home(&key(0x1D, true), at(300)));
+        let mut t = Tune::new(1.0, false);
+        t.home(&key(0x1D, true), at(0));
+        t.home(&InputEvent::Button { button: 1, down: true }, at(20));
+        t.home(&key(0x1D, false), at(60));
+        assert!(!t.home(&key(0x1D, true), at(120)));
+        let mut t = Tune::new(1.0, false);
+        t.home(&key(0x1D, true), at(0));
+        t.home(&key(0x1D, false), at(50));
+        assert!(!t.home(&key(0x1D, true), at(900)));
+    }
+
+    /// Device B: forwards to C once its cursor reaches x = 999 (its right edge).
+    struct Hopper {
+        rec: Arc<Mutex<Vec<Injected>>>,
+        next: (SocketAddr, String),
+    }
+    const RIGHT: Portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 120.0 };
+    impl Sink for Hopper {
+        fn screens(&self) -> Vec<Rect> {
+            vec![AREA]
+        }
+        fn inject(&mut self, e: Injected) {
+            self.rec.lock().unwrap().push(e);
+        }
+        fn hop(&self, x: f64, y: f64) -> Option<Hop> {
+            (x >= 999.0).then(|| Hop { to: self.next.0, fp: self.next.1.clone(), portal: RIGHT, y: (y / 500.0) as f32 })
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_travels_on_through_a_chain_and_back() {
+        let (b_rec, c_rec) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let (b, me) = devices();
+        let c = Arc::new(Tls::new(&crate::network::secure::Identity::generate()));
+        let (c_port, b_port) = (53391, 53390);
+        let cr = c_rec.clone();
+        tokio::spawn(serve(c.clone(), c_port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(cr.clone()))));
+        let (br, next) = (b_rec.clone(), (SocketAddr::from(([127, 0, 0, 1], c_port)), c.me.clone()));
+        tokio::spawn(serve(b, b_port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Hopper { rec: br.clone(), next: next.clone() })));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut s = dial(&me, b_port).await;
+        let step = |ms| tokio::time::sleep(Duration::from_millis(ms));
+        send(&mut s, Msg::Enter { edge: Edge::Right, y: 0.5 }).await.unwrap(); // A's right edge → B's left
+        send(&mut s, Msg::Input(InputEvent::Move { dx: 5000, dy: 0 })).await.unwrap(); // across B into C
+        step(300).await;
+        send(&mut s, Msg::Input(InputEvent::Key { scan: 0x1E, down: true })).await.unwrap();
+        send(&mut s, Msg::Input(InputEvent::Key { scan: 0x1E, down: false })).await.unwrap();
+        send(&mut s, Msg::Input(InputEvent::Move { dx: -5000, dy: 0 })).await.unwrap(); // out of C's entry edge
+        step(300).await;
+        send(&mut s, Msg::Input(InputEvent::Key { scan: 0x30, down: true })).await.unwrap(); // typed on B again
+        step(200).await;
+        let c_got = c_rec.lock().unwrap().clone();
+        assert_eq!(c_got[0], Injected::MoveTo { x: 8.0, y: 250.0 }, "C entered on its left edge, level with B's cursor");
+        assert!(c_got.contains(&Injected::Key { scan: 0x1E, down: true }) && !c_got.contains(&Injected::Key { scan: 0x30, down: true }));
+        let b_got = b_rec.lock().unwrap().clone();
+        assert!(!b_got.contains(&Injected::Key { scan: 0x1E, down: true }), "keys typed on C never reach B");
+        let back = b_got.iter().position(|e| *e == Injected::MoveTo { x: 987.0, y: 250.0 }).expect("cursor back out of B's portal");
+        assert_eq!(b_got[back + 1], Injected::Key { scan: 0x30, down: true });
+    }
+
+    #[tokio::test]
+    async fn a_new_driver_takes_over_and_the_old_one_gets_its_cursor_back() {
+        let rec = Arc::new(Mutex::new(Vec::new()));
+        let (b, first) = devices();
+        let second = Tls::new(&crate::network::secure::Identity::generate());
+        let port = 53389;
+        let r = rec.clone();
+        tokio::spawn(serve(b, port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(r.clone()))));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut one = dial(&first, port).await;
+        send(&mut one, Msg::Enter { edge: Edge::Right, y: 0.5 }).await.unwrap();
+        send(&mut one, Msg::Input(InputEvent::Key { scan: 0x2A, down: true })).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut two = dial(&second, port).await;
+        send(&mut two, Msg::Enter { edge: Edge::Bottom, y: 0.25 }).await.unwrap();
+        let back = timeout(Duration::from_secs(2), read_msg(&mut one)).await.unwrap().unwrap();
+        assert_eq!(back, Msg::Return { y: 0.5 });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let got = rec.lock().unwrap().clone();
+        // the first driver's held Shift is let go before the second one's cursor appears at our top edge
+        let up = got.iter().position(|e| *e == Injected::Key { scan: 0x2A, down: false }).unwrap();
+        assert_eq!(got[up + 1], Injected::MoveTo { x: 250.0, y: 8.0 });
     }
 }
