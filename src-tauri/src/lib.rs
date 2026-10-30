@@ -463,8 +463,12 @@ fn open_overlay(app: &AppHandle, label: &str, to: Option<String>, edge: Edge) ->
         .skip_taskbar(true)
         .resizable(cfg!(target_os = "linux")) // GTK ignores set_size on a non-resizable window; no decorations = no handles anyway
         .focused(false)
-        .visible(false) // shown by place_overlay
+        // WebView2 makes its input child window only once shown, so a hidden build leaves wry's file drop target off
+        // it (drags got ⊘); built shown off-screen, then hidden until place_overlay shows it (the child stays)
+        .visible(cfg!(target_os = "windows"))
+        .position(-32000.0, -32000.0)
         .build()?;
+    w.hide()?; // the band is only placed when a session starts
     let engine = app.state::<Arc<dyn SpatialPlatformEngine>>().inner().clone();
     let window = w.clone();
     // AppKit window setup belongs on the main thread
