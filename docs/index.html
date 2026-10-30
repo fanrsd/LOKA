@@ -139,7 +139,7 @@
 
   /* features */
   .features { margin-top: 56px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 44px 64px; list-style: none; }
-  .features li { display: grid; grid-template-columns: 44px 1fr; gap: 4px 18px; }
+  .features li { display: grid; grid-template-columns: 44px 1fr; gap: 4px 18px; align-content: start; }
   .features .dot { width: 44px; height: 44px; grid-row: span 2; }
   .features h3 { font-size: 18px; font-weight: 600; letter-spacing: -.01em; }
   .features p { color: var(--muted); font-size: 13.5px; }
@@ -282,7 +282,7 @@
         <button class="step" role="tab" aria-selected="false" data-shot="screenshots/pairing.webp">
           <span class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="8" cy="12" r="4.5"/><circle cx="16" cy="12" r="4.5"/></svg></span>
           <h3><span lang="en">Pair</span><span lang="id">Pairing</span></h3>
-          <p><span lang="en">Click one. It asks for your OK on the other screen.</span><span lang="id">Klik salah satunya. Perangkat itu meminta persetujuanmu.</span></p>
+          <p><span lang="en">Click one. Check that both screens show the same 6-digit code, then accept on the other one.</span><span lang="id">Klik salah satunya. Pastikan kedua layar menampilkan kode 6 digit yang sama, lalu terima di perangkat itu.</span></p>
         </button>
         <button class="step" role="tab" aria-selected="false" data-shot="screenshots/calibrate.webp">
           <span class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 4v16M3 12h11M10 8l4 4-4 4"/></svg></span>
@@ -306,16 +306,28 @@
         <p><span lang="en">Only the stretch of edge you mark is a door, so the rest of the edge works normally.</span><span lang="id">Hanya bagian tepi yang kamu tandai yang menjadi pintu, sisanya tetap normal.</span></p></li>
       <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="3"/><path d="M7 14h10" stroke-linecap="round"/></svg></span>
         <h3><span lang="en">Keyboard and clipboard follow</span><span lang="id">Keyboard dan clipboard ikut</span></h3>
-        <p><span lang="en">Typing goes to whichever device has the cursor, and what you copy comes along: text, pictures and files. Ctrl acts as ⌘ on a Mac, Scroll Lock keeps the pointer where it is, and <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd> always brings it home.</span><span lang="id">Ketikan masuk ke perangkat tempat kursor berada, dan yang kamu salin ikut terbawa: teks, gambar, dan file. Ctrl jadi ⌘ di Mac, Scroll Lock menahan pointer di tempatnya, dan <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Esc</kbd> selalu mengembalikannya.</span></p></li>
+        <p><span lang="en">Typing goes to whichever device has the cursor, and what you copy comes along: text, pictures and files. Recent clipboard keeps your last 12 copies, and <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> pastes what just arrived. Ctrl acts as ⌘ on a Mac, Mac trackpad gestures cross over, and tapping <kbd>Ctrl</kbd> twice always brings the cursor home.</span><span lang="id">Ketikan masuk ke perangkat tempat kursor berada, dan yang kamu salin ikut terbawa: teks, gambar, dan file. Recent clipboard menyimpan 12 salinan terakhir, dan <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> menempel yang baru tiba. Ctrl jadi ⌘ di Mac, gestur trackpad Mac ikut menyeberang, dan tekan <kbd>Ctrl</kbd> dua kali selalu memulangkan kursor.</span></p></li>
+      <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"><rect x="2" y="7" width="6" height="10" rx="1.5"/><rect x="9" y="5" width="6" height="14" rx="1.5"/><rect x="16" y="7" width="6" height="10" rx="1.5"/></svg></span>
+        <h3><span lang="en">One desk, more devices</span><span lang="id">Satu meja, banyak perangkat</span></h3>
+        <p><span lang="en">Any computer can drive any other. Place a third one next to the second and the cursor keeps going: PC to laptop to Mac. The tray can take control of any of them without touching the edge.</span><span lang="id">Komputer mana pun bisa mengendalikan yang lain. Taruh komputer ketiga di sebelah yang kedua dan kursor terus berjalan: PC ke laptop ke Mac. Menu tray bisa mengambil alih perangkat mana pun tanpa menyentuh tepi.</span></p></li>
       <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg></span>
         <h3><span lang="en">Drop files on the edge</span><span lang="id">Lempar file ke tepi</span></h3>
-        <p><span lang="en">Drag files past the glow and drop them in any folder or app on the other computer, or let go on the glow and they land in Downloads/LOKA. Nothing gets overwritten.</span><span lang="id">Seret file melewati garis yang menyala lalu lepas di folder atau aplikasi mana pun di komputer lain, atau lepas di garisnya dan semuanya masuk ke Downloads/LOKA. Tidak ada yang tertimpa.</span></p></li>
+        <p><span lang="en">Drag files past the glow and drop them in any folder or app on the other computer, or let go on the glow and they land in your chosen folder. Big files stream in as they arrive. Also from Explorer's Send to or Finder's Open With. Nothing gets overwritten.</span><span lang="id">Seret file melewati garis yang menyala lalu lepas di folder atau aplikasi mana pun di komputer lain, atau lepas di garisnya dan semuanya masuk ke folder pilihanmu. File besar langsung mengalir sambil terkirim. Bisa juga lewat Send to di Explorer atau Open With di Finder. Tidak ada yang tertimpa.</span></p></li>
+      <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg></span>
+        <h3><span lang="en">Share more, only if you want</span><span lang="id">Berbagi lebih, kalau kamu mau</span></h3>
+        <p><span lang="en">A folder that opens as a drive, your sound on the other speakers, your notifications, your microphone in calls on the other computer, a terminal, and Wake-on-LAN for a sleeping one. Everything starts off.</span><span lang="id">Folder yang terbuka sebagai drive, suaramu di speaker komputer lain, notifikasimu, mikrofonmu untuk call di komputer lain, terminal, dan Wake-on-LAN untuk yang sedang tidur. Semuanya mati sampai kamu nyalakan.</span></p></li>
+      <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2-5 4 10 2-5h6"/></svg></span>
+        <h3><span lang="en">A link that notices</span><span lang="id">Koneksi yang tahu diri</span></h3>
+        <p><span lang="en">If the other computer sleeps, drops off Wi-Fi or freezes, the cursor comes home within about 3 seconds and nothing stays pressed over there. Switching Wi-Fi mid-session keeps going.</span><span lang="id">Kalau komputer lain tidur, lepas dari Wi-Fi, atau macet, kursor pulang dalam sekitar 3 detik dan tidak ada tombol yang tertahan di sana. Pindah Wi-Fi di tengah sesi tetap jalan.</span></p></li>
       <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></span>
         <h3><span lang="en">Your glow, your way</span><span lang="id">Glow sesukamu</span></h3>
-        <p><span lang="en">Choose the glow colour and how a crossing feels: Ripple, Pulse or Calm. The app takes on your colour.</span><span lang="id">Pilih warna glow dan animasi saat menyeberang: Ripple, Pulse, atau Calm. Aplikasi ikut warnamu.</span></p></li>
+        <p><span lang="en">Choose the glow colour, how see-through it is, and how a crossing feels: Ripple, Pulse or Calm. The app takes on your colour.</span><span lang="id">Pilih warna glow, seberapa transparan, dan animasi saat menyeberang: Ripple, Pulse, atau Calm. Aplikasi ikut warnamu.</span></p></li>
+      <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M17 9a4 4 0 0 1 0 6"/></svg></span>
+        <h3><span lang="en">Feels at home</span><span lang="id">Terasa native</span></h3>
+        <p><span lang="en">Its own title bar, a soft tick on every click (one tap on the speaker mutes it), and it lives in the tray, sharing in the background.</span><span lang="id">Title bar sendiri, bunyi "tik" pelan di setiap klik (sekali ketuk speaker untuk mematikannya), dan tinggal di tray, tetap berbagi di latar belakang.</span></p></li>
       <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6z"/></svg></span>
         <h3><span lang="en">Stays on your network</span><span lang="id">Tetap di jaringanmu</span></h3>
-        <p><span lang="en">Devices talk directly over your LAN. No account, no server, no cloud.</span><span lang="id">Perangkat terhubung langsung lewat LAN. Tanpa akun, tanpa server, tanpa cloud.</span></p></li>
+        <p><span lang="en">Devices talk directly over your LAN, encrypted and pinned to each paired device. No account, no server, no cloud.</span><span lang="id">Perangkat terhubung langsung lewat LAN, terenkripsi dan terikat ke tiap perangkat pasangan. Tanpa akun, tanpa server, tanpa cloud.</span></p></li>
       <li><span class="dot"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5"/></svg></span>
         <h3><span lang="en">Open source</span><span lang="id">Open source</span></h3>
         <p><span lang="en">Apache 2.0. Read it, build it, improve it. Forks keep the credit.</span><span lang="id">Apache 2.0. Baca, build, kembangkan. Fork wajib mencantumkan sumbernya.</span></p></li>
@@ -360,7 +372,15 @@
     <div>
       <details>
         <summary><span lang="en">Does the keyboard move with the mouse?</span><span lang="id">Apakah keyboard ikut pindah bersama mouse?</span></summary>
-        <p><span lang="en">Yes. While the cursor is on another device, every key you press goes there instead. Ctrl+Alt+Esc returns both at once.</span><span lang="id">Ya. Selama kursor ada di perangkat lain, setiap tombol yang ditekan dikirim ke sana. Ctrl+Alt+Esc mengembalikan keduanya sekaligus.</span></p>
+        <p><span lang="en">Yes. While the cursor is on another device, every key you press goes there instead. Tapping Ctrl twice (or Ctrl+Alt+Esc) brings both home at once.</span><span lang="id">Ya. Selama kursor ada di perangkat lain, setiap tombol yang ditekan dikirim ke sana. Tekan Ctrl dua kali (atau Ctrl+Alt+Esc) untuk memulangkan keduanya sekaligus.</span></p>
+      </details>
+      <details>
+        <summary><span lang="en">Can I use three computers or more?</span><span lang="id">Bisa pakai tiga komputer atau lebih?</span></summary>
+        <p><span lang="en">Yes. Pair them in a row and place a glow on each computer toward its neighbour, e.g. on the PC toward the laptop and on the laptop toward the Mac. The cursor then goes from the PC through the laptop onto the Mac, and back the same way.</span><span lang="id">Bisa. Pair berurutan lalu pasang glow di tiap komputer ke arah tetangganya, misalnya di PC ke arah laptop dan di laptop ke arah Mac. Kursor lalu berjalan dari PC lewat laptop ke Mac, dan pulang lewat jalan yang sama.</span></p>
+      </details>
+      <details>
+        <summary><span lang="en">What if the other computer sleeps or loses Wi-Fi?</span><span lang="id">Bagaimana kalau komputer lain tidur atau putus Wi-Fi?</span></summary>
+        <p><span lang="en">The cursor comes home within about 3 seconds and nothing stays pressed on the other side. A paired computer that went to sleep gets a <b>Wake up</b> button.</span><span lang="id">Kursor pulang dalam sekitar 3 detik dan tidak ada tombol yang tertahan di seberang. Komputer pasangan yang tertidur punya tombol <b>Wake up</b>.</span></p>
       </details>
       <details>
         <summary><span lang="en">How do I send a file?</span><span lang="id">Bagaimana cara mengirim file?</span></summary>

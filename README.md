@@ -34,7 +34,7 @@ Meet **Oka**, the little one from LOKA: a cursor, the thing that actually travel
 | | |
 |---|---|
 | <img src="docs/screenshots/home.webp" alt="Nearby devices, each shown as an Oka"> | <img src="docs/screenshots/pairing.webp" alt="Pairing prompt with two Okas facing each other"> |
-| <img src="docs/screenshots/client-waiting.webp" alt="A device waiting to be paired"> | <img src="docs/screenshots/glow-violet.webp" alt="The same screen with a violet glow"> |
+| <img src="docs/screenshots/waiting.webp" alt="Waiting for the MacBook Air to accept, with the pairing code to compare"> | <img src="docs/screenshots/glow-violet.webp" alt="The same screen with a violet glow"> |
 
 ## Platforms
 

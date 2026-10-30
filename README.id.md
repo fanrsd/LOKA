@@ -35,7 +35,7 @@ Kenalan dengan **Oka**, si kecil dari LOKA: sebuah kursor, benda yang memang ber
 | | |
 |---|---|
 | <img src="docs/screenshots/home.webp" alt="Perangkat di sekitar, masing-masing tampil sebagai Oka"> | <img src="docs/screenshots/pairing.webp" alt="Permintaan pairing dengan dua Oka saling berhadapan"> |
-| <img src="docs/screenshots/client-waiting.webp" alt="Perangkat menunggu di-pairing"> | <img src="docs/screenshots/glow-violet.webp" alt="Layar yang sama dengan glow ungu"> |
+| <img src="docs/screenshots/waiting.webp" alt="Menunggu MacBook Air menerima, dengan kode pairing untuk dicocokkan"> | <img src="docs/screenshots/glow-violet.webp" alt="Layar yang sama dengan glow ungu"> |
 
 ## Platform
 
