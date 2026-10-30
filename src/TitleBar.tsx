@@ -5,9 +5,21 @@ import { setSoundOn, soundOn, tick } from "./sound";
 export const isMac = navigator.userAgent.includes("Mac");
 const win = getCurrentWindow();
 
-// Windows' own caption glyphs (Segoe Fluent Icons on 11, MDL2 Assets on 10)
+// Windows' own caption glyphs (Segoe Fluent Icons on 11, MDL2 Assets on 10); Linux has neither font, so the same shapes are drawn
 const GLYPH = { minimize: "\uE921", maximize: "\uE922", restore: "\uE923", close: "\uE8BB" };
+const SHAPE = { minimize: "M0.5 5.5h10", maximize: "M1 1h9v9H1z", restore: "M3 1h7v7M1 3h7v7H1z", close: "M1 1l9 9M10 1l-9 9" };
+const segoe = navigator.userAgent.includes("Windows");
 const glyphFont = { fontFamily: "Segoe Fluent Icons, Segoe MDL2 Assets" };
+
+function Glyph({ name }: { name: keyof typeof GLYPH }) {
+  if (segoe) return <>{GLYPH[name]}</>;
+  return (
+    <svg aria-hidden width="10" height="10" viewBox="0 0 11 11" fill="none" stroke="currentColor" strokeWidth="1">
+      <path d={SHAPE[name]} />
+    </svg>
+  );
+}
+
 const control =
   "grid h-full w-[46px] place-items-center text-[10px] text-muted transition-colors duration-100 hover:bg-white/[0.06] hover:text-fg active:bg-white/[0.04] focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent";
 
@@ -49,7 +61,7 @@ export function TitleBar() {
       {!isMac && (
         <>
           <button onClick={() => win.minimize()} aria-label="Minimize" className={control} style={glyphFont}>
-            {GLYPH.minimize}
+            <Glyph name="minimize" />
           </button>
           <button
             onClick={() => win.toggleMaximize()}
@@ -57,7 +69,7 @@ export function TitleBar() {
             className={control}
             style={glyphFont}
           >
-            {maximized ? GLYPH.restore : GLYPH.maximize}
+            <Glyph name={maximized ? "restore" : "maximize"} />
           </button>
           <button
             onClick={() => win.close()}
@@ -65,7 +77,7 @@ export function TitleBar() {
             className={`${control} hover:bg-[#c42b1c] hover:text-white active:bg-[#c42b1c]/90`}
             style={glyphFont}
           >
-            {GLYPH.close}
+            <Glyph name="close" />
           </button>
         </>
       )}

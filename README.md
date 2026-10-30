@@ -42,6 +42,7 @@ Meet **Oka**, the little one from LOKA: a cursor, the thing that actually travel
 |---|---|
 | Windows 10/11 | Works |
 | macOS | Code complete, still being tested on real hardware. Needs the **Accessibility** permission. |
+| Linux | New: X11 and Wayland desktops, and servers without a desktop (`loka --headless`). Still being tested on real hardware. |
 | Android | Planned |
 | iOS | Not planned: iOS does not allow apps to control the device's input |
 
@@ -60,6 +61,8 @@ Download the installer from [Releases](https://github.com/fanrsd/LOKA/releases/l
     ```
 
   Allow **Accessibility** when asked (System Settings → Privacy & Security → Accessibility), on every Mac; on macOS 15+ also allow **Local Network**. After updating, if the mouse stops crossing, remove LOKA from the Accessibility list with **−** and turn it on again.
+- **Linux:** `LOKA_x.y.z_amd64.deb` (Debian, Ubuntu), the `.rpm` (Fedora), or the `.AppImage`. LOKA reads the mouse and keyboard below the desktop, so it needs permission once: **About → Allow input access** (asks for your password).
+- **Linux server without a desktop:** install the `.deb` or `.rpm`, then run `sudo loka --headless` on it (or `sudo loka --allow-input` once, then `loka --headless` as your user). Pair from LOKA on another computer and answer the code in the terminal. Its keyboard input lands on the server's console.
 
 Then:
 

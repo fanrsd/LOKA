@@ -72,7 +72,7 @@ export function Home() {
       </footer>
 
       <Outbox device={device} peers={peers} />
-      {about && <About update={update} seed={fingerprint} windows={device.info.os === "windows"} onClose={() => setAbout(false)} />}
+      {about && <About update={update} seed={fingerprint} os={device.info.os} onClose={() => setAbout(false)} />}
     </main>
   );
 }

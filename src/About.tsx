@@ -50,8 +50,27 @@ export function useUpdate(): Update {
   return { ...s, available: latest && s.current && isNewer(latest.tag, s.current) ? latest : undefined, check };
 }
 
-export function About({ update, seed, windows, onClose }: { update: Update; seed: string; windows: boolean; onClose: () => void }) {
-  const [firewall, setFirewall] = useState<"idle" | "busy" | "done" | string>("idle");
+/** One-time permission fix per OS: Windows Firewall, Linux input devices. */
+const FIX: Record<string, { title: string; text: string; button: string; command: string; failed: string }> = {
+  windows: {
+    title: "Network",
+    text: "Other computers can't find this one, or can't move over? Windows Firewall may be blocking LOKA on this network.",
+    button: "Allow through Windows Firewall",
+    command: "allow_firewall",
+    failed: "Windows Firewall was not changed",
+  },
+  linux: {
+    title: "Mouse and keyboard",
+    text: "LOKA reads the mouse and keyboard and types for other devices below the desktop, so it works on X11, Wayland and the console. That needs your permission once.",
+    button: "Allow input access",
+    command: "allow_input",
+    failed: "Input access was not allowed",
+  },
+};
+
+export function About({ update, seed, os, onClose }: { update: Update; seed: string; os: string; onClose: () => void }) {
+  const [fixed, setFixed] = useState<"idle" | "busy" | "done" | string>("idle");
+  const fix = FIX[os];
 
   useEffect(() => {
     const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -60,8 +79,8 @@ export function About({ update, seed, windows, onClose }: { update: Update; seed
   }, [onClose]);
 
   const allow = () => {
-    setFirewall("busy");
-    invoke("allow_firewall").then(() => setFirewall("done"), (e) => setFirewall(String(e)));
+    setFixed("busy");
+    invoke(fix.command).then(() => setFixed("done"), (e) => setFixed(String(e) || fix.failed));
   };
 
   return (
@@ -118,18 +137,16 @@ export function About({ update, seed, windows, onClose }: { update: Update; seed
             )}
           </section>
 
-          {windows && (
+          {fix && (
             <section className="mt-6">
-              <h3 className="text-xs font-medium text-faint">Network</h3>
-              <p className="mt-2 text-sm leading-relaxed text-muted">
-                Other computers can't find this one, or can't move over? Windows Firewall may be blocking LOKA on this network.
-              </p>
+              <h3 className="text-xs font-medium text-faint">{fix.title}</h3>
+              <p className="mt-2 text-sm leading-relaxed text-muted">{fix.text}</p>
               <div className="mt-3 flex items-center gap-3">
-                <button onClick={allow} disabled={firewall === "busy" || firewall === "done"} className={quietButton + " ring-1 ring-line"}>
-                  Allow through Windows Firewall
+                <button onClick={allow} disabled={fixed === "busy" || fixed === "done"} className={quietButton + " ring-1 ring-line"}>
+                  {fix.button}
                 </button>
-                <span role="status" className={`text-xs ${firewall === "done" ? "text-fg" : "text-danger"}`}>
-                  {firewall === "done" ? "Allowed" : firewall === "idle" || firewall === "busy" ? "" : firewall}
+                <span role="status" className={`text-xs ${fixed === "done" ? "text-fg" : "text-danger"}`}>
+                  {fixed === "done" ? "Allowed" : fixed === "idle" || fixed === "busy" ? "" : fixed}
                 </span>
               </div>
             </section>
@@ -180,7 +197,7 @@ function Notes({ text }: { text: string }) {
   };
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim().replace(/^#+\s*/, "");
-    if (!line || /^\*\*(Windows|macOS):\*\*/.test(line)) continue;
+    if (!line || /^\*\*(Windows|macOS|Linux):\*\*/.test(line)) continue;
     if (/^[-*] /.test(line)) items.push(line.slice(2));
     else {
       flush();

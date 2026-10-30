@@ -118,6 +118,7 @@ pub enum PairAnswer {
 pub enum Refusal {
     NotPaired = 1,
     NoScreen = 2,
+    NoInput = 3,
 }
 
 impl Refusal {
@@ -125,6 +126,7 @@ impl Refusal {
         match self {
             Refusal::NotPaired => "the other device isn't paired with this one, pair them again",
             Refusal::NoScreen => "the other device has no screen to show the cursor on",
+            Refusal::NoInput => "the other device doesn't let LOKA use its mouse and keyboard yet: there, open About → Allow input access (or run `sudo loka --allow-input`)",
         }
     }
 }
@@ -216,6 +218,7 @@ impl Msg {
             11 => Msg::Refuse(match b[1] {
                 1 => Refusal::NotPaired,
                 2 => Refusal::NoScreen,
+                3 => Refusal::NoInput,
                 _ => return None,
             }),
             12 => Msg::Lock { on: b[1] != 0 },
@@ -312,7 +315,7 @@ pub fn bounds(screens: &[Rect]) -> Rect {
 }
 
 /// The pixel on some screen closest to `(x, y)`: the cursor never sits in the gaps between monitors.
-fn nearest(screens: &[Rect], x: f64, y: f64) -> (f64, f64) {
+pub(crate) fn nearest(screens: &[Rect], x: f64, y: f64) -> (f64, f64) {
     screens
         .iter()
         .map(|s| (x.clamp(s.x, s.x + s.w - 1.0), y.clamp(s.y, s.y + s.h - 1.0)))
@@ -1024,7 +1027,7 @@ mod tests {
             Msg::Input(InputEvent::Key { scan: 0xE05B, down: false }),
             Msg::Return { y: 1.0 },
             Msg::Leave,
-            Msg::Refuse(Refusal::NoScreen),
+            Msg::Refuse(Refusal::NoInput),
             Msg::Lock { on: true },
             Msg::Drag { batch: u64::MAX - 1 },
             Msg::PairRequest,

@@ -43,6 +43,7 @@ Kenalan dengan **Oka**, si kecil dari LOKA: sebuah kursor, benda yang memang ber
 |---|---|
 | Windows 10/11 | Berjalan |
 | macOS | Kode lengkap, masih diuji di perangkat asli. Perlu izin **Accessibility**. |
+| Linux | Baru: desktop X11 dan Wayland, serta server tanpa desktop (`loka --headless`). Masih diuji di perangkat asli. |
 | Android | Direncanakan |
 | iOS | Tidak direncanakan: iOS tidak mengizinkan aplikasi mengendalikan input perangkat |
 
@@ -61,6 +62,8 @@ Unduh installer dari [Releases](https://github.com/fanrsd/LOKA/releases/latest):
     ```
 
   Izinkan **Accessibility** saat diminta (System Settings → Privacy & Security → Accessibility), di setiap Mac; di macOS 15+ izinkan juga **Local Network**. Setelah update, jika mouse tidak bisa pindah lagi, hapus LOKA dari daftar Accessibility dengan tombol **−** lalu aktifkan lagi.
+- **Linux:** `LOKA_x.y.z_amd64.deb` (Debian, Ubuntu), `.rpm` (Fedora), atau `.AppImage`. LOKA membaca mouse dan keyboard di bawah desktop, jadi perlu izin sekali: **About → Allow input access** (minta password).
+- **Server Linux tanpa desktop:** pasang `.deb` atau `.rpm`, lalu jalankan `sudo loka --headless` di server (atau `sudo loka --allow-input` sekali, lalu `loka --headless` sebagai user biasa). Pair dari LOKA di komputer lain dan jawab kodenya di terminal. Ketikan keyboard masuk ke console server.
 
 Lalu:
 

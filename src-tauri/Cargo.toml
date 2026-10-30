@@ -1,6 +1,6 @@
 [package]
 name = "loka"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/fanrsd/LOKA"
@@ -41,6 +41,11 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSWindow", "NSResponder", "NSPasteboard", "NSFilePromiseProvider", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSView", "NSApplication", "NSImage", "NSGraphicsContext"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSEnumerator", "NSURL", "NSError", "NSOperation", "NSGeometry", "NSData", "NSDictionary"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+x11rb = { version = "0.13", features = ["randr"] }
+libc = "0.2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }

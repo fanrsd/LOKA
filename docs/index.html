@@ -149,7 +149,7 @@
   kbd { font: inherit; padding: 1px 6px; border-radius: 6px; background: rgb(255 255 255 / .08); color: var(--fg); }
 
   /* download */
-  .downloads { margin-top: 48px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+  .downloads { margin-top: 48px; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
   .os { border-radius: 22px; padding: 30px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); display: flex; flex-direction: column; gap: 14px; }
   .os h3 { font-size: 30px; font-weight: 800; letter-spacing: -.03em; display: flex; align-items: center; gap: 14px; }
   .os p { color: var(--muted); font-size: 13.5px; }
@@ -245,7 +245,7 @@
     <ul class="checks">
       <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Free and open source</span><span lang="id">Gratis dan open source</span></li>
       <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">No account, no cloud</span><span lang="id">Tanpa akun, tanpa cloud</span></li>
-      <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Windows and macOS</span><span lang="id">Windows dan macOS</span></li>
+      <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Windows, macOS and Linux</span><span lang="id">Windows, macOS dan Linux</span></li>
       <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Drop files across screens</span><span lang="id">Lempar file antar layar</span></li>
     </ul>
 
@@ -363,6 +363,17 @@
         <div class="cmd"><code>xattr -dr com.apple.quarantine /Applications/LOKA.app</code><button type="button" class="copy"><span lang="en">Copy</span><span lang="id">Salin</span></button></div>
         <a class="btn" href="https://github.com/fanrsd/LOKA/releases/latest"><span lang="en">Download for macOS</span><span lang="id">Unduh untuk macOS</span></a>
       </article>
+      <article class="os">
+        <h3><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M7 9l3 2.5L7 14M12 14h5M8 20h8"/></svg>Linux</h3>
+        <p><span lang="en">X11, Wayland, or a server without a desktop. <b>.deb</b>, <b>.rpm</b> or <b>.AppImage</b>.</span><span lang="id">X11, Wayland, atau server tanpa desktop. <b>.deb</b>, <b>.rpm</b> atau <b>.AppImage</b>.</span></p>
+        <ol>
+          <li><span lang="en">Install the package for your distro, then open LOKA.</span><span lang="id">Pasang paket untuk distro kamu, lalu buka LOKA.</span></li>
+          <li><span lang="en">Once: <b>About → Allow input access</b> (asks for your password).</span><span lang="id">Sekali saja: <b>About → Allow input access</b> (minta password).</span></li>
+          <li><span lang="en">No desktop? Run it in the terminal and answer the pairing code there:</span><span lang="id">Tanpa desktop? Jalankan di terminal dan jawab kode pairing di sana:</span></li>
+        </ol>
+        <div class="cmd"><code>sudo loka --headless</code><button type="button" class="copy"><span lang="en">Copy</span><span lang="id">Salin</span></button></div>
+        <a class="btn" href="https://github.com/fanrsd/LOKA/releases/latest"><span lang="en">Download for Linux</span><span lang="id">Unduh untuk Linux</span></a>
+      </article>
     </div>
   </section>
 
@@ -396,6 +407,10 @@
       <details>
         <summary><span lang="en">Why does macOS ask for Accessibility?</span><span lang="id">Kenapa macOS meminta izin Accessibility?</span></summary>
         <p><span lang="en">macOS only lets apps read and move the mouse and keyboard with that permission. Without it LOKA can't hand input over.</span><span lang="id">macOS hanya mengizinkan aplikasi membaca dan menggerakkan mouse serta keyboard dengan izin itu. Tanpanya LOKA tidak bisa memindahkan input.</span></p>
+      </details>
+      <details>
+        <summary><span lang="en">Can LOKA control a Linux server without a desktop?</span><span lang="id">Bisakah LOKA mengendalikan server Linux tanpa desktop?</span></summary>
+        <p><span lang="en">Yes. Run <code>sudo loka --headless</code> on the server, pair from LOKA on another computer and type <b>y</b> when the code matches. Push the cursor off the edge you placed for it, and your keyboard types on the server's console.</span><span lang="id">Bisa. Jalankan <code>sudo loka --headless</code> di server, pair dari LOKA di komputer lain lalu ketik <b>y</b> kalau kodenya sama. Dorong kursor ke tepi yang kamu atur untuknya, dan keyboard kamu mengetik di console server.</span></p>
       </details>
       <details>
         <summary><span lang="en">Can't see the other computer?</span><span lang="id">Komputer lain tidak terlihat?</span></summary>

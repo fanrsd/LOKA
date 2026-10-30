@@ -3,6 +3,8 @@ mod carry;
 mod clip;
 mod kvm;
 mod network;
+#[cfg(target_os = "linux")]
+mod headless;
 mod platform;
 mod notify;
 mod settings;
@@ -354,6 +356,24 @@ async fn allow_firewall() -> Result<(), String> {
     Err("Only needed on Windows".into())
 }
 
+/// Linux: let LOKA read the mouse and keyboard and send input (`/dev/input`, uinput), one password prompt.
+#[tauri::command]
+async fn allow_input() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return tauri::async_runtime::spawn_blocking(platform::allow_input).await.map_err(|e| e.to_string())?;
+    #[allow(unreachable_code)]
+    Err("Only needed on Linux".into())
+}
+
+/// This computer's name as other devices list it.
+fn alias() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|h| h.trim().to_string()).filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "LOKA".into())
+}
+
 /// Open a web page in the default browser.
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
@@ -441,7 +461,7 @@ fn open_overlay(app: &AppHandle, label: &str, to: Option<String>, edge: Edge) ->
         .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
-        .resizable(false)
+        .resizable(cfg!(target_os = "linux")) // GTK ignores set_size on a non-resizable window; no decorations = no handles anyway
         .focused(false)
         .visible(false) // shown by place_overlay
         .build()?;
@@ -609,6 +629,31 @@ fn install_send_to() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--allow-input") {
+            match platform::allow_input() {
+                Ok(()) => println!("LOKA can use the mouse and keyboard now."),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if args.iter().any(|a| a == "--headless") {
+            return headless::run();
+        }
+        // overlays need to sit at exact screen positions, which Wayland gives no app: run through XWayland
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("GDK_BACKEND").is_none() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
+        // WebKitGTK's DMA-BUF renderer draws an empty window on NVIDIA's driver and in VMs (seen under WSLg)
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
     let mut builder = tauri::Builder::default();
     #[cfg(desktop)]
     {
@@ -652,6 +697,7 @@ pub fn run() {
             add_host,
             remove_host,
             allow_firewall,
+            allow_input,
             open_url,
             sim::start_sim,
             set_sharing,
@@ -691,7 +737,7 @@ pub fn run() {
                 .map(|m| m.size().width as f32 / m.size().height as f32)
                 .unwrap_or(16.0 / 9.0);
             let me = DeviceInfo {
-                alias: std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "LOKA".into()),
+                alias: alias(),
                 device_type: if cfg!(mobile) { DeviceType::Mobile } else { DeviceType::Desktop },
                 os: std::env::consts::OS.into(),
                 fingerprint: tls.me.clone(),
@@ -954,6 +1000,8 @@ fn carry_out(app: &AppHandle, step: carry::Step) {
             // AppKit/OLE drag sessions belong on the main thread
             let _ = app.run_on_main_thread(move || {
                 let icon = drag::Image::Raw(include_bytes!("../icons/64x64.png").to_vec());
+                #[cfg(target_os = "linux")]
+                let Ok(w) = w.gtk_window() else { return };
                 if let Err(e) = drag::start_drag(&w, drag::DragItem::Files(files), icon, |_, _| {}, Default::default()) {
                     eprintln!("drag: {e}");
                 }
@@ -1085,8 +1133,12 @@ fn setup_overlays(app: &mut tauri::App, state: AppState, tls: Arc<Tls>) -> tauri
 #[cfg(desktop)]
 fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: AppState, tls: Arc<Tls>) {
     tauri::async_runtime::spawn(async move {
-        let st = state.clone();
-        let allow = move |fp: &str| if st.lock().unwrap().settings.is_paired(fp) { Ok(()) } else { Err(kvm::Refusal::NotPaired) };
+        let (st, e) = (state.clone(), engine.clone());
+        let allow = move |fp: &str| match (st.lock().unwrap().settings.is_paired(fp), e.can_inject()) {
+            (false, _) => Err(kvm::Refusal::NotPaired),
+            (_, false) => Err(kvm::Refusal::NoInput),
+            _ => Ok(()),
+        };
         let (a, st) = (app.clone(), state.clone());
         let ask = move |_: IpAddr, fp: String, code: String| {
             let (app, state) = (a.clone(), st.clone());

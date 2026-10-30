@@ -5,10 +5,15 @@ use serde::{Deserialize, Serialize};
 use tauri::WebviewWindow;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+
+#[cfg(target_os = "linux")]
+pub use linux::{allow_input, HEADLESS};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CursorSample {
@@ -108,6 +113,10 @@ pub trait SpatialPlatformEngine: Send + Sync {
     fn inject(&self, _event: Injected) {}
     /// Being driven: keep the cursor drawn until `false` (Windows draws none when no mouse is attached). Idempotent.
     fn show_cursor(&self, _on: bool) {}
+    /// Received input can reach this OS (Linux: uinput is allowed).
+    fn can_inject(&self) -> bool {
+        true
+    }
     /// Cursor-lock key held right now on this machine's own keyboard: Scroll Lock (F14 on a Mac).
     fn lock_key_down(&self) -> bool {
         false
@@ -119,6 +128,8 @@ pub fn engine() -> Box<dyn SpatialPlatformEngine> {
     return Box::new(windows::WindowsEngine);
     #[cfg(target_os = "macos")]
     return Box::new(macos::MacEngine);
+    #[cfg(target_os = "linux")]
+    return Box::new(linux::LinuxEngine::new());
     #[allow(unreachable_code)]
     Box::new(NoopEngine)
 }
