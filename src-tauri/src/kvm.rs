@@ -528,12 +528,6 @@ pub async fn send_session(
     if let Some(batch) = drag {
         send(&mut wr, Msg::Drag { batch }).await?;
     }
-    let fresh = clipboard_text().filter(|t| LAST_SHARED.lock().unwrap().as_ref() != Some(t));
-    timeout(WRITE_TIMEOUT, write_clipboard(&mut wr, fresh.clone())).await??;
-    if fresh.is_some() {
-        *LAST_SHARED.lock().unwrap() = fresh;
-    }
-
     let (tx, mut rx) = unbounded_channel();
     let m = portal.monitor;
     crate::platform::feed();
@@ -569,6 +563,12 @@ pub async fn send_session(
     tokio::pin!(ended);
     ended.as_mut().enable();
     let result: io::Result<()> = async {
+        // after capture is on: reading the clipboard (it may wait for a picture being read) never holds the cursor at the edge
+        let fresh = clipboard_text().filter(|t| LAST_SHARED.lock().unwrap().as_ref() != Some(t));
+        timeout(WRITE_TIMEOUT, write_clipboard(&mut wr, fresh.clone())).await??;
+        if fresh.is_some() {
+            *LAST_SHARED.lock().unwrap() = fresh;
+        }
         // an event read past a run of moves, handled next turn
         let mut held: Option<Captured> = None;
         loop {

@@ -71,7 +71,7 @@ export function Terminal({ fingerprint, alias, onClose }: { fingerprint: string;
       role="dialog"
       aria-modal="true"
       aria-labelledby="terminal-title"
-      className="fixed inset-0 z-30 flex flex-col bg-ink"
+      className="fixed inset-x-0 bottom-0 top-(--titlebar) z-30 flex flex-col bg-ink"
       style={{ animation: "fade-in 0.2s ease-out" }}
     >
       <header className="flex items-center gap-4 px-6 pb-3 pt-5">

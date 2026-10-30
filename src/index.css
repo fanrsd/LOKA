@@ -21,6 +21,9 @@
 }
 
 html, body, #root { height: 100%; margin: 0; }
+/* own title bar: Windows' caption height; a Mac's traffic lights sit in 28 px */
+:root { --titlebar: 32px; }
+:root.mac { --titlebar: 28px; }
 body {
   background: var(--color-ink);
   color: var(--color-fg);

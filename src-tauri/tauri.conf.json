@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LOKA",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "identifier": "dev.loka.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -11,7 +11,7 @@
   },
   "app": {
     "macOSPrivateApi": true,
-    "windows": [{ "label": "main", "title": "LOKA", "width": 860, "height": 700, "minWidth": 680, "minHeight": 560, "backgroundColor": "#05060c" }],
+    "windows": [{ "label": "main", "title": "LOKA", "width": 860, "height": 700, "minWidth": 680, "minHeight": 560, "backgroundColor": "#05060c", "decorations": false }],
     "security": { "csp": null }
   },
   "bundle": {

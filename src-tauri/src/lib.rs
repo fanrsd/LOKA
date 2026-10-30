@@ -495,8 +495,11 @@ fn open_overlay(app: &AppHandle, label: &str, to: Option<String>, edge: Edge) ->
 fn place_overlay(app: &AppHandle, label: &str, portal: &Portal) -> tauri::Result<()> {
     let Some(w) = app.get_webview_window(label) else { return Ok(()) };
     let b = portal.hit_box();
-    w.set_position(tauri::PhysicalPosition::new(b.x as i32, b.y as i32))?;
-    w.set_size(tauri::PhysicalSize::new(b.w as u32, b.h as u32))?;
+    // twice: landing on a monitor with another scale makes Windows rescale the window (WM_DPICHANGED)
+    for _ in 0..2 {
+        w.set_position(tauri::PhysicalPosition::new(b.x as i32, b.y as i32))?;
+        w.set_size(tauri::PhysicalSize::new(b.w as u32, b.h as u32))?;
+    }
     w.show()?;
     // show() rewrites window styles on Windows; restore the overlay ones
     match app.try_state::<Arc<dyn SpatialPlatformEngine>>() {
@@ -1264,7 +1267,8 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
             }
         }
         let hit = doors.iter().find_map(|d| d.portal.sample(c.x, c.y).map(|(y, p)| (d, y, p)));
-        let on_edge = hit.is_some_and(|(_, _, p)| p >= 1.0) && !locked;
+        // within a pixel: a Mac reports points, so ×2 on Retina its cursor can stop a pixel short of the right/bottom edge
+        let on_edge = hit.is_some_and(|(d, _, p)| (1.0 - p as f64) * d.portal.reach < 1.5) && !locked;
         if let (true, Some((door, y, _))) = (on_edge, hit) {
             // a file drag pushed against the edge goes over with the cursor, or back with it (band)
             let mut drag = None;

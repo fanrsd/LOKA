@@ -1,0 +1,5 @@
+{
+  "app": {
+    "windows": [{ "label": "main", "title": "LOKA", "width": 860, "height": 700, "minWidth": 680, "minHeight": 560, "backgroundColor": "#05060c", "titleBarStyle": "Overlay", "hiddenTitle": true }]
+  }
+}
