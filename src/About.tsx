@@ -65,7 +65,7 @@ export function About({ update, seed, windows, onClose }: { update: Update; seed
   };
 
   return (
-    <div className="fixed inset-0 z-20 grid place-items-center bg-ink/70 p-5 backdrop-blur-md" style={{ animation: "fade-in 0.2s ease-out" }} onClick={onClose}>
+    <div className="fixed inset-x-0 bottom-0 top-(--titlebar) z-20 flex items-center justify-center bg-ink/70 p-5 backdrop-blur-md" style={{ animation: "fade-in 0.2s ease-out" }} onClick={onClose}>
       <div
         role="dialog"
         aria-modal="true"
