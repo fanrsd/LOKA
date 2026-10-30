@@ -318,7 +318,8 @@ impl SpatialPlatformEngine for MacEngine {
             Ok(())
         } else {
             *CAPTURE.lock().unwrap() = None;
-            Err("CGEventTapCreate failed: grant LOKA Accessibility permission in System Settings".into())
+            // ad-hoc signing: an updated LOKA no longer matches its old Accessibility entry, though the switch still shows on
+            Err("LOKA can't take the mouse and keyboard: allow it in Privacy → Accessibility (after an update, remove LOKA there and add it again)".into())
         }
     }
 

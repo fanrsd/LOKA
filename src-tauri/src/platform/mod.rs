@@ -106,6 +106,8 @@ pub trait SpatialPlatformEngine: Send + Sync {
     /// Give input back to the local machine and put the cursor at `warp_to`. Idempotent.
     fn stop_capture(&self, _warp_to: (f64, f64)) {}
     fn inject(&self, _event: Injected) {}
+    /// Being driven: keep the cursor drawn until `false` (Windows draws none when no mouse is attached). Idempotent.
+    fn show_cursor(&self, _on: bool) {}
     /// Cursor-lock key held right now on this machine's own keyboard: Scroll Lock (F14 on a Mac).
     fn lock_key_down(&self) -> bool {
         false

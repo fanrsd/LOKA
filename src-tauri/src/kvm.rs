@@ -524,13 +524,10 @@ pub async fn send_session(
 ) -> io::Result<Option<u64>> {
     let (s, _) = tls.connect(to, Some(expect)).await?;
     let (mut rd, mut wr) = tokio::io::split(s);
-    send(&mut wr, Msg::Enter { edge: portal.edge, y }).await?;
-    if let Some(batch) = drag {
-        send(&mut wr, Msg::Drag { batch }).await?;
-    }
     let (tx, mut rx) = unbounded_channel();
     let m = portal.monitor;
     crate::platform::feed();
+    // before Enter: when capture fails (a Mac without Accessibility), the peer's cursor must not jump to its edge
     engine.start_capture((m.x + m.w / 2.0, m.y + m.h / 2.0), tx).map_err(io::Error::other)?;
     let mut alive = tokio::time::interval(Duration::from_millis(500));
 
@@ -563,6 +560,10 @@ pub async fn send_session(
     tokio::pin!(ended);
     ended.as_mut().enable();
     let result: io::Result<()> = async {
+        timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Enter { edge: portal.edge, y })).await??;
+        if let Some(batch) = drag {
+            timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Drag { batch })).await??;
+        }
         // after capture is on: reading the clipboard (it may wait for a picture being read) never holds the cursor at the edge
         let fresh = clipboard_text().filter(|t| LAST_SHARED.lock().unwrap().as_ref() != Some(t));
         timeout(WRITE_TIMEOUT, write_clipboard(&mut wr, fresh.clone())).await??;
@@ -1240,6 +1241,39 @@ mod tests {
         let e = send_session(&me, engine.clone(), ([127, 0, 0, 1], port).into(), &them_fp, portal, 0.5, Tune::new(1.0, false), None).await.unwrap_err();
         assert_eq!(e.to_string(), Refusal::NotPaired.text());
         assert_eq!(*engine.warped.lock().unwrap(), Some(portal.point(0.5, RETURN_INSET)));
+    }
+
+    /// A Mac without Accessibility: the hook can't be installed.
+    struct NoCapture;
+    impl SpatialPlatformEngine for NoCapture {
+        fn prepare_overlay(&self, _: &tauri::WebviewWindow) -> tauri::Result<()> {
+            Ok(())
+        }
+        fn cursor(&self) -> Option<crate::platform::CursorSample> {
+            None
+        }
+        fn start_capture(&self, _: (f64, f64), _: tokio::sync::mpsc::UnboundedSender<Captured>) -> Result<(), String> {
+            Err("no Accessibility".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_capture_never_enters_the_peer() {
+        let port = 53378;
+        let (them, me) = devices();
+        let them_fp = them.me.clone();
+        let entered = Arc::new(AtomicBool::new(false));
+        let seen = entered.clone();
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| {
+            seen.store(true, Ordering::SeqCst);
+            None::<Recorder>
+        }));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
+        let e = send_session(&me, Arc::new(NoCapture), ([127, 0, 0, 1], port).into(), &them_fp, portal, 0.5, Tune::new(1.0, false), None).await.unwrap_err();
+        assert_eq!(e.to_string(), "no Accessibility");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!entered.load(Ordering::SeqCst), "the peer's cursor jumped to its edge for a session that never ran");
     }
 
     struct Drags(Arc<Mutex<Vec<u64>>>);

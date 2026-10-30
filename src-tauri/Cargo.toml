@@ -1,6 +1,6 @@
 [package]
 name = "loka"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/fanrsd/LOKA"
@@ -34,7 +34,7 @@ quinn = { version = "0.11.12", default-features = false, features = ["runtime-to
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "UI_Notifications", "UI_Notifications_Management", "ApplicationModel", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Memory", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }
 windows-core = "0.62"
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_DataExchange"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_DataExchange"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

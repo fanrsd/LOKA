@@ -406,20 +406,25 @@ async fn set_portal(app: AppHandle, state: State<'_, AppState>, fingerprint: Str
         };
         s.settings.save();
     }
-    refresh_tray(&app);
-    let label = portal_label(&fingerprint);
+    show_portal(&app, &fingerprint, portal)
+}
+
+/// Tray, overlay window and its placement for the portal to `fingerprint` (already in settings).
+fn show_portal(app: &AppHandle, fingerprint: &str, portal: Option<Portal>) -> Result<(), String> {
+    refresh_tray(app);
+    let label = portal_label(fingerprint);
     let Some(portal) = portal else {
         if let Some(w) = app.get_webview_window(&label) {
             let _ = w.close();
         }
         return Ok(());
     };
-    if app.get_webview_window(sim::LABEL).is_some() && state.lock().unwrap().peers.get(&fingerprint).is_some_and(|p| p.info.os == "sim") {
-        sim::place(&app, &portal).map_err(|e| e.to_string())?;
+    if app.get_webview_window(sim::LABEL).is_some() && app.state::<AppState>().lock().unwrap().peers.get(fingerprint).is_some_and(|p| p.info.os == "sim") {
+        sim::place(app, &portal).map_err(|e| e.to_string())?;
     }
-    open_overlay(&app, &label, Some(fingerprint), portal.edge).map_err(|e| e.to_string())?;
+    open_overlay(app, &label, Some(fingerprint.to_string()), portal.edge).map_err(|e| e.to_string())?;
     let _ = app.emit_to(&label, "portal", portal.edge); // redraw for a new edge without a restart
-    place_overlay(&app, &label, &portal).map_err(|e| e.to_string())
+    place_overlay(app, &label, &portal).map_err(|e| e.to_string())
 }
 
 /// The overlay window `label`, created if needed. `to`: the paired device a drop on it goes to
@@ -535,6 +540,7 @@ struct EngineSink {
 /// Session over: no band back to the driver any more; a picture or files copied here go to it.
 impl Drop for EngineSink {
     fn drop(&mut self) {
+        self.engine.show_cursor(false);
         let to = {
             let state = self.app.state::<AppState>();
             let mut s = state.lock().unwrap();
@@ -1119,9 +1125,32 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
             }
             // the whole entry edge leads back to the driver: files dragged there and dropped go to it (reach = Calibrate's REACH)
             let band = Portal { edge, monitor: kvm::bounds(&screens), start: 0.0, end: 1.0, reach: 120.0 };
-            app.state::<AppState>().lock().unwrap().session = Some((fp.to_string(), band));
+            let mirror = {
+                let state = app.state::<AppState>();
+                let mut s = state.lock().unwrap();
+                s.session = Some((fp.to_string(), band));
+                // no way to the driver yet: mirror its portal (middle of the screen on the entry edge), editable in Calibrate
+                let b = band.monitor;
+                let screen = screens.iter().find(|m| match edge {
+                    Edge::Left => m.x == b.x,
+                    Edge::Right => m.x + m.w == b.x + b.w,
+                    Edge::Top => m.y == b.y,
+                    Edge::Bottom => m.y + m.h == b.y + b.h,
+                });
+                let mirror = screen.filter(|_| !s.settings.portals.contains_key(fp)).map(|m| Portal { edge, monitor: *m, start: 0.35, end: 0.65, reach: 120.0 });
+                if let Some(p) = mirror {
+                    s.settings.portals.insert(fp.to_string(), p);
+                    s.settings.save();
+                }
+                mirror
+            };
+            if let Some(p) = mirror {
+                let (app, fp) = (app.clone(), fp.to_string());
+                tauri::async_runtime::spawn(async move { drop(show_portal(&app, &fp, Some(p))) });
+            }
             let _ = app.emit_to(BAND, "portal", edge);
             let _ = place_overlay(&app, BAND, &band);
+            engine.show_cursor(true);
             Some(EngineSink { engine: engine.clone(), screens, app: app.clone() })
         };
         let st = state.clone();

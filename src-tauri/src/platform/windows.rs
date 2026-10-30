@@ -13,6 +13,7 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
+        Accessibility::MOUSEKEYS,
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
             KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
@@ -23,7 +24,8 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             CallNextHookEx, CreateCursor, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PeekMessageW,
             PostThreadMessageW, SetCursorPos, SetSystemCursor, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, SystemParametersInfoW,
-            UnhookWindowsHookEx, GWL_EXSTYLE, SPI_SETCURSORS,
+            UnhookWindowsHookEx, GWL_EXSTYLE, MKF_AVAILABLE, MKF_MOUSEKEYSON, SM_MOUSEPRESENT, SPIF_SENDCHANGE, SPI_GETMOUSEKEYS,
+            SPI_SETCURSORS, SPI_SETMOUSEKEYS,
             HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, SM_CXVIRTUALSCREEN,
             SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
             WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -232,10 +234,35 @@ impl SpatialPlatformEngine for WindowsEngine {
         }
     }
 
+    fn show_cursor(&self, on: bool) {
+        let mut saved = MOUSE_KEYS.lock().unwrap();
+        let set = |mk: &mut MOUSEKEYS| unsafe { SystemParametersInfoW(SPI_SETMOUSEKEYS, mk.cbSize, (mk as *mut MOUSEKEYS).cast(), SPIF_SENDCHANGE) };
+        if !on {
+            if let Some(mut old) = saved.take() {
+                set(&mut old);
+            }
+            return;
+        }
+        if saved.is_some() || unsafe { GetSystemMetrics(SM_MOUSEPRESENT) } != 0 {
+            return;
+        }
+        let mut old = MOUSEKEYS { cbSize: size_of::<MOUSEKEYS>() as u32, ..Default::default() };
+        if unsafe { SystemParametersInfoW(SPI_GETMOUSEKEYS, old.cbSize, (&mut old as *mut MOUSEKEYS).cast(), 0) } == 0 {
+            return;
+        }
+        // MouseKeys on = Windows counts a pointer and draws the cursor (as Synergy/Input Leap do); not saved to the
+        // profile, so a crash leaves it on only until sign-out. Injected numpad keys don't drive it (checked).
+        set(&mut MOUSEKEYS { dwFlags: MKF_AVAILABLE | MKF_MOUSEKEYSON, ..old });
+        *saved = Some(old);
+    }
+
     fn lock_key_down(&self) -> bool {
         unsafe { GetAsyncKeyState(VK_SCROLL as i32) < 0 }
     }
 }
+
+/// MouseKeys as it was before a driven session forced it on (no mouse attached); `None` = untouched.
+static MOUSE_KEYS: Mutex<Option<MOUSEKEYS>> = Mutex::new(None);
 
 /// Every system cursor (OCR_NORMAL … OCR_PERSON) swapped for a blank one.
 fn hide_cursors() {
