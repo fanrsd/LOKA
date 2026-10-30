@@ -131,10 +131,20 @@ pub fn clipboard_concealed() -> bool {
     false
 }
 
+/// Every clipboard read/write in this process, one at a time. Windows: the clipboard is opened for the
+/// process (`OpenClipboard(NULL)`), not the thread, and two threads reading a picture at once corrupt the
+/// heap (STATUS_HEAP_CORRUPTION; the history watcher and a crossing do exactly that).
+#[cfg(desktop)]
+fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>) -> Result<T, arboard::Error> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    f(&mut arboard::Clipboard::new()?)
+}
+
 /// Plain-text clipboard. `None` when empty, not text, secret, or held by another app.
 pub fn clipboard_text() -> Option<String> {
     #[cfg(desktop)]
-    return arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok().filter(|t| !t.is_empty() && !clipboard_concealed());
+    return with_clipboard(|c| c.get_text()).ok().filter(|t| !t.is_empty() && !clipboard_concealed());
     #[allow(unreachable_code)]
     None
 }
@@ -142,24 +152,22 @@ pub fn clipboard_text() -> Option<String> {
 /// Replace the clipboard text, unless it already holds exactly that (keeps clipboard-history apps clean).
 pub fn set_clipboard_text(text: &str) {
     #[cfg(desktop)]
-    if clipboard_text().as_deref() != Some(text) {
-        if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-            eprintln!("clipboard: {e}");
-        }
+    if let Err(e) = with_clipboard(|c| if c.get_text().ok().as_deref() == Some(text) { Ok(()) } else { c.set_text(text) }) {
+        eprintln!("clipboard: {e}");
     }
 }
 
 /// Picture on the clipboard: `(width, height, RGBA)`.
 pub fn clipboard_image() -> Option<(usize, usize, Vec<u8>)> {
     #[cfg(desktop)]
-    return arboard::Clipboard::new().and_then(|mut c| c.get_image()).ok().map(|i| (i.width, i.height, i.bytes.into_owned()));
+    return with_clipboard(|c| c.get_image()).ok().map(|i| (i.width, i.height, i.bytes.into_owned()));
     #[allow(unreachable_code)]
     None
 }
 
 pub fn set_clipboard_image(width: usize, height: usize, rgba: Vec<u8>) {
     #[cfg(desktop)]
-    if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_image(arboard::ImageData { width, height, bytes: rgba.into() })) {
+    if let Err(e) = with_clipboard(|c| c.set_image(arboard::ImageData { width, height, bytes: rgba.into() })) {
         eprintln!("clipboard image: {e}");
     }
 }
@@ -167,7 +175,7 @@ pub fn set_clipboard_image(width: usize, height: usize, rgba: Vec<u8>) {
 /// Files and folders copied in Explorer/Finder; empty when there are none.
 pub fn clipboard_files() -> Vec<std::path::PathBuf> {
     #[cfg(desktop)]
-    return arboard::Clipboard::new().and_then(|mut c| c.get().file_list()).unwrap_or_default();
+    return with_clipboard(|c| c.get().file_list()).unwrap_or_default();
     #[allow(unreachable_code)]
     Vec::new()
 }
@@ -175,7 +183,7 @@ pub fn clipboard_files() -> Vec<std::path::PathBuf> {
 /// Put `paths` on the clipboard as copied files, ready to paste in Explorer/Finder or an app.
 pub fn set_clipboard_files(paths: &[std::path::PathBuf]) {
     #[cfg(desktop)]
-    if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set().file_list(paths)) {
+    if let Err(e) = with_clipboard(|c| c.set().file_list(paths)) {
         eprintln!("clipboard files: {e}");
     }
 }
@@ -289,6 +297,16 @@ impl Portal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_pictures_can_be_read_from_several_threads_at_once() {
+        // the history watcher and a crossing both read the picture; unserialised, that corrupted the heap
+        set_clipboard_image(64, 64, vec![200; 64 * 64 * 4]);
+        let readers: Vec<_> = (0..4)
+            .map(|_| std::thread::spawn(|| (0..25).for_each(|_| drop(clipboard_image()))))
+            .collect();
+        readers.into_iter().for_each(|r| r.join().unwrap());
+    }
 
     // second monitor at x=1920, 2560x1440, phone on its right edge, middle half calibrated
     const P: Portal = Portal {
