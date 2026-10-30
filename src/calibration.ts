@@ -82,3 +82,18 @@ export function useEdge(): Edge {
   }, []);
   return edge;
 }
+
+/** Whether the device behind this portal window is on the network now (the band's driver always is). */
+export function useOnline(): boolean {
+  const [online, setOnline] = useState(true);
+  useEffect(() => {
+    const label = getCurrentWebviewWindow().label;
+    if (!label.startsWith("portal-")) return;
+    const prefix = label.slice("portal-".length);
+    const check = () => invoke<{ info: { fingerprint: string } }[]>("peers").then((p) => setOnline(p.some((x) => x.info.fingerprint.startsWith(prefix))));
+    check();
+    const t = setInterval(check, 5000); // same pace as Home's list
+    return () => clearInterval(t);
+  }, []);
+  return online;
+}

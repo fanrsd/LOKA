@@ -6,7 +6,7 @@ import { Home } from "./Home";
 import { PhoneView } from "./PhoneView";
 import { TitleBar, isMac } from "./TitleBar";
 import { tickOnPress } from "./sound";
-import { useEdge } from "./calibration";
+import { useEdge, useOnline } from "./calibration";
 import { type Look, applyAccent, loadLook } from "./look";
 import { listen } from "@tauri-apps/api/event";
 import "./index.css";
@@ -27,7 +27,12 @@ if (!import.meta.env.DEV) {
 }
 
 function Overlay() {
-  return <BezelPortal side={useEdge()} event="spatial" />;
+  // an offline device keeps its doorway (crossing may still work when only discovery is blocked), faded
+  return (
+    <div className="h-full w-full transition-opacity duration-700" style={{ opacity: useOnline() ? 1 : 0.25 }}>
+      <BezelPortal side={useEdge()} event="spatial" />
+    </div>
+  );
 }
 
 // the band (being driven) and one window per portal of the device map

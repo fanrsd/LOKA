@@ -78,6 +78,15 @@ export function About({ update, seed, os, onClose }: { update: Update; seed: str
     return () => window.removeEventListener("keydown", esc);
   }, [onClose]);
 
+  // the rule outlives the app: show what Windows Firewall has now, not what this window last did
+  useEffect(() => {
+    if (os !== "windows") return;
+    invoke<string>("firewall_status").then((s) => {
+      if (s === "allowed") setFixed("done");
+      if (s === "blocked") setFixed("A Windows Firewall rule blocks LOKA: allowing replaces it");
+    }, () => {});
+  }, [os]);
+
   const allow = () => {
     setFixed("busy");
     invoke(fix.command).then(() => setFixed("done"), (e) => setFixed(String(e) || fix.failed));

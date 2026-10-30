@@ -330,30 +330,51 @@ fn remove_host(state: State<AppState>, ip: IpAddr) {
 }
 
 /// Windows: allow LOKA inbound on every network profile (one UAC prompt). The first-run firewall
-/// prompt often only allows Public or Private, and Windows marks new networks Public.
+/// prompt often only allows Public or Private, and Windows marks new networks Public. Earlier inbound
+/// rules for this exe go first: a Block one (prompt cancelled) would win over the allow.
 #[tauri::command]
 async fn allow_firewall() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let args = format!("advfirewall firewall add rule name=LOKA dir=in action=allow profile=any program=\"{}\"", exe.display());
+        let program = format!("dir=in program=\"{}\"", exe.display());
+        let args = format!("/c netsh advfirewall firewall delete rule name=all {program} & netsh advfirewall firewall add rule name=LOKA action=allow profile=any {program}");
         // Start-Process throws when the UAC prompt is declined → exit 1
-        let script = format!(
-            "$p = Start-Process netsh -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '{}'; exit $p.ExitCode",
-            args.replace('\'', "''")
-        );
-        let status = tauri::async_runtime::spawn_blocking(move || {
-            std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).creation_flags(CREATE_NO_WINDOW).status()
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-        return if status.success() { Ok(()) } else { Err("Windows Firewall was not changed".into()) };
+        let script = format!("$p = Start-Process cmd -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '{}'; exit $p.ExitCode", args.replace('\'', "''"));
+        let out = powershell(script).await?;
+        return if out.status.success() { Ok(()) } else { Err("Windows Firewall was not changed".into()) };
     }
     #[allow(unreachable_code)]
     Err("Only needed on Windows".into())
+}
+
+/// Windows: this exe's inbound firewall rules: `blocked` (any Block rule), `allowed` (an Allow on every profile) or `none`.
+#[tauri::command]
+async fn firewall_status() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        // the firewall COM API: Get-NetFirewall* takes ~8 s
+        let script = format!(
+            "$r = @((New-Object -ComObject HNetCfg.FwPolicy2).Rules | ? {{ $_.ApplicationName -eq '{}' -and $_.Direction -eq 1 -and $_.Enabled }}); \
+             if ($r | ? Action -eq 0) {{ 'blocked' }} elseif ($r | ? {{ $_.Action -eq 1 -and ($_.Profiles -band 7) -eq 7 }}) {{ 'allowed' }} else {{ 'none' }}",
+            exe.display().to_string().replace('\'', "''")
+        );
+        let out = powershell(script).await?;
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    #[allow(unreachable_code)]
+    Err("Only needed on Windows".into())
+}
+
+#[cfg(target_os = "windows")]
+async fn powershell(script: String) -> Result<std::process::Output, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    tauri::async_runtime::spawn_blocking(move || std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).creation_flags(CREATE_NO_WINDOW).output())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// Linux: let LOKA read the mouse and keyboard and send input (`/dev/input`, uinput), one password prompt.
@@ -370,6 +391,8 @@ fn alias() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
+        // macOS GUI apps get no HOSTNAME and have no /proc: ask for the name set in System Settings
+        .or_else(|| cfg!(target_os = "macos").then(|| std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok()).flatten().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|h| !h.is_empty()))
         .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|h| h.trim().to_string()).filter(|h| !h.is_empty()))
         .unwrap_or_else(|| "LOKA".into())
 }
@@ -716,6 +739,7 @@ pub fn run() {
             add_host,
             remove_host,
             allow_firewall,
+            firewall_status,
             allow_input,
             open_url,
             sim::start_sim,
@@ -1333,12 +1357,29 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
         // TimedOut: the link went silent (Wi-Fi drop, sleep, crash), not a refusal or a hang-up
         let error = r.as_ref().err().map(|e| if e.kind() == std::io::ErrorKind::TimedOut { format!("{alias} stopped answering") } else { e.to_string() });
         let _ = app.emit("kvm", serde_json::json!({ "active": false, "error": error }));
+        if let Some(e) = &error {
+            crossing_failed(&app, e.clone());
+        }
         if error.is_some() {
             tokio::time::sleep(Duration::from_secs(1)).await; // no reconnect storm at the edge
         }
         DRIVING.store(false, Ordering::SeqCst);
     });
     Ok(())
+}
+
+/// The reason a crossing failed, as a notification: the main window showing it is usually hidden.
+/// The same reason again within 30 s stays quiet (the cursor keeps pushing the edge).
+#[cfg(desktop)]
+fn crossing_failed(app: &AppHandle, error: String) {
+    use tauri_plugin_notification::NotificationExt;
+    static LAST: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.as_ref().is_some_and(|(e, at)| *e == error && at.elapsed() < Duration::from_secs(30)) {
+        return;
+    }
+    let _ = app.notification().builder().title("LOKA couldn't move over").body(&error).show();
+    *last = Some((error, std::time::Instant::now()));
 }
 
 /// 60 Hz loop: cursor → portal samples → click-through toggle, local glow event, UDP telemetry, crossings.
@@ -1420,6 +1461,9 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
                     resting = None;
                     if let Err(e) = start_session(&app, door.label.clone(), door.fp.clone(), door.portal, y, drag) {
                         eprintln!("crossing: {e}");
+                        if !DRIVING.load(Ordering::SeqCst) {
+                            crossing_failed(&app, e.to_string());
+                        }
                     }
                 }
                 continue;
