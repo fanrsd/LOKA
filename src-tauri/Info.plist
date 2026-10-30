@@ -22,5 +22,7 @@
   </array>
   <key>NSAudioCaptureUsageDescription</key>
   <string>LOKA plays this Mac's sound on your other computer when you turn on sharing its sound.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>LOKA lets your other computer use this Mac's microphone when you turn on sharing its microphone.</string>
 </dict>
 </plist>

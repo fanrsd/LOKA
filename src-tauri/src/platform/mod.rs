@@ -62,6 +62,23 @@ pub enum Captured {
     Escape,
 }
 
+static ORIGIN: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+static FED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    ORIGIN.elapsed().as_millis() as u64
+}
+
+/// Dead-man switch: the session task calls this while it is alive and draining captured input.
+pub fn feed() {
+    FED.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// No `feed` for 1.5 s: the session task panicked or hangs, so capture must give input back on its own.
+pub fn starved() -> bool {
+    now_ms().saturating_sub(FED.load(std::sync::atomic::Ordering::Relaxed)) > 1500
+}
+
 /// What a receiver asks its OS to perform. Positions are absolute physical px.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]

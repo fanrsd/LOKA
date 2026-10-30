@@ -222,6 +222,20 @@ fn set_cursor_hidden(hide: bool) {
     }
 }
 
+/// Everything `stop_capture` undoes except the warp; idempotent, any thread.
+fn release() {
+    *CAPTURE.lock().unwrap() = None;
+    TAP.store(null_mut(), Ordering::SeqCst);
+    let rl = RUN_LOOP.swap(null_mut(), Ordering::SeqCst);
+    unsafe {
+        if !rl.is_null() {
+            CFRunLoopStop(rl);
+        }
+        CGAssociateMouseAndMouseCursorPosition(1);
+    }
+    set_cursor_hidden(false);
+}
+
 /// Password managers mark secrets with this (nspasteboard.org convention).
 pub fn clipboard_concealed() -> bool {
     let pb = objc2_app_kit::NSPasteboard::generalPasteboard();
@@ -309,17 +323,8 @@ impl SpatialPlatformEngine for MacEngine {
     }
 
     fn stop_capture(&self, warp_to: (f64, f64)) {
-        *CAPTURE.lock().unwrap() = None;
-        TAP.store(null_mut(), Ordering::SeqCst);
-        let rl = RUN_LOOP.swap(null_mut(), Ordering::SeqCst);
-        unsafe {
-            if !rl.is_null() {
-                CFRunLoopStop(rl);
-            }
-            CGAssociateMouseAndMouseCursorPosition(1);
-            CGWarpMouseCursorPosition(to_points(warp_to.0, warp_to.1));
-        }
-        set_cursor_hidden(false);
+        release();
+        unsafe { CGWarpMouseCursorPosition(to_points(warp_to.0, warp_to.1)) };
     }
 
     fn inject(&self, event: Injected) {
@@ -391,7 +396,14 @@ unsafe extern "C" fn tap_callback(_proxy: Ref, ty: u32, event: Ref, _info: Ref) 
         }
         return event;
     }
-    let guard = CAPTURE.lock().unwrap();
+    let mut guard = CAPTURE.lock().unwrap();
+    if guard.as_ref().is_some_and(|c| c.out.is_closed() || super::starved()) {
+        // the session task died or hangs: give input back without it
+        let _ = guard.take().unwrap().out.send(Captured::Escape);
+        drop(guard);
+        release();
+        return event;
+    }
     let Some(c) = guard.as_ref() else { return event };
     let field = |f| CGEventGetIntegerValueField(event, f);
     let flags = CGEventGetFlags(event);

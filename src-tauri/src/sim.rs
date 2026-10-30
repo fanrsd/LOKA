@@ -69,6 +69,7 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
             telemetry_port: TELEMETRY_PORT,
             transfer_port: TRANSFER_PORT,
             kvm_port: KVM_PORT,
+            proto: kvm::PROTOCOL,
             mac: None,
         },
         addr: Ipv4Addr::LOCALHOST.into(),
@@ -124,14 +125,14 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
     // Pairing prompts appear in the phone window; the pairing itself is stored by this host's side.
     let allow = move |fp: &str| if paired(fp) { Ok(()) } else { Err(kvm::Refusal::NotPaired) };
     let (a, st) = (app.clone(), state.clone());
-    let ask = move |ip: std::net::IpAddr, fp: String| {
-        let (app, state, host, me) = (a.clone(), st.clone(), host.clone(), me.clone());
+    let ask = move |ip: std::net::IpAddr, fp: String, code: String| {
+        let (app, state, host) = (a.clone(), st.clone(), host.clone());
         async move {
             if fp != host {
-                return false;
+                return kvm::PairAnswer::Unknown;
             }
             let info = app.state::<tokio::sync::watch::Sender<DeviceInfo>>().borrow().clone();
-            ask_user(&app, &state, LABEL, &Peer { info, addr: ip, seen: Instant::now() }, &me).await
+            ask_user(&app, &state, LABEL, &Peer { info, addr: ip, seen: Instant::now() }, code).await
         }
     };
     let h = app.clone();

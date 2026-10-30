@@ -1,4 +1,5 @@
-//! Payload transfer: one pinned TLS connection (`secure`) per payload.
+//! Payload transfer: one stream of a pinned QUIC connection (`secure`) per payload; a sender's
+//! `shutdown` returns once the receiver has every byte, and a dead peer fails it within seconds.
 //! `u32 LE header_len | JSON Header | size bytes`.
 //! Also carries the clipboard when it is a picture or files (too big for a KVM frame): pictures as one
 //! PNG payload, files as a batch the receiver puts on its clipboard once every file arrived.
@@ -23,7 +24,6 @@ use std::{
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpListener,
 };
 
 pub const PORT: u16 = 53320;
@@ -254,17 +254,16 @@ pub async fn serve(
     allow: impl Fn(&str) -> bool + Send + Sync + 'static,
     on_event: impl Fn(TransferEvent) + Send + Sync + 'static,
 ) -> io::Result<()> {
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    let (on_event, allow, dir) = (Arc::new(on_event), Arc::new(allow), Arc::new(dir));
+    let mut listener = tls.listen(port)?;
+    let (on_event, dir) = (Arc::new(on_event), Arc::new(dir));
     let batches = Batches::default();
     loop {
-        let (tcp, from) = listener.accept().await?;
-        let (tls, allow, dir, clip_dir, on_event, batches) = (tls.clone(), allow.clone(), dir.clone(), clip_dir.clone(), on_event.clone(), batches.clone());
+        let (s, who, from) = listener.accept().await?;
+        if !allow(&who) {
+            continue;
+        }
+        let (dir, clip_dir, on_event, batches) = (dir.clone(), clip_dir.clone(), on_event.clone(), batches.clone());
         tokio::spawn(async move {
-            let Ok((s, who)) = tls.accept(tcp).await else { return };
-            if !allow(&who) {
-                return;
-            }
             if let Err(e) = receive(s, &dir(), &clip_dir, &batches, &*on_event).await {
                 eprintln!("transfer from {from} failed: {e}");
             }

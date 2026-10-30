@@ -110,6 +110,16 @@ impl SpatialPlatformEngine for WindowsEngine {
                 if msg.message != WM_TIMER {
                     continue;
                 }
+                let mut cap = CAPTURE.lock().unwrap();
+                if cap.as_ref().is_some_and(|c| c.out.is_closed() || super::starved()) {
+                    // the session task died or hangs: give input back without it
+                    let _ = cap.take().unwrap().out.send(Captured::Escape);
+                    drop(cap);
+                    let _ = HOOK_THREAD.compare_exchange(GetCurrentThreadId(), 0, Ordering::SeqCst, Ordering::SeqCst);
+                    show_cursors();
+                    break;
+                }
+                drop(cap);
                 let down = keys_down();
                 if (0..256).any(|vk| down[vk] && !was_down[vk]) {
                     UnhookWindowsHookEx(keys);

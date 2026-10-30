@@ -19,7 +19,7 @@ use tauri::AppHandle;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::network::secure::ServerStream;
+use crate::network::secure::Stream;
 
 const DATA: u8 = 1;
 const RESIZE: u8 = 2;
@@ -39,7 +39,7 @@ async fn read_size(r: &mut (impl AsyncRead + Unpin)) -> io::Result<PtySize> {
 }
 
 /// Runs one shell for an authenticated, permitted peer until either side ends.
-pub async fn serve(s: ServerStream) -> io::Result<()> {
+pub async fn serve(s: Stream) -> io::Result<()> {
     let (mut rd, mut wr) = tokio::io::split(s);
     let size = read_size(&mut rd).await?;
     let pair = native_pty_system().openpty(size).map_err(other)?;
@@ -197,12 +197,10 @@ mod tests {
     async fn remote_shell_runs_commands_and_ends_when_the_shell_exits() {
         let (srv, cli) = (Tls::new(&Identity::generate()), Tls::new(&Identity::generate()));
         let expect = srv.me.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            serve(srv.accept(tcp).await.unwrap().0).await
-        });
+        let port = 53383;
+        let addr = ([127, 0, 0, 1], port).into();
+        let mut listener = srv.listen(port).unwrap();
+        let server = tokio::spawn(async move { serve(listener.accept().await.unwrap().0).await });
         let (mut s, _) = cli.connect(addr, Some(&expect)).await.unwrap();
         s.write_all(&size_bytes(100, 30)).await.unwrap();
         // the PTY echoes what was typed, so the marker must only appear once the shell has expanded it

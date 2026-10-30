@@ -1,6 +1,6 @@
 [package]
 name = "loka"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/fanrsd/LOKA"
@@ -22,7 +22,6 @@ uuid = { version = "1", features = ["v4"] }
 tauri-plugin-notification = "2"
 if-addrs = "0.15.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 ring = "0.17"
 tauri-plugin-global-shortcut = "2.4.1"
@@ -30,6 +29,7 @@ tauri-plugin-dialog = "2.8.4"
 tauri-plugin-single-instance = "2.5.5"
 base64 = "0.23.1"
 mac_address = "1.2.1"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "UI_Notifications", "UI_Notifications_Management", "ApplicationModel", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Memory", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem"] }

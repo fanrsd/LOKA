@@ -6,7 +6,7 @@
 //! the viewer stops). `len == 0` is a keepalive sent every `PING`, so a viewer notices an owner that went
 //! to sleep. The viewer never writes; anything from it, or EOF, ends `serve`.
 
-use crate::{kvm::Service, network::secure::ServerStream};
+use crate::{kvm::Service, network::secure::Stream};
 use serde::{Deserialize, Serialize};
 use std::{io, sync::Mutex, time::Duration};
 use tauri::{async_runtime::JoinHandle, AppHandle, Emitter};
@@ -64,7 +64,7 @@ async fn recv(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Msg>> {
 }
 
 /// Owner side: streams this computer's new notifications until the viewer hangs up.
-pub async fn serve(s: ServerStream) -> io::Result<()> {
+pub async fn serve(s: Stream) -> io::Result<()> {
     let (mut r, mut w) = tokio::io::split(s);
     let (tx, mut rx) = mpsc::channel(32);
     let watcher = tokio::task::spawn_blocking(move || watch(tx));

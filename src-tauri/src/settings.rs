@@ -62,6 +62,7 @@ pub struct Sharing {
     pub folder: Option<PathBuf>,
     pub sound: bool,
     pub notifications: bool,
+    pub mic: bool,
 }
 
 impl Settings {

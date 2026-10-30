@@ -1,6 +1,8 @@
-//! Hear one computer's sound on the other. The owner captures what it plays (system output loopback:
-//! WASAPI loopback on Windows, a CoreAudio process tap on macOS 14.6+, both via cpal) and streams raw
-//! PCM; the listener plays it on its default output through a small jitter buffer.
+//! Hear one computer's sound on the other, or use its microphone. The owner captures what it plays
+//! (system output loopback: WASAPI loopback on Windows, a CoreAudio process tap on macOS 14.6+, both via
+//! cpal) or its default input device, and streams raw PCM; the listener plays sound on its default
+//! output and a microphone into a virtual cable (VB-CABLE / BlackHole) that call apps pick as their
+//! mic, both through a small jitter buffer.
 //!
 //! Wire format on the authenticated stream (owner → listener, little-endian; the listener sends
 //! nothing, so any byte or EOF from it means it hung up):
@@ -9,7 +11,7 @@
 //! chunk   frames u16 (1..=MAX_FRAMES) | frames * channels i16, interleaved
 //! ```
 
-use crate::network::secure::ServerStream;
+use crate::{kvm::Service, network::secure::Stream};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     FromSample, SampleFormat, SizedSample, StreamConfig,
@@ -39,11 +41,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const JITTER_MS: usize = 80;
 const MAX_BEHIND_MS: usize = 300;
 
-/// Owner side: stream this computer's sound until the listener hangs up.
-pub async fn serve(s: ServerStream) -> io::Result<()> {
+/// Owner side: stream this computer's sound (or microphone, `mic`) until the listener hangs up.
+pub async fn serve(s: Stream, mic: bool) -> io::Result<()> {
     let (tx, mut chunks) = mpsc::channel(QUEUE);
     let (etx, mut errors) = mpsc::unbounded_channel();
-    let (stream, rate, channels) = off_runtime(move || capture(tx, etx)).await.map_err(io::Error::other)?;
+    let (stream, rate, channels) = off_runtime(move || capture(mic, tx, etx)).await.map_err(io::Error::other)?;
     let (mut rd, mut wr) = tokio::io::split(s);
     let mut header = MAGIC.to_vec();
     header.extend_from_slice(&rate.to_le_bytes());
@@ -67,10 +69,20 @@ pub async fn serve(s: ServerStream) -> io::Result<()> {
     Ok(())
 }
 
-/// Starts loopback capture of the default output device. Returns the stream, its rate and channels.
-fn capture(tx: mpsc::Sender<Vec<i16>>, etx: mpsc::UnboundedSender<String>) -> Result<(cpal::Stream, u32, u16), String> {
-    let device = cpal::default_host().default_output_device().ok_or("This computer has no sound output")?;
-    let config = device.default_output_config().map_err(capture_error)?;
+/// Starts capture of the default input (`mic`) or loopback of the default output. Returns the stream,
+/// its rate and channels.
+fn capture(mic: bool, tx: mpsc::Sender<Vec<i16>>, etx: mpsc::UnboundedSender<String>) -> Result<(cpal::Stream, u32, u16), String> {
+    let host = cpal::default_host();
+    let err = |e| capture_error(mic, e);
+    let (device, config) = if mic {
+        let d = host.default_input_device().ok_or("This computer has no microphone")?;
+        let c = d.default_input_config().map_err(err)?;
+        (d, c)
+    } else {
+        let d = host.default_output_device().ok_or("This computer has no sound output")?;
+        let c = d.default_output_config().map_err(err)?;
+        (d, c)
+    };
     if !(1..=8).contains(&config.channels()) {
         return Err(format!("Can't share sound with {} channels", config.channels()));
     }
@@ -81,8 +93,8 @@ fn capture(tx: mpsc::Sender<Vec<i16>>, etx: mpsc::UnboundedSender<String>) -> Re
         SampleFormat::I32 => build_capture::<i32>(&device, c, tx, etx),
         f => return Err(format!("Can't share sound in {f} format")),
     }
-    .map_err(capture_error)?;
-    stream.play().map_err(capture_error)?;
+    .map_err(err)?;
+    stream.play().map_err(err)?;
     Ok((stream, c.sample_rate, c.channels))
 }
 
@@ -97,7 +109,7 @@ where
     i16: FromSample<T>,
 {
     let frame = config.channels as usize;
-    // an output device used as input = loopback (WASAPI loopback / CoreAudio process tap)
+    // for an output device this is loopback (WASAPI loopback / CoreAudio process tap)
     device.build_input_stream(
         config,
         move |data: &[T], _: &_| {
@@ -114,11 +126,13 @@ where
     )
 }
 
-fn capture_error(e: cpal::Error) -> String {
-    #[cfg(target_os = "macos")]
-    return format!("Sharing sound needs macOS 14.6 or later and the System Audio Recording permission ({e})");
-    #[cfg(not(target_os = "macos"))]
-    format!("Can't capture sound: {e}")
+fn capture_error(mic: bool, e: cpal::Error) -> String {
+    match (mic, cfg!(target_os = "macos")) {
+        (true, true) => format!("Sharing the microphone needs the Microphone permission: System Settings → Privacy & Security → Microphone ({e})"),
+        (true, false) => format!("Can't use the microphone ({e}). Check that desktop apps may use it: Settings → Privacy & security → Microphone"),
+        (false, true) => format!("Sharing sound needs macOS 14.6 or later and the System Audio Recording permission ({e})"),
+        (false, false) => format!("Can't capture sound: {e}"),
+    }
 }
 
 fn fatal(e: &cpal::Error) -> bool {
@@ -288,9 +302,22 @@ struct Playback {
     errors: mpsc::UnboundedReceiver<String>,
 }
 
-/// Opens the default output at the sender's format if it takes it, else at its own default format.
-fn play(rate: u32, channels: u16) -> Result<Playback, String> {
-    let device = cpal::default_host().default_output_device().ok_or("This computer has no sound output")?;
+/// Virtual cable whose playback side shows up as a microphone in call apps, and what to install if absent.
+#[cfg(target_os = "macos")]
+const CABLE: (&str, &str) = ("BlackHole", "Using another computer's microphone needs BlackHole. Install it, then pick “BlackHole 2ch” as the microphone in your call app.");
+#[cfg(not(target_os = "macos"))]
+const CABLE: (&str, &str) = ("CABLE Input", "Using another computer's microphone needs VB-CABLE. Install it, then pick “CABLE Output” as the microphone in your call app.");
+
+/// Opens the default output (or the virtual cable, `mic`) at the sender's format if it takes it, else
+/// at its own default format.
+fn play(rate: u32, channels: u16, mic: bool) -> Result<Playback, String> {
+    let host = cpal::default_host();
+    let device = if mic {
+        let mut all = host.output_devices().map_err(|e| e.to_string())?;
+        all.find(|d| d.description().is_ok_and(|n| n.name().contains(CABLE.0))).ok_or(CABLE.1)?
+    } else {
+        host.default_output_device().ok_or("This computer has no sound output")?
+    };
     let usable = |f: SampleFormat| matches!(f, SampleFormat::F32 | SampleFormat::I16 | SampleFormat::I32);
     let config = match device.supported_output_configs().ok().and_then(|mut all| {
         all.find(|r| r.channels() == channels && r.contains_rate(rate) && usable(r.sample_format()))
@@ -331,31 +358,45 @@ fn build_playback<T: SizedSample + FromSample<f32>>(
     )
 }
 
-/// device fingerprint → (session id, task)
-static LISTENING: Mutex<Option<HashMap<String, (u64, JoinHandle<()>)>>> = Mutex::new(None);
+/// (service, device fingerprint) → (session id, task)
+static LISTENING: Mutex<Option<HashMap<(Service, String), (u64, JoinHandle<()>)>>> = Mutex::new(None);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 /// Plays paired device `fingerprint`'s sound here (`on`) or stops. Emits `sound`
 /// `{ device, on: false, error }` when it stops on its own.
 #[tauri::command]
 pub async fn set_listening(app: AppHandle, fingerprint: String, on: bool) -> Result<(), String> {
+    listen(app, fingerprint, on, Service::Sound).await
+}
+
+/// Plays paired device `fingerprint`'s microphone into the virtual cable (`on`) or stops. Emits `mic`
+/// `{ device, on: false, error }` when it stops on its own.
+#[tauri::command]
+pub async fn set_mic(app: AppHandle, fingerprint: String, on: bool) -> Result<(), String> {
+    listen(app, fingerprint, on, Service::Mic).await
+}
+
+async fn listen(app: AppHandle, fingerprint: String, on: bool, service: Service) -> Result<(), String> {
+    let mic = service == Service::Mic;
+    let (event, what) = if mic { ("mic", "microphone") } else { ("sound", "sound") };
+    let key = (service, fingerprint);
     if !on {
-        if let Some((_, task)) = lock(&LISTENING).get_or_insert_default().remove(&fingerprint) {
+        if let Some((_, task)) = lock(&LISTENING).get_or_insert_default().remove(&key) {
             task.abort();
         }
         return Ok(());
     }
-    if lock(&LISTENING).get_or_insert_default().contains_key(&fingerprint) {
+    if lock(&LISTENING).get_or_insert_default().contains_key(&key) {
         return Ok(());
     }
-    let mut s = crate::open_service(&app, &fingerprint, crate::kvm::Service::Sound).await?;
+    let mut s = crate::open_service(&app, &key.1, service).await?;
     let (rate, channels) = timeout(Duration::from_secs(5), read_header(&mut s))
         .await
-        .map_err(|_| "That computer didn't start sharing its sound".to_string())?
+        .map_err(|_| format!("That computer didn't start sharing its {what}"))?
         .map_err(|e| e.to_string())?;
-    let mut p = off_runtime(move || play(rate, channels)).await?;
+    let mut p = off_runtime(move || play(rate, channels, mic)).await?;
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let device = fingerprint.clone();
+    let mine = key.clone();
     // held while spawning so a session that ends at once still finds itself registered
     let mut listening = lock(&LISTENING);
     let task = tauri::async_runtime::spawn(async move {
@@ -363,7 +404,7 @@ pub async fn set_listening(app: AppHandle, fingerprint: String, on: bool) -> Res
         let error = loop {
             tokio::select! {
                 r = read_chunk(&mut s, channels, &mut bytes, &mut samples) => if let Err(e) = r {
-                    break if e.kind() == io::ErrorKind::UnexpectedEof { "The other computer stopped sharing its sound".into() } else { e.to_string() };
+                    break if e.kind() == io::ErrorKind::UnexpectedEof { format!("The other computer stopped sharing its {what}") } else { e.to_string() };
                 },
                 e = p.errors.recv() => break e.unwrap_or_default(),
             }
@@ -372,13 +413,13 @@ pub async fn set_listening(app: AppHandle, fingerprint: String, on: bool) -> Res
         drop(p.stream);
         let mut listening = lock(&LISTENING);
         let map = listening.get_or_insert_default();
-        if map.get(&device).is_some_and(|(i, _)| *i == id) {
-            map.remove(&device);
+        if map.get(&mine).is_some_and(|(i, _)| *i == id) {
+            map.remove(&mine);
             drop(listening);
-            let _ = app.emit("sound", json!({ "device": device, "on": false, "error": error }));
+            let _ = app.emit(event, json!({ "device": mine.1, "on": false, "error": error }));
         }
     });
-    if let Some((_, old)) = listening.get_or_insert_default().insert(fingerprint, (id, task)) {
+    if let Some((_, old)) = listening.get_or_insert_default().insert(key, (id, task)) {
         old.abort();
     }
     Ok(())

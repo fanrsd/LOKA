@@ -28,12 +28,15 @@ pub struct DeviceInfo {
     pub alias: String,
     pub device_type: DeviceType,
     pub os: String,
-    /// SHA-256 of the device's TLS certificate (`secure`): checked on every connection
+    /// SHA-256 of the device's certificate (`secure`): checked on every connection
     pub fingerprint: String,
     pub aspect_ratio: f32,
     pub telemetry_port: u16,
     pub transfer_port: u16,
     pub kvm_port: u16,
+    /// wire version (`kvm::PROTOCOL`); 0 = before it was announced (v0.5, TCP links)
+    #[serde(default)]
+    pub proto: u32,
     /// hardware address, so paired devices can wake this one (Wake-on-LAN)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
@@ -178,11 +181,16 @@ mod tests {
             telemetry_port: 1,
             transfer_port: 2,
             kvm_port: 3,
+            proto: 2,
             mac: None,
         };
         let v: serde_json::Value = serde_json::to_value(Announcement { info, announce: true }).unwrap();
         assert_eq!(v["deviceType"], "desktop");
         assert_eq!(v["telemetryPort"], 1);
+        assert_eq!(v["proto"], 2);
         assert_eq!(v["announce"], true);
+        let mut old = v;
+        old.as_object_mut().unwrap().remove("proto");
+        assert_eq!(serde_json::from_value::<Announcement>(old).unwrap().info.proto, 0, "a v0.5 device announces no version");
     }
 }

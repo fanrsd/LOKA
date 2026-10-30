@@ -77,7 +77,8 @@ export function Home() {
   );
 }
 
-type PairState = { state: "waiting"; code: string } | { state: "declined" } | { state: "error"; message: string };
+type PairAnswer = "accepted" | "declined" | "noAnswer" | "unknown";
+type PairState = { state: "waiting"; code?: string } | { state: Exclude<PairAnswer, "accepted"> } | { state: "error"; message: string };
 
 /** Every LOKA nearby. Any of them can be paired and placed around this computer's screens; any paired one can drive this one too. */
 function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; onChange: () => void }) {
@@ -90,13 +91,19 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
   useEffect(() => {
     const un = listen<{ active: boolean; error?: string | null; device?: string }>("kvm", (e) => setKvm(e.payload));
     const unLock = listen<boolean>("lock", (e) => setLocked(e.payload));
+    // the requester's half of the pairing code arrives once both nonces are exchanged
+    const unCode = listen<{ fingerprint: string; code: string }>("pair-code", ({ payload: { fingerprint: f, code } }) =>
+      setPairing((s) => (s[f]?.state === "waiting" ? { ...s, [f]: { state: "waiting", code } } : s)),
+    );
     return () => {
       un.then((f) => f());
       unLock.then((f) => f());
+      unCode.then((f) => f());
     };
   }, []);
 
   const isPaired = (f: string) => device.paired.some((p) => p.fingerprint === f);
+  const outdated = (p: Peer) => p.info.proto !== device.info.proto;
   const select = (f: string | null) => {
     setSelected(f);
     if (f) localStorage.setItem(SELECTED_KEY, f);
@@ -104,17 +111,16 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
   };
 
   const offlinePaired = device.paired.filter((p) => !peers.some((c) => c.info.fingerprint === p.fingerprint));
-  const current = peers.find((c) => c.info.fingerprint === selected && isPaired(selected));
+  const current = peers.find((c) => c.info.fingerprint === selected && isPaired(selected) && !outdated(c));
   const placed = (f: string) => f in device.portals;
 
   const pair = async (p: Peer) => {
     const f = p.info.fingerprint;
-    const code = await invoke<string>("pair_code", { fingerprint: f });
-    setPairing((s) => ({ ...s, [f]: { state: "waiting", code } }));
+    setPairing((s) => ({ ...s, [f]: { state: "waiting" } }));
     try {
-      const accepted = await invoke<boolean>("pair", { fingerprint: f });
-      setPairing(({ [f]: _, ...rest }) => (accepted ? rest : { ...rest, [f]: { state: "declined" } }));
-      if (accepted) select(f);
+      const answer = await invoke<PairAnswer>("pair", { fingerprint: f });
+      setPairing(({ [f]: _, ...rest }) => (answer === "accepted" ? rest : { ...rest, [f]: { state: answer } }));
+      if (answer === "accepted") select(f);
     } catch (e) {
       setPairing((s) => ({ ...s, [f]: { state: "error", message: String(e) } }));
     }
@@ -123,15 +129,20 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
   const view = (p: Peer): { mood: Mood; note: string; tone: "fg" | "muted" | "danger" } => {
     const f = p.info.fingerprint;
     const s = pairing[f];
-    if (s?.state === "waiting") return { mood: "waiting", note: `Code ${s.code}`, tone: "fg" };
+    if (outdated(p)) return { mood: "sad", note: "Needs LOKA update", tone: "muted" };
+    if (s?.state === "waiting") return { mood: "waiting", note: s.code ? `Code ${s.code}` : "Asking…", tone: "fg" };
     if (isPaired(f)) return { mood: selected === f ? "happy" : "idle", note: placed(f) ? "Paired" : "Paired · place it", tone: selected === f ? "fg" : "muted" };
     if (s?.state === "declined") return { mood: "sad", note: "Declined", tone: "danger" };
+    if (s?.state === "noAnswer") return { mood: "sad", note: "No answer", tone: "danger" };
+    if (s?.state === "unknown") return { mood: "sad", note: "Can't see this computer", tone: "danger" };
     if (s?.state === "error") return { mood: "sad", note: "Couldn't reach it", tone: "danger" };
     return { mood: "idle", note: "Click to pair", tone: "muted" };
   };
 
   const empty = peers.length === 0 && offlinePaired.length === 0;
-  const waiting = Object.entries(pairing).find(([, s]) => s.state === "waiting");
+  const waiting = Object.values(pairing).find((s) => s.state === "waiting");
+  const waitingCode = waiting?.state === "waiting" ? waiting.code : undefined;
+  const unseen = peers.find((p) => pairing[p.info.fingerprint]?.state === "unknown");
 
   return (
     <>
@@ -149,10 +160,14 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
         </h1>
         <p className="rise mt-3 max-w-[52ch] text-[15px] leading-relaxed text-muted" style={{ "--i": 1 } as React.CSSProperties}>
           {waiting
-            ? `Check that the other device shows ${(waiting[1] as { code: string }).code}, then accept there.`
-            : current
-              ? "Push your cursor off the glowing edge to move over. Push it back out the far side to come home. The other device can reach this one the same way."
-              : "Every computer running LOKA shows up here. Click one to pair, then place it around your screens."}
+            ? waitingCode
+              ? `Check that the other device shows ${waitingCode}, then accept there.`
+              : "Asking the other device…"
+            : unseen
+              ? `${unseen.info.alias} can't see this computer on the network. Check both are on the same network, or add this computer by IP there.`
+              : current
+                ? "Push your cursor off the glowing edge to move over. Push it back out the far side to come home. The other device can reach this one the same way."
+                : "Every computer running LOKA shows up here. Click one to pair, then place it around your screens."}
         </p>
 
         {empty ? (
@@ -172,11 +187,11 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
               return (
                 <li key={f} className="rise" style={{ "--i": 2 + i } as React.CSSProperties}>
                   <button
-                    disabled={pairing[f]?.state === "waiting"}
+                    disabled={pairing[f]?.state === "waiting" || outdated(p)}
                     onClick={() => (isPaired(f) ? select(f) : pair(p))}
                     aria-pressed={active}
                     aria-label={`${p.info.alias}, ${osLabel(p.info.os)}. ${v.note}`}
-                    className="group flex w-32 flex-col items-center rounded-[22px] px-2 pb-3 pt-4 transition-[background-color,transform] duration-300 ease-[var(--ease-spring)] hover:bg-white/[0.04] active:scale-[0.96] focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-wait"
+                    className={`group flex w-32 flex-col items-center rounded-[22px] px-2 pb-3 pt-4 transition-[background-color,transform] duration-300 ease-[var(--ease-spring)] hover:bg-white/[0.04] active:scale-[0.96] focus-visible:outline-2 focus-visible:outline-accent ${outdated(p) ? "disabled:cursor-not-allowed" : "disabled:cursor-wait"}`}
                   >
                     <span className={`rounded-[36%] p-1 ring-2 transition-[box-shadow,transform] duration-300 ease-[var(--ease-spring)] group-hover:-translate-y-0.5 ${active ? "ring-accent" : "ring-transparent"}`}>
                       <Face seed={f} size={68} mood={v.mood} />
@@ -213,7 +228,7 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
         <>
           <Calibrate key={selected} fingerprint={selected} alias={current.info.alias} saved={device.portals[selected]} />
           <Pointer initial={device.cursor} mac={mac} />
-          <Remote key={selected} fingerprint={selected} alias={current.info.alias} />
+          <Remote key={selected} fingerprint={selected} alias={current.info.alias} mac={mac} />
           <div className="mt-4 flex justify-end">
             <button
               onClick={() => {

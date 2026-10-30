@@ -1,12 +1,13 @@
 //! Shared mouse & keyboard. Pushing the cursor into a portal hands input to the paired device behind it;
 //! pushing it out of that device's opposite edge (or Ctrl+Alt+Esc) hands it back. Any paired device can
-//! drive any other; links are pinned TLS (`network::secure`).
+//! drive any other; links are streams of pinned QUIC connections (`network::secure`).
 //!
 //! Wire: fixed 9-byte frames `tag | payload (8 bytes, LE)`. A Clipboard frame is followed by `len` bytes
-//! of UTF-8: the clipboard travels with the cursor (driver → driven on Enter, back on Return).
+//! of UTF-8: the clipboard travels with the cursor (driver → driven on Enter, back on Return). Pairing
+//! frames are followed by 32 bytes: commit, nonce, reveal.
 
 use crate::{
-    network::secure::{ClientStream, ServerStream, Tls},
+    network::secure::{self, Stream, Tls},
     platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Gesture, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine, LOCK_SCAN},
 };
 use std::{
@@ -21,7 +22,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf},
-    net::TcpListener,
     sync::{
         mpsc::{self, unbounded_channel, UnboundedReceiver},
         Notify,
@@ -31,6 +31,8 @@ use tokio::{
 };
 
 pub const PORT: u16 = 53321;
+/// Wire version, announced by discovery: devices with another one can't pair or connect.
+pub const PROTOCOL: u32 = 2;
 const FRAME: usize = 9;
 /// A stalled peer must never keep this machine's input hostage.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -53,9 +55,13 @@ pub enum Msg {
     /// Receiver → sender: cursor left through the entry edge at `y` (fraction along that edge).
     Return { y: f32 },
     Leave,
-    /// Ask the other device's user to pair with this one.
+    /// Ask the other device's user to pair with this one; followed by SHA-256 of the asker's nonce.
     PairRequest,
-    PairResponse { accepted: bool },
+    /// Answerer → asker, right away: followed by the answerer's nonce.
+    PairNonce,
+    /// Asker → answerer: followed by the asker's nonce, which must match its commitment.
+    PairReveal,
+    PairResponse(PairAnswer),
     /// Clipboard text follows: `len` bytes of UTF-8.
     Clipboard { len: u32 },
     /// Driven → driver: session turned down, so the driver can say why instead of "closed".
@@ -71,17 +77,18 @@ pub enum Msg {
 }
 
 /// What a paired device can open on this one, each only if this one's user shares it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Service {
     Shell = 1,
     Files = 2,
     Sound = 3,
     Notifications = 4,
+    Mic = 5,
 }
 
 impl Service {
     fn from_u8(b: u8) -> Option<Self> {
-        [Service::Shell, Service::Files, Service::Sound, Service::Notifications].into_iter().find(|s| *s as u8 == b)
+        [Service::Shell, Service::Files, Service::Sound, Service::Notifications, Service::Mic].into_iter().find(|s| *s as u8 == b)
     }
 
     fn not_shared(self) -> &'static str {
@@ -90,8 +97,21 @@ impl Service {
             Service::Files => "the other computer isn't sharing a folder",
             Service::Sound => "the other computer isn't sharing its sound",
             Service::Notifications => "the other computer isn't sharing its notifications",
+            Service::Mic => "the other computer isn't sharing its microphone",
         }
     }
+}
+
+/// How the asked device answered a pairing request.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PairAnswer {
+    Declined = 0,
+    Accepted = 1,
+    /// its user didn't answer in time
+    NoAnswer = 2,
+    /// it doesn't see the asking device on the network, so it can't tell who is asking
+    Unknown = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -150,7 +170,7 @@ impl Msg {
             }
             Msg::Leave => put(0, &[7]),
             Msg::PairRequest => put(0, &[8]),
-            Msg::PairResponse { accepted } => put(0, &[9, accepted as u8]),
+            Msg::PairResponse(a) => put(0, &[9, a as u8]),
             Msg::Clipboard { len } => {
                 put(0, &[10]);
                 put(1, &len.to_le_bytes());
@@ -162,6 +182,8 @@ impl Msg {
                 put(1, &batch.to_le_bytes());
             }
             Msg::Open(s) => put(0, &[15, s as u8]),
+            Msg::PairNonce => put(0, &[16]),
+            Msg::PairReveal => put(0, &[17]),
         }
         b
     }
@@ -187,7 +209,9 @@ impl Msg {
             6 => Msg::Return { y: f32_at(1)? },
             7 => Msg::Leave,
             8 => Msg::PairRequest,
-            9 => Msg::PairResponse { accepted: b[1] != 0 },
+            9 => Msg::PairResponse(
+                [PairAnswer::Declined, PairAnswer::Accepted, PairAnswer::NoAnswer, PairAnswer::Unknown].into_iter().find(|a| *a as u8 == b[1])?,
+            ),
             10 => Msg::Clipboard { len: Some(u32::from_le_bytes(b[1..5].try_into().unwrap())).filter(|l| *l <= MAX_CLIPBOARD)? },
             11 => Msg::Refuse(match b[1] {
                 1 => Refusal::NotPaired,
@@ -198,6 +222,8 @@ impl Msg {
             13 => Msg::Drag { batch: u64::from_le_bytes(b[1..9].try_into().unwrap()) },
             14 => Msg::Input(InputEvent::Gesture { gesture: Gesture::from_u8(b[1])? }),
             15 => Msg::Open(Service::from_u8(b[1])?),
+            16 => Msg::PairNonce,
+            17 => Msg::PairReveal,
             _ => return None,
         })
     }
@@ -510,11 +536,14 @@ pub async fn send_session(
 
     let (tx, mut rx) = unbounded_channel();
     let m = portal.monitor;
+    crate::platform::feed();
     engine.start_capture((m.x + m.w / 2.0, m.y + m.h / 2.0), tx).map_err(io::Error::other)?;
+    let mut alive = tokio::time::interval(Duration::from_millis(500));
 
     // reading in its own task keeps frames intact when the select below picks the other branch
     // shortcut: the Client's clipboard only comes back on an edge return, not on Ctrl+Alt+Esc; add a Leave ack if needed.
-    let closed = || io::Error::new(io::ErrorKind::ConnectionAborted, "peer closed the session");
+    // a silently dead peer (QUIC idle timeout) stays TimedOut, so the user is told it stopped answering
+    let closed = |e: io::Error| if e.kind() == io::ErrorKind::TimedOut { e } else { io::Error::new(io::ErrorKind::ConnectionAborted, "peer closed the session") };
     let mut returned = tokio::spawn(async move {
         let mut drag = None;
         loop {
@@ -528,10 +557,10 @@ pub async fn send_session(
                         *LAST_SHARED.lock().unwrap() = Some(text);
                     }
                     Ok(None) => {}
-                    Err(_) => return Err(closed()),
+                    Err(e) => return Err(closed(e)),
                 },
                 Ok(_) => {}
-                Err(_) => return Err(closed()),
+                Err(e) => return Err(closed(e)),
             }
         }
     });
@@ -548,10 +577,14 @@ pub async fn send_session(
                 None => tokio::select! {
                     c = rx.recv() => c,
                     r = &mut returned => {
-                        (back_y, back_drag) = r.unwrap_or_else(|_| Err(closed()))?;
+                        (back_y, back_drag) = r.unwrap_or_else(|e| Err(closed(io::Error::other(e))))?;
                         return Ok(());
                     }
                     _ = &mut ended => Some(Captured::Escape),
+                    _ = alive.tick() => {
+                        crate::platform::feed();
+                        continue;
+                    }
                 },
             };
             let e = match c {
@@ -627,29 +660,66 @@ pub fn end_sessions() {
     END.notify_waiters();
 }
 
-/// One frame, pushed out now: TLS would otherwise hold small frames back.
+/// One frame, pushed out now.
 async fn send(w: &mut (impl AsyncWrite + Unpin), m: Msg) -> io::Result<()> {
     w.write_all(&m.encode()).await?;
     w.flush().await
 }
 
-/// Ask the device at `to` (which must be `expect`, its discovered fingerprint) to pair; resolves once
-/// its user answers (or the request times out).
-pub async fn request_pair(tls: &Tls, to: SocketAddr, expect: &str) -> io::Result<bool> {
+/// A pairing frame and the 32 bytes that follow it.
+async fn send_pairing(w: &mut (impl AsyncWrite + Unpin), m: Msg, bytes: &[u8; 32]) -> io::Result<()> {
+    let mut b = m.encode().to_vec();
+    b.extend_from_slice(bytes);
+    w.write_all(&b).await?;
+    w.flush().await
+}
+
+/// The 32 bytes after a `want` frame.
+async fn read_pairing(r: &mut (impl AsyncRead + Unpin), want: Msg) -> io::Result<[u8; 32]> {
+    if read_msg(r).await? != want {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected pairing frame"));
+    }
+    let mut b = [0; 32];
+    r.read_exact(&mut b).await?;
+    Ok(b)
+}
+
+/// Ask the device at `to` (which must be `expect`, its discovered fingerprint) to pair; `on_code` gets
+/// the code both screens show as soon as it is known. Resolves once its user answers (or the request
+/// times out).
+pub async fn request_pair(tls: &Tls, to: SocketAddr, expect: &str, on_code: impl FnOnce(String)) -> io::Result<PairAnswer> {
     let (mut s, _) = tls.connect(to, Some(expect)).await?;
-    send(&mut s, Msg::PairRequest).await?;
+    let mine = secure::nonce();
+    send_pairing(&mut s, Msg::PairRequest, &secure::commit(&mine)).await?;
+    let theirs = timeout(Duration::from_secs(5), read_pairing(&mut s, Msg::PairNonce)).await??;
+    send_pairing(&mut s, Msg::PairReveal, &mine).await?;
+    on_code(secure::pairing_code(&tls.me, expect, &mine, &theirs));
     match timeout(PAIR_TIMEOUT + Duration::from_secs(5), read_msg(&mut s)).await? {
-        Ok(Msg::PairResponse { accepted }) => Ok(accepted),
+        Ok(Msg::PairResponse(answer)) => Ok(answer),
         Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected reply to pair request")),
         Err(e) => Err(e),
     }
+}
+
+/// Answering side, after the PairRequest frame from `asker`: the code to show, once the asker revealed
+/// the nonce it committed to before seeing ours.
+async fn answer_pair(s: &mut Stream, asker: &str, me: &str) -> io::Result<String> {
+    let mut committed = [0; 32];
+    s.read_exact(&mut committed).await?;
+    let mine = secure::nonce();
+    send_pairing(s, Msg::PairNonce, &mine).await?;
+    let theirs = read_pairing(s, Msg::PairReveal).await?;
+    if secure::commit(&theirs) != committed {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "pairing nonce doesn't match its commitment"));
+    }
+    Ok(secure::pairing_code(asker, me, &theirs, &mine))
 }
 
 /// How long the other device's user has to accept a pairing request.
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A stream to paired device `expect`'s `service`, once it answered that it shares it.
-pub async fn open(tls: &Tls, to: SocketAddr, expect: &str, service: Service) -> io::Result<ClientStream> {
+pub async fn open(tls: &Tls, to: SocketAddr, expect: &str, service: Service) -> io::Result<Stream> {
     let (mut s, _) = tls.connect(to, Some(expect)).await?;
     send(&mut s, Msg::Open(service)).await?;
     match timeout(Duration::from_secs(5), s.read_u8()).await?? {
@@ -659,45 +729,39 @@ pub async fn open(tls: &Tls, to: SocketAddr, expect: &str, service: Service) -> 
 }
 
 /// A driver's connection waiting for the screen: stream, its fingerprint, entry edge and position.
-type Incoming = (ServerStream, String, Edge, f32);
+type Incoming = (Stream, String, Edge, f32);
 
-/// Receiving side. Every connection is handled on its own: a pairing request (answered by `ask_pair` with
-/// the address and fingerprint of the asking device), a service (`allow_service`, then `on_service` owns
-/// the stream), or an input session, which only devices passing `allow_session` (paired fingerprints) may
-/// start. One session at a time: a new driver takes over, handing the cursor back to the current one.
+/// Receiving side. Every stream is handled on its own: a pairing request (answered by `ask_pair` with
+/// the address and fingerprint of the asking device and the code to show), a service (`allow_service`,
+/// then `on_service` owns the stream), or an input session, which only devices passing `allow_session`
+/// (paired fingerprints) may start. One session at a time: a new driver takes over, handing the cursor
+/// back to the current one.
 /// `make_sink` gets the driving device's fingerprint and the edge the cursor enters (and leaves) through.
-pub async fn serve<S: Sink, F: Future<Output = bool> + Send + 'static>(
+pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
     tls: Arc<Tls>,
     port: u16,
     allow_session: impl Fn(&str) -> Result<(), Refusal> + Send + Sync + 'static,
-    ask_pair: impl Fn(IpAddr, String) -> F + Send + Sync + 'static,
+    ask_pair: impl Fn(IpAddr, String, String) -> F + Send + Sync + 'static,
     allow_service: impl Fn(Service, &str) -> bool + Send + Sync + 'static,
-    on_service: impl Fn(Service, String, ServerStream) + Send + Sync + 'static,
+    on_service: impl Fn(Service, String, Stream) + Send + Sync + 'static,
     mut make_sink: impl FnMut(&str, Edge) -> Option<S>,
 ) -> io::Result<()> {
-    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let mut listener = tls.listen(port)?;
     let (tx, mut rx) = mpsc::channel::<Incoming>(1);
     let host = Arc::new((allow_session, ask_pair, allow_service, on_service));
     let t = tls.clone();
     tokio::spawn(async move {
-        loop {
-            let (tcp, from) = match listener.accept().await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("kvm accept: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
+        while let Ok((mut s, who, from)) = listener.accept().await {
             let (t, tx, host) = (t.clone(), tx.clone(), host.clone());
             tokio::spawn(async move {
                 let (allow_session, ask_pair, allow_service, on_service) = &*host;
-                let Ok((mut s, who)) = t.accept(tcp).await else { return };
                 let Ok(Ok(first)) = timeout(Duration::from_secs(5), read_msg(&mut s)).await else { return };
                 match first {
                     Msg::PairRequest => {
-                        let accepted = ask_pair(from.ip(), who).await;
-                        let _ = send(&mut s, Msg::PairResponse { accepted }).await;
+                        // a wrong reveal (or none) drops the request without a prompt
+                        let Ok(Ok(code)) = timeout(Duration::from_secs(5), answer_pair(&mut s, &who, &t.me)).await else { return };
+                        let answer = ask_pair(from.ip(), who, code).await;
+                        let _ = send(&mut s, Msg::PairResponse(answer)).await;
                     }
                     Msg::Enter { edge, y } => match allow_session(&who) {
                         Ok(()) => {
@@ -733,19 +797,18 @@ pub async fn serve<S: Sink, F: Future<Output = bool> + Send + 'static>(
     }
 }
 
-/// Turn a session down. The driver hangs up first: closing with its clipboard frame unread resets the
-/// link and loses the Refuse.
-async fn refuse(mut s: ServerStream, r: Refusal) {
+/// Turn a session down; `shutdown` waits until the driver has the Refuse.
+async fn refuse(mut s: Stream, r: Refusal) {
     let _ = timeout(WRITE_TIMEOUT, async {
         send(&mut s, Msg::Refuse(r)).await?;
-        tokio::io::copy(&mut s, &mut tokio::io::sink()).await
+        s.shutdown().await
     })
     .await;
 }
 
 /// The driver's input forwarded on to the next device of a chain until that one hands the cursor back.
 struct Relay {
-    wr: WriteHalf<ClientStream>,
+    wr: WriteHalf<Stream>,
     back: UnboundedReceiver<Back>,
     reader: JoinHandle<()>,
     portal: Portal,
@@ -964,7 +1027,9 @@ mod tests {
             Msg::Lock { on: true },
             Msg::Drag { batch: u64::MAX - 1 },
             Msg::PairRequest,
-            Msg::PairResponse { accepted: true },
+            Msg::PairResponse(PairAnswer::NoAnswer),
+            Msg::PairNonce,
+            Msg::PairReveal,
             Msg::Clipboard { len: MAX_CLIPBOARD },
         ];
         for m in all {
@@ -1069,7 +1134,7 @@ mod tests {
         (Arc::new(Tls::new(&Identity::generate())), Tls::new(&Identity::generate()))
     }
 
-    async fn dial(t: &Tls, port: u16) -> crate::network::secure::ClientStream {
+    async fn dial(t: &Tls, port: u16) -> Stream {
         t.connect(([127, 0, 0, 1], port).into(), None).await.unwrap().0
     }
 
@@ -1079,7 +1144,7 @@ mod tests {
         let g = got.clone();
         let port = 53398;
         let (them, me) = devices();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(g.clone()))));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
         for m in [
@@ -1109,11 +1174,11 @@ mod tests {
         let (them, me) = devices();
         let them_fp = them.me.clone();
         let allow = move |fp: &str| if p1.lock().unwrap().as_deref() == Some(fp) { Ok(()) } else { Err(Refusal::NotPaired) };
-        let ask = move |_, fp: String| {
+        let ask = move |_, fp: String, _| {
             let p = p2.clone();
             async move {
                 *p.lock().unwrap() = Some(fp); // user taps "Pair": remembers who asked, by certificate
-                true
+                PairAnswer::Accepted
             }
         };
         tokio::spawn(serve(them, port, allow, ask, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(g.clone()))));
@@ -1126,7 +1191,7 @@ mod tests {
         assert_eq!(read_msg(&mut s).await.unwrap(), Msg::Refuse(Refusal::NotPaired), "the driver is told why");
         assert!(got.lock().unwrap().is_empty(), "session before pairing must be dropped");
 
-        assert!(request_pair(&me, to, &them_fp).await.unwrap());
+        assert_eq!(request_pair(&me, to, &them_fp, |_| {}).await.unwrap(), PairAnswer::Accepted);
         assert_eq!(paired.lock().unwrap().as_deref(), Some(me.me.as_str()));
         let mut s = dial(&me, port).await;
         send(&mut s, enter).await.unwrap();
@@ -1168,7 +1233,7 @@ mod tests {
         let port = 53394;
         let (them, me) = devices();
         let them_fp = them.me.clone();
-        tokio::spawn(serve(them, port, |_| Err(Refusal::NotPaired), |_, _| async { false }, |_, _| false, |_, _, _| {}, |_, _| None::<Recorder>));
+        tokio::spawn(serve(them, port, |_| Err(Refusal::NotPaired), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| None::<Recorder>));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
@@ -1195,7 +1260,7 @@ mod tests {
         let d = drags.clone();
         let (them, me) = devices();
         let them_fp = them.me.clone();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Drags(d.clone()))));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Drags(d.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
@@ -1234,7 +1299,7 @@ mod tests {
     async fn crossing(port: u16, own: Arc<Mutex<Option<String>>>, text: Option<&str>, copy_on_client: Option<&str>) -> Option<String> {
         let o = own.clone();
         let (them, me) = devices();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Clip { own: o.clone() })));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Clip { own: o.clone() })));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
         send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.5 }).await.unwrap();
@@ -1325,9 +1390,9 @@ mod tests {
         let c = Arc::new(Tls::new(&crate::network::secure::Identity::generate()));
         let (c_port, b_port) = (53391, 53390);
         let cr = c_rec.clone();
-        tokio::spawn(serve(c.clone(), c_port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(cr.clone()))));
+        tokio::spawn(serve(c.clone(), c_port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(cr.clone()))));
         let (br, next) = (b_rec.clone(), (SocketAddr::from(([127, 0, 0, 1], c_port)), c.me.clone()));
-        tokio::spawn(serve(b, b_port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Hopper { rec: br.clone(), next: next.clone() })));
+        tokio::spawn(serve(b, b_port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Hopper { rec: br.clone(), next: next.clone() })));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, b_port).await;
         let step = |ms| tokio::time::sleep(Duration::from_millis(ms));
@@ -1354,9 +1419,9 @@ mod tests {
         let rec = Arc::new(Mutex::new(Vec::new()));
         let (b, first) = devices();
         let second = Tls::new(&crate::network::secure::Identity::generate());
-        let port = 53389;
+        let port = 53379; // UDP 53389 is held by a Windows service on some machines
         let r = rec.clone();
-        tokio::spawn(serve(b, port, |_| Ok(()), |_, _| async { false }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(r.clone()))));
+        tokio::spawn(serve(b, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(r.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut one = dial(&first, port).await;
         send(&mut one, Msg::Enter { edge: Edge::Right, y: 0.5 }).await.unwrap();
@@ -1371,5 +1436,96 @@ mod tests {
         // the first driver's held Shift is let go before the second one's cursor appears at our top edge
         let up = got.iter().position(|e| *e == Injected::Key { scan: 0x2A, down: false }).unwrap();
         assert_eq!(got[up + 1], Injected::MoveTo { x: 250.0, y: 8.0 });
+    }
+
+    #[tokio::test]
+    async fn pairing_codes_match_answers_say_why_and_a_wrong_reveal_gets_no_prompt() {
+        let port = 53386;
+        let (them, me) = devices();
+        let them_fp = them.me.clone();
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let sh = shown.clone();
+        // the first request is accepted; the user never answers the second
+        let ask = move |_, _, code: String| {
+            let mut sh = sh.lock().unwrap();
+            sh.push(code);
+            let answer = if sh.len() == 1 { PairAnswer::Accepted } else { PairAnswer::NoAnswer };
+            async move { answer }
+        };
+        tokio::spawn(serve(them, port, |_| Ok(()), ask, |_, _| false, |_, _, _| {}, |_, _| None::<Recorder>));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let to: SocketAddr = ([127, 0, 0, 1], port).into();
+        let mut mine = None;
+        assert_eq!(request_pair(&me, to, &them_fp, |c| mine = Some(c)).await.unwrap(), PairAnswer::Accepted);
+        assert_eq!(*shown.lock().unwrap(), vec![mine.unwrap()], "both screens show the same code");
+        assert_eq!(request_pair(&me, to, &them_fp, |_| {}).await.unwrap(), PairAnswer::NoAnswer);
+        assert_eq!(Msg::decode(&[9, 4, 0, 0, 0, 0, 0, 0, 0]), None, "unknown answer");
+
+        // revealing another nonce than the one committed to: dropped before any prompt
+        let mut s = dial(&me, port).await;
+        send_pairing(&mut s, Msg::PairRequest, &secure::commit(&secure::nonce())).await.unwrap();
+        read_pairing(&mut s, Msg::PairNonce).await.unwrap();
+        send_pairing(&mut s, Msg::PairReveal, &secure::nonce()).await.unwrap();
+        assert!(timeout(Duration::from_secs(2), read_msg(&mut s)).await.unwrap().is_err(), "no answer");
+        assert_eq!(shown.lock().unwrap().len(), 2, "no prompt");
+    }
+
+    /// Forwards UDP between a client and `to` until `cut`, then drops everything both ways.
+    async fn black_hole(listen: u16, to: u16, cut: Arc<AtomicBool>) {
+        let front = tokio::net::UdpSocket::bind(("127.0.0.1", listen)).await.unwrap();
+        let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        back.connect(("127.0.0.1", to)).await.unwrap();
+        let (mut a, mut b, mut client) = ([0u8; 65536], [0u8; 65536], None);
+        loop {
+            tokio::select! {
+                Ok((n, from)) = front.recv_from(&mut a) => {
+                    client = Some(from);
+                    if !cut.load(Ordering::SeqCst) {
+                        let _ = back.send(&a[..n]).await;
+                    }
+                }
+                Ok(n) = back.recv(&mut b) => {
+                    if let (Some(c), false) = (client, cut.load(Ordering::SeqCst)) {
+                        let _ = front.send_to(&b[..n], c).await;
+                    }
+                }
+                else => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silently_dead_link_releases_held_keys_and_ends_both_sides() {
+        let (port, proxy) = (53385, 53384);
+        let rec = Arc::new(Mutex::new(Vec::new()));
+        let (them, me) = devices();
+        let them_fp = them.me.clone();
+        let r = rec.clone();
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(r.clone()))));
+        let cut = Arc::new(AtomicBool::new(false));
+        tokio::spawn(black_hole(proxy, port, cut.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let engine = Arc::new(Captor::default());
+        let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
+        let e = engine.clone();
+        let driver = tokio::spawn(async move { send_session(&me, e, ([127, 0, 0, 1], proxy).into(), &them_fp, portal, 0.5, Tune::new(1.0, false), None).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let down = Injected::Key { scan: 0x1E, down: true };
+        engine.out.lock().unwrap().as_ref().unwrap().send(Captured::Input(InputEvent::Key { scan: 0x1E, down: true })).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(rec.lock().unwrap().contains(&down));
+
+        cut.store(true, Ordering::SeqCst); // Wi-Fi gone, peer asleep: nothing more arrives either way
+        let e = timeout(Duration::from_secs(5), driver).await.expect("driver gave up in time").unwrap().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "the driver is told the other side stopped answering: {e}");
+        assert!(engine.warped.lock().unwrap().is_some(), "local input given back");
+        let up = Injected::Key { scan: 0x1E, down: false };
+        for _ in 0..20 {
+            if rec.lock().unwrap().contains(&up) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the held key was never released on the driven side");
     }
 }

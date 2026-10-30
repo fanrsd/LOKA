@@ -10,10 +10,10 @@ use hyper_util::rt::TokioIo;
 use tauri::AppHandle;
 use tokio::net::TcpListener;
 
-use crate::network::secure::ServerStream;
+use crate::network::secure::Stream;
 
 /// Owner: WebDAV for `root` on this one stream until the viewer hangs up.
-pub async fn serve(s: ServerStream, root: PathBuf) -> io::Result<()> {
+pub async fn serve(s: Stream, root: PathBuf) -> io::Result<()> {
     // dav-server maps request paths below `root` and refuses `..` past it
     let dav = DavHandler::builder().filesystem(LocalFs::new(root, false, false, false)).locksystem(MemLs::new()).build_handler();
     let svc = service_fn(move |req| {
@@ -99,25 +99,22 @@ async fn mount(_port: u16) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::network::secure::{Identity, Tls};
-    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// One raw HTTP/1.1 request over a fresh pinned TLS pair; the whole response.
-    async fn request(root: PathBuf, raw: Vec<u8>) -> Vec<u8> {
-        let (owner, viewer) = (Arc::new(Tls::new(&Identity::generate())), Tls::new(&Identity::generate()));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (srv, expect) = (owner.clone(), owner.me.clone());
+    /// One raw HTTP/1.1 request over a fresh pinned pair of devices (the owner on UDP `port`); the
+    /// whole response.
+    async fn request(port: u16, root: PathBuf, raw: Vec<u8>) -> Vec<u8> {
+        let (owner, viewer) = (Tls::new(&Identity::generate()), Tls::new(&Identity::generate()));
+        let mut listener = owner.listen(port).unwrap();
         tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let (s, _) = srv.accept(tcp).await.unwrap();
+            let (s, _, _) = listener.accept().await.unwrap();
             let _ = serve(s, root).await;
         });
-        let (mut s, _) = viewer.connect(addr, Some(&expect)).await.unwrap();
+        let (mut s, _) = viewer.connect(([127, 0, 0, 1], port).into(), Some(&owner.me)).await.unwrap();
         s.write_all(&raw).await.unwrap();
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
-        // a peer that closes without close_notify is an error here; the bytes before it still count
+        // the bytes before an error still count
         while let Ok(n @ 1..) = s.read(&mut buf).await {
             out.extend_from_slice(&buf[..n]);
         }
@@ -133,14 +130,14 @@ mod tests {
 
         let mut put = format!("PUT /note.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
         put.extend_from_slice(body);
-        let res = request(root.clone(), put).await;
+        let res = request(53382, root.clone(), put).await;
         assert!(res.starts_with(b"HTTP/1.1 201"), "{}", String::from_utf8_lossy(&res));
         assert_eq!(std::fs::read(root.join("note.bin")).unwrap(), body);
 
-        let res = request(root.clone(), b"GET /note.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec()).await;
+        let res = request(53381, root.clone(), b"GET /note.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec()).await;
         assert!(res.starts_with(b"HTTP/1.1 200") && res.ends_with(body), "{}", String::from_utf8_lossy(&res));
 
-        let res = request(root.clone(), b"PUT /../escaped HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 3\r\n\r\nbad".to_vec()).await;
+        let res = request(53380, root.clone(), b"PUT /../escaped HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 3\r\n\r\nbad".to_vec()).await;
         assert!(!base.join("escaped").exists(), "wrote outside the shared folder: {}", String::from_utf8_lossy(&res));
 
         let _ = std::fs::remove_dir_all(&base);

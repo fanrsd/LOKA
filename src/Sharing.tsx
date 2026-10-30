@@ -57,6 +57,7 @@ export function Sharing({ initial, received, mac, onChange }: { initial: Sharing
           )}
         </div>
         <Toggle on={s.sound} onChange={(sound) => change({ sound })} label="Its sound" hint="Paired devices can play what this computer plays" />
+        <Toggle on={s.mic} onChange={(mic) => change({ mic })} label="Its microphone" hint="Paired devices can use it as their mic" />
         <Toggle on={s.notifications} onChange={(notifications) => change({ notifications })} label="Its notifications" hint="Shown on paired devices that ask for them" />
         <Toggle on={s.terminal} onChange={(terminal) => change({ terminal })} label="A terminal" hint="Paired devices can run commands here as you. Turn on only for your own computers." />
       </div>

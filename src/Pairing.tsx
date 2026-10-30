@@ -4,11 +4,12 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Face } from "./Face";
 import type { Portal } from "./calibration";
 
-export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string };
+/** `proto`: wire version (`kvm::PROTOCOL`); devices with another one can't pair or connect. */
+export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string; proto: number };
 export type Peer = { info: DeviceInfo; addr: string };
 export type PairedDevice = { fingerprint: string; alias: string };
 export type CursorPrefs = { speed: number; edgeDelayMs: number; swapCtrlCmd: boolean };
-export type Sharing = { terminal: boolean; folder: string | null; sound: boolean; notifications: boolean };
+export type Sharing = { terminal: boolean; folder: string | null; sound: boolean; notifications: boolean; mic: boolean };
 export type Device = {
   info: DeviceInfo;
   paired: PairedDevice[];

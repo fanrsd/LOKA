@@ -69,7 +69,7 @@ type AppState = Arc<Mutex<Shared>>;
 static DRIVING: AtomicBool = AtomicBool::new(false);
 
 /// A stream to paired device `fingerprint`'s `service` (it must share it). Err = user-readable message.
-pub(crate) async fn open_service(app: &AppHandle, fingerprint: &str, service: kvm::Service) -> Result<secure::ClientStream, String> {
+pub(crate) async fn open_service(app: &AppHandle, fingerprint: &str, service: kvm::Service) -> Result<secure::Stream, String> {
     let to = app.state::<AppState>().lock().unwrap().addr(fingerprint, |i| i.kvm_port).ok_or("that device isn't paired or isn't on the network")?;
     let tls = app.state::<Arc<Tls>>().inner().clone();
     kvm::open(&tls, to, fingerprint, service).await.map_err(|e| e.to_string())
@@ -266,24 +266,22 @@ fn peers(state: State<AppState>) -> Vec<Peer> {
     state.lock().unwrap().live_peers().cloned().collect()
 }
 
-/// The code both screens show while pairing with `fingerprint`.
+/// Ask a nearby device's user to pair. Emits `pair-code` `{fingerprint, code}` once the code both
+/// screens show is known; resolves with their answer (`accepted`, `declined`, `noAnswer`, `unknown`).
 #[tauri::command]
-fn pair_code(tls: State<Arc<Tls>>, fingerprint: String) -> String {
-    secure::pairing_code(&tls.me, &fingerprint)
-}
-
-/// Ask a nearby device's user to pair. Resolves with their answer.
-#[tauri::command]
-async fn pair(app: AppHandle, state: State<'_, AppState>, tls: State<'_, Arc<Tls>>, fingerprint: String) -> Result<bool, String> {
+async fn pair(app: AppHandle, state: State<'_, AppState>, tls: State<'_, Arc<Tls>>, fingerprint: String) -> Result<kvm::PairAnswer, String> {
     let peer = state.lock().unwrap().live_peers().find(|p| p.info.fingerprint == fingerprint).cloned().ok_or("device is no longer on the network")?;
     // the connection only goes through if the device there holds the certificate discovery announced
-    let accepted = kvm::request_pair(&tls, SocketAddr::new(peer.addr, peer.info.kvm_port), &fingerprint).await.map_err(|e| e.to_string())?;
-    if accepted {
+    let show = |code: String| {
+        let _ = app.emit_to(MAIN_WINDOW, "pair-code", serde_json::json!({ "fingerprint": fingerprint, "code": code }));
+    };
+    let answer = kvm::request_pair(&tls, SocketAddr::new(peer.addr, peer.info.kvm_port), &fingerprint, show).await.map_err(|e| e.to_string())?;
+    if answer == kvm::PairAnswer::Accepted {
         state.lock().unwrap().settings.pair(PairedDevice { fingerprint, alias: peer.info.alias });
         let _ = app.emit("paired", ());
         refresh_tray(&app);
     }
-    Ok(accepted)
+    Ok(answer)
 }
 
 #[tauri::command]
@@ -371,9 +369,9 @@ fn open_url(url: String) -> Result<(), String> {
     r.map(drop).map_err(|e| e.to_string())
 }
 
-/// Show a pairing prompt (with the code from both fingerprints) in `window` and wait for the user
-/// (or time out → declined). `me` is the fingerprint of the device being asked.
-async fn ask_user(app: &AppHandle, state: &AppState, window: &str, from: &Peer, me: &str) -> bool {
+/// Show a pairing prompt (with the `code` both screens show) in `window` and wait for the user
+/// (or time out → no answer).
+async fn ask_user(app: &AppHandle, state: &AppState, window: &str, from: &Peer, code: String) -> kvm::PairAnswer {
     let (tx, rx) = oneshot::channel();
     let id = {
         let mut s = state.lock().unwrap();
@@ -382,12 +380,15 @@ async fn ask_user(app: &AppHandle, state: &AppState, window: &str, from: &Peer, 
         s.pending.insert(id, tx);
         id
     };
-    let code = secure::pairing_code(me, &from.info.fingerprint);
     let _ = app.emit_to(window, "pair-request", serde_json::json!({ "id": id, "peer": from, "code": code }));
-    let accepted = matches!(tokio::time::timeout(kvm::PAIR_TIMEOUT, rx).await, Ok(Ok(true)));
+    let answer = match tokio::time::timeout(kvm::PAIR_TIMEOUT, rx).await {
+        Ok(Ok(true)) => kvm::PairAnswer::Accepted,
+        Ok(Ok(false)) => kvm::PairAnswer::Declined,
+        _ => kvm::PairAnswer::NoAnswer,
+    };
     state.lock().unwrap().pending.remove(&id);
     let _ = app.emit_to(window, "pair-request-closed", id);
-    accepted
+    answer
 }
 
 /// Store (or with `None`, remove) the portal to paired device `fingerprint` and put its overlay there.
@@ -632,7 +633,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_device,
             peers,
-            pair_code,
             pair,
             answer_pair,
             unpair,
@@ -660,6 +660,7 @@ pub fn run() {
             shell::term_close,
             share::open_share,
             audio::set_listening,
+            audio::set_mic,
             notify::set_mirroring
         ])
         // closing the window keeps LOKA sharing from the tray; "Quit LOKA" there ends it
@@ -689,6 +690,7 @@ pub fn run() {
                 telemetry_port: telemetry::PORT,
                 transfer_port: transfer::PORT,
                 kvm_port: kvm::PORT,
+                proto: kvm::PROTOCOL,
                 mac: mac_address::get_mac_address().ok().flatten().map(|m| m.to_string()),
             };
             let state: AppState = Arc::new(Mutex::new(Shared {
@@ -1076,20 +1078,30 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
     tauri::async_runtime::spawn(async move {
         let st = state.clone();
         let allow = move |fp: &str| if st.lock().unwrap().settings.is_paired(fp) { Ok(()) } else { Err(kvm::Refusal::NotPaired) };
-        let (a, st, me) = (app.clone(), state.clone(), tls.me.clone());
-        let ask = move |ip: IpAddr, fp: String| {
-            let (app, state, me) = (a.clone(), st.clone(), me.clone());
+        let (a, st) = (app.clone(), state.clone());
+        let ask = move |_: IpAddr, fp: String, code: String| {
+            let (app, state) = (a.clone(), st.clone());
             async move {
-                // a device we discovered at that address, whose certificate is the one it announced
-                let from = state.lock().unwrap().live_peers().find(|p| p.addr == ip && p.info.fingerprint == fp).cloned();
-                let Some(from) = from else { return false };
-                let accepted = ask_user(&app, &state, MAIN_WINDOW, &from, &me).await;
-                if accepted {
+                // the fingerprint is proven by the connection; its address may differ from the one discovery
+                // heard (several interfaces, VPN, vEthernet), and a peer a few heartbeats stale still counts
+                let from = state.lock().unwrap().peers.get(&fp).cloned();
+                let Some(from) = from else { return kvm::PairAnswer::Unknown };
+                // a prompt hidden in the tray would just time out
+                if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+                    let _ = w.unminimize();
+                    let _ = w.show();
+                }
+                {
+                    use tauri_plugin_notification::NotificationExt;
+                    let _ = app.notification().builder().title("LOKA").body(format!("{} wants to pair · open LOKA to answer", from.info.alias)).show();
+                }
+                let answer = ask_user(&app, &state, MAIN_WINDOW, &from, code).await;
+                if answer == kvm::PairAnswer::Accepted {
                     state.lock().unwrap().settings.pair(PairedDevice { fingerprint: fp, alias: from.info.alias.clone() });
                     let _ = app.emit("paired", ());
-        refresh_tray(&app);
+                    refresh_tray(&app);
                 }
-                accepted
+                answer
             }
         };
         let make = move |fp: &str, edge: Edge| {
@@ -1119,10 +1131,11 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                     kvm::Service::Files => sh.folder.is_some(),
                     kvm::Service::Sound => sh.sound,
                     kvm::Service::Notifications => sh.notifications,
+                    kvm::Service::Mic => sh.mic,
                 }
         };
         let st = state.clone();
-        let on_service = move |service: kvm::Service, _fp: String, stream: secure::ServerStream| {
+        let on_service = move |service: kvm::Service, _fp: String, stream: secure::Stream| {
             let folder = st.lock().unwrap().settings.sharing.folder.clone();
             tauri::async_runtime::spawn(async move {
                 let r = match service {
@@ -1131,7 +1144,8 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                         Some(root) => share::serve(stream, root).await,
                         None => Ok(()),
                     },
-                    kvm::Service::Sound => audio::serve(stream).await,
+                    kvm::Service::Sound => audio::serve(stream, false).await,
+                    kvm::Service::Mic => audio::serve(stream, true).await,
                     kvm::Service::Notifications => notify::serve(stream).await,
                 };
                 if let Err(e) = r {
@@ -1160,10 +1174,12 @@ struct Door {
 #[cfg(desktop)]
 fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: f32, drag: Option<u64>) -> Result<(), &'static str> {
     let state = app.state::<AppState>();
-    let (to, transfer_to, prefs, peer_is_mac) = {
+    let (to, transfer_to, prefs, peer_is_mac, alias) = {
         let s = state.lock().unwrap();
         let to = s.addr(&fp, |i| i.kvm_port).ok_or("that device isn't on the network")?;
-        (to, s.addr(&fp, |i| i.transfer_port), s.settings.cursor, s.peers.get(&fp).is_some_and(|p| p.info.os == "macos"))
+        let peer = s.peers.get(&fp);
+        let alias = peer.map_or_else(|| "The other device".into(), |p| p.info.alias.clone());
+        (to, s.addr(&fp, |i| i.transfer_port), s.settings.cursor, peer.is_some_and(|p| p.info.os == "macos"), alias)
     };
     if DRIVING.swap(true, Ordering::SeqCst) {
         return Err("already controlling another device");
@@ -1180,7 +1196,8 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
         if let Ok(Some(batch)) = r {
             hold_drag(&app, &label, batch); // a drag came back with the cursor
         }
-        let error = r.as_ref().err().map(|e| e.to_string());
+        // TimedOut: the link went silent (Wi-Fi drop, sleep, crash), not a refusal or a hang-up
+        let error = r.as_ref().err().map(|e| if e.kind() == std::io::ErrorKind::TimedOut { format!("{alias} stopped answering") } else { e.to_string() });
         let _ = app.emit("kvm", serde_json::json!({ "active": false, "error": error }));
         if error.is_some() {
             tokio::time::sleep(Duration::from_secs(1)).await; // no reconnect storm at the edge
