@@ -307,6 +307,55 @@ impl Portal {
     }
 }
 
+/// Stretches of `edge` of screen `m` (fractions along it) a portal may use: not against another of
+/// `screens` (the cursor just moves on to that one there) and not under one of `taken`.
+pub fn free_spans(screens: &[Rect], m: Rect, edge: Edge, taken: &[Portal]) -> Vec<(f64, f64)> {
+    let vertical = matches!(edge, Edge::Left | Edge::Right);
+    let (lo, len) = if vertical { (m.y, m.h) } else { (m.x, m.w) };
+    let mut blocked: Vec<(f64, f64)> = taken.iter().filter(|p| p.edge == edge && p.monitor == m).map(|p| (p.start, p.end)).collect();
+    for n in screens.iter().filter(|n| **n != m) {
+        let touches = match edge {
+            Edge::Left => n.x + n.w == m.x,
+            Edge::Right => n.x == m.x + m.w,
+            Edge::Top => n.y + n.h == m.y,
+            Edge::Bottom => n.y == m.y + m.h,
+        };
+        if touches {
+            let (a, b) = if vertical { (n.y, n.y + n.h) } else { (n.x, n.x + n.w) };
+            blocked.push(((a - lo) / len, (b - lo) / len));
+        }
+    }
+    blocked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let (mut free, mut at) = (vec![], 0.0f64);
+    for (a, b) in blocked.into_iter().chain([(1.0, 1.0)]) {
+        if a.min(1.0) > at {
+            free.push((at, a.min(1.0)));
+        }
+        at = at.max(b);
+    }
+    free
+}
+
+/// Where a device newly put on `edge` goes: the middle of the longest free stretch of that edge on any
+/// screen (or as near as it fits), 30 % long at most; `None` when no screen has room left there.
+pub fn fit(screens: &[Rect], edge: Edge, taken: &[Portal]) -> Option<Portal> {
+    let mut best: Option<(Rect, (f64, f64))> = None;
+    for m in screens {
+        for s in free_spans(screens, *m, edge, taken) {
+            if best.is_none_or(|(_, b)| s.1 - s.0 > b.1 - b.0 + 1e-9) {
+                best = Some((*m, s));
+            }
+        }
+    }
+    let (monitor, (a, b)) = best?;
+    let len = (b - a).min(0.3);
+    if len < 0.05 {
+        return None;
+    }
+    let start = (0.5 - len / 2.0).clamp(a, b - len);
+    Some(Portal { edge, monitor, start, end: start + len, reach: 120.0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +412,24 @@ mod tests {
         assert_eq!((b.x, b.y, b.w, b.h), (4480.0 - 101.0, 360.0, 101.0, 720.0));
         let (cx, cy) = (b.x + 1.0, b.y + 1.0); // inner corner of the band samples
         assert!(P.sample(cx + 1.0, cy).is_some());
+    }
+
+    #[test]
+    fn free_spans_skip_neighbouring_screens_and_other_portals() {
+        let a = Rect { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 };
+        let b = Rect { x: 1920.0, y: 540.0, w: 1920.0, h: 1080.0 }; // lower half of a's right edge touches b
+        let screens = [a, b];
+        assert_eq!(free_spans(&screens, a, Edge::Right, &[]), vec![(0.0, 0.5)]);
+        assert_eq!(free_spans(&screens, b, Edge::Left, &[]), vec![(0.5, 1.0)]);
+        let taken = [Portal { edge: Edge::Right, monitor: b, start: 0.35, end: 0.65, reach: 120.0 }];
+        assert_eq!(free_spans(&screens, b, Edge::Right, &taken), vec![(0.0, 0.35), (0.65, 1.0)]);
+        // longest stretch wins (first on a tie), as near the middle as it fits
+        let p = fit(&screens, Edge::Right, &taken).unwrap();
+        assert!(p.monitor == a && (p.start - 0.2).abs() < 1e-9 && (p.end - 0.5).abs() < 1e-9);
+        let p = fit(&[b], Edge::Right, &taken).unwrap();
+        assert!((p.start - 0.05).abs() < 1e-9 && (p.end - 0.35).abs() < 1e-9);
+        // a full edge has no room
+        let full = [Portal { start: 0.0, end: 1.0, ..taken[0] }];
+        assert_eq!(fit(&[b], Edge::Right, &full), None);
     }
 }

@@ -412,10 +412,12 @@ async fn ask_user(app: &AppHandle, state: &AppState, window: &str, from: &Peer, 
 }
 
 /// Store (or with `None`, remove) the portal to paired device `fingerprint` and put its overlay there.
+/// `sync`: the side changed, so that device puts this one on its opposite edge (or takes it off); resolves
+/// with why it didn't, if it couldn't.
 // async: building a window inside a sync command deadlocks WebView2 on Windows
 #[tauri::command]
-async fn set_portal(app: AppHandle, state: State<'_, AppState>, fingerprint: String, portal: Option<Portal>) -> Result<(), String> {
-    {
+async fn set_portal(app: AppHandle, state: State<'_, AppState>, tls: State<'_, Arc<Tls>>, fingerprint: String, portal: Option<Portal>, sync: bool) -> Result<Option<String>, String> {
+    let (to, alias) = {
         let mut s = state.lock().unwrap();
         if !s.settings.is_paired(&fingerprint) {
             return Err("not paired".into());
@@ -425,8 +427,20 @@ async fn set_portal(app: AppHandle, state: State<'_, AppState>, fingerprint: Str
             None => s.settings.portals.remove(&fingerprint),
         };
         s.settings.save();
+        let alias = s.settings.paired.iter().find(|d| d.fingerprint == fingerprint).map(|d| d.alias.clone()).unwrap_or_default();
+        (s.addr(&fingerprint, |i| i.kvm_port), alias)
+    };
+    show_portal(&app, &fingerprint, portal)?;
+    if !sync {
+        return Ok(None);
     }
-    show_portal(&app, &fingerprint, portal)
+    let Some(to) = to else { return Ok(Some(format!("{alias} is offline: place this computer on its screens there"))) };
+    let edge = portal.map(|p| p.edge);
+    Ok(match tokio::time::timeout(Duration::from_secs(5), kvm::place(&tls, to, &fingerprint, edge)).await {
+        Ok(Ok(true)) => None,
+        Ok(Ok(false)) => Some(format!("{alias} has no free room on that side: place this computer on its screens there")),
+        _ => Some(format!("Couldn't update {alias}'s layout (needs LOKA 0.8): place this computer on its screens there")),
+    })
 }
 
 /// Tray, overlay window and its placement for the portal to `fingerprint` (already in settings).
@@ -571,6 +585,7 @@ impl Drop for EngineSink {
             let to = s.session.take().and_then(|(fp, _)| s.addr(&fp, |i| i.transfer_port).map(|a| (a, fp)));
             to
         };
+        refresh_tray(&self.app);
         if let Some((addr, fp)) = to {
             sync_clipboard(self.app.clone(), addr, fp);
         }
@@ -1088,15 +1103,18 @@ fn tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(app, "open", "Open LOKA", true, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    let devices: Vec<(String, String)> = {
+    let (devices, busy): (Vec<(String, String)>, bool) = {
         let state = app.state::<AppState>();
         let s = state.lock().unwrap();
-        s.settings.paired.iter().filter(|d| s.settings.portals.contains_key(&d.fingerprint)).map(|d| (d.fingerprint.clone(), d.alias.clone())).collect()
+        let devices = s.settings.paired.iter().filter(|d| s.settings.portals.contains_key(&d.fingerprint)).map(|d| (d.fingerprint.clone(), d.alias.clone())).collect();
+        (devices, s.session.is_some())
     };
     for (fp, alias) in devices {
         menu.append(&MenuItem::with_id(app, format!("control:{fp}"), format!("Control {alias}"), true, None::<&str>)?)?;
     }
-    menu.append(&MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?)?;
+    // only while another device drives this one: while driving, this computer's own mouse is over there,
+    // so the tray can't be reached and Ctrl+Alt+Esc is the way out
+    menu.append(&MenuItem::with_id(app, "disconnect", "Disconnect", busy, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(app, "about", "About LOKA", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "Quit LOKA", true, None::<&str>)?)?;
@@ -1133,6 +1151,48 @@ fn setup_overlays(app: &mut tauri::App, state: AppState, tls: Arc<Tls>) -> tauri
     Ok(())
 }
 
+/// This computer's screens, in the canonical space.
+#[cfg(desktop)]
+fn screens(app: &AppHandle) -> Vec<Rect> {
+    let monitors = app.available_monitors().unwrap_or_default();
+    monitors.iter().map(|m| Rect { x: m.position().x as f64, y: m.position().y as f64, w: m.size().width as f64, h: m.size().height as f64 }).collect()
+}
+
+/// Put paired device `fp` on `edge` here (`None`: off this computer's screens), where that edge still has
+/// room; one already on that edge stays where it is. `false`: not paired, or no room.
+#[cfg(desktop)]
+fn mirror_portal(app: &AppHandle, fp: &str, edge: Option<Edge>) -> bool {
+    let screens = screens(app);
+    let portal = {
+        let state = app.state::<AppState>();
+        let mut s = state.lock().unwrap();
+        if !s.settings.is_paired(fp) {
+            return false;
+        }
+        let portal = match edge {
+            Some(e) if s.settings.portals.get(fp).is_some_and(|p| p.edge == e) => return true,
+            Some(e) => {
+                let taken: Vec<Portal> = s.settings.portals.iter().filter(|(f, _)| *f != fp).map(|(_, p)| *p).collect();
+                let Some(p) = platform::fit(&screens, e, &taken) else { return false };
+                s.settings.portals.insert(fp.to_string(), p);
+                Some(p)
+            }
+            None => {
+                s.settings.portals.remove(fp);
+                None
+            }
+        };
+        s.settings.save();
+        portal
+    };
+    let (app, fp) = (app.clone(), fp.to_string());
+    tauri::async_runtime::spawn(async move {
+        drop(show_portal(&app, &fp, portal));
+        let _ = app.emit("device", ()); // the layout map follows
+    });
+    true
+}
+
 /// Answers pairing requests and accepts input sessions from paired devices.
 #[cfg(desktop)]
 fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: AppState, tls: Arc<Tls>) {
@@ -1143,6 +1203,9 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
             (_, false) => Err(kvm::Refusal::NoInput),
             _ => Ok(()),
         };
+        let a = app.clone();
+        // the other device moved this one to its `edge` of its screens: it goes on the opposite edge here
+        let on_place = move |fp: &str, edge: Option<Edge>| mirror_portal(&a, fp, edge.map(Edge::opposite));
         let (a, st) = (app.clone(), state.clone());
         let ask = move |_: IpAddr, fp: String, code: String| {
             let (app, state) = (a.clone(), st.clone());
@@ -1170,40 +1233,23 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
             }
         };
         let make = move |fp: &str, edge: Edge| {
-            let screens: Vec<Rect> = app
-                .available_monitors()
-                .ok()?
-                .iter()
-                .map(|m| Rect { x: m.position().x as f64, y: m.position().y as f64, w: m.size().width as f64, h: m.size().height as f64 })
-                .collect();
+            let screens = screens(&app);
             if screens.is_empty() {
                 return None;
             }
             // the whole entry edge leads back to the driver: files dragged there and dropped go to it (reach = Calibrate's REACH)
             let band = Portal { edge, monitor: kvm::bounds(&screens), start: 0.0, end: 1.0, reach: 120.0 };
-            let mirror = {
+            let placed = {
                 let state = app.state::<AppState>();
                 let mut s = state.lock().unwrap();
                 s.session = Some((fp.to_string(), band));
-                // no way to the driver yet: mirror its portal (middle of the screen on the entry edge), editable in Calibrate
-                let b = band.monitor;
-                let screen = screens.iter().find(|m| match edge {
-                    Edge::Left => m.x == b.x,
-                    Edge::Right => m.x + m.w == b.x + b.w,
-                    Edge::Top => m.y == b.y,
-                    Edge::Bottom => m.y + m.h == b.y + b.h,
-                });
-                let mirror = screen.filter(|_| !s.settings.portals.contains_key(fp)).map(|m| Portal { edge, monitor: *m, start: 0.35, end: 0.65, reach: 120.0 });
-                if let Some(p) = mirror {
-                    s.settings.portals.insert(fp.to_string(), p);
-                    s.settings.save();
-                }
-                mirror
+                s.settings.portals.contains_key(fp)
             };
-            if let Some(p) = mirror {
-                let (app, fp) = (app.clone(), fp.to_string());
-                tauri::async_runtime::spawn(async move { drop(show_portal(&app, &fp, Some(p))) });
+            // no way to the driver yet: it goes on the entry edge, editable in the layout
+            if !placed {
+                mirror_portal(&app, fp, Some(edge));
             }
+            refresh_tray(&app);
             let _ = app.emit_to(BAND, "portal", edge);
             let _ = place_overlay(&app, BAND, &band);
             engine.show_cursor(true);
@@ -1241,7 +1287,7 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                 }
             });
         };
-        if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, allow_service, on_service, make).await {
+        if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, allow_service, on_service, on_place, make).await {
             eprintln!("kvm receiver stopped: {e}");
         }
     });

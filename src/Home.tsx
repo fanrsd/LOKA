@@ -114,6 +114,7 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
   const current = peers.find((c) => c.info.fingerprint === selected && isPaired(selected) && !outdated(c));
   const placed = (f: string) => f in device.portals;
 
+  /** Resolves with whether the other device accepted. */
   const pair = async (p: Peer) => {
     const f = p.info.fingerprint;
     setPairing((s) => ({ ...s, [f]: { state: "waiting" } }));
@@ -121,8 +122,10 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
       const answer = await invoke<PairAnswer>("pair", { fingerprint: f });
       setPairing(({ [f]: _, ...rest }) => (answer === "accepted" ? rest : { ...rest, [f]: { state: answer } }));
       if (answer === "accepted") select(f);
+      return answer === "accepted";
     } catch (e) {
       setPairing((s) => ({ ...s, [f]: { state: "error", message: String(e) } }));
+      return false;
     }
   };
 
@@ -224,9 +227,10 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
         <AddHost hosts={device.hosts} ips={device.ips} onChange={onChange} />
       </section>
 
+      {!empty && <Calibrate device={device} peers={peers} selected={selected} onSelect={select} onPair={pair} onChange={onChange} />}
+
       {current && selected && (
         <>
-          <Calibrate key={selected} fingerprint={selected} alias={current.info.alias} saved={device.portals[selected]} />
           <Pointer initial={device.cursor} mac={mac} />
           <Remote key={selected} fingerprint={selected} alias={current.info.alias} mac={mac} />
           <div className="mt-4 flex justify-end">

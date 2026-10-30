@@ -138,7 +138,8 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
     let h = app.clone();
     tauri::async_runtime::spawn(async move {
         let sink = move |_: &str, _| Some(WindowSink(h.clone()));
-        if let Err(e) = kvm::serve(tls, KVM_PORT, allow, ask, |_, _| false, |_, _, _| {}, sink).await {
+        // the simulated phone keeps no layout of its own: the host already moves its window (`place`)
+        if let Err(e) = kvm::serve(tls, KVM_PORT, allow, ask, |_, _| false, |_, _, _| {}, |_, _| true, sink).await {
             eprintln!("sim kvm receiver stopped: {e}");
         }
     });

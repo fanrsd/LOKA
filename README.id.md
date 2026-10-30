@@ -68,8 +68,8 @@ Unduh installer dari [Releases](https://github.com/fanrsd/LOKA/releases/latest):
 Lalu:
 
 1. Buka LOKA di kedua komputer.
-2. Di salah satunya, klik Oka komputer lain. Pastikan kedua layar menampilkan kode yang sama, lalu terima di komputer lain.
-3. Pilih tepi layar, lalu geser bar yang menyala sampai sejajar dengan letak perangkat lain.
+2. Di salah satunya, seret Oka komputer lain ke tepi layar yang bersebelahan dengannya di mejamu (atau klik). Pastikan kedua layar menampilkan kode yang sama, lalu terima di komputer lain.
+3. Geser kotaknya di sepanjang tepi sampai cahayanya sejajar dengan letak perangkat lain. Komputer lain otomatis menaruh komputer ini di tepi yang berseberangan.
 
 Kedua perangkat harus berada di jaringan lokal yang sama. LOKA memakai UDP 53318 (pencarian perangkat) dan TCP 53319–53321 (telemetri, file, input). Wi-Fi tamu atau router dengan client isolation memblokir pencarian: LOKA menampilkan **This computer's address** di bawah **Add by IP**; ketik alamat itu di **Add by IP** pada komputer lain.
 

@@ -67,8 +67,8 @@ Download the installer from [Releases](https://github.com/fanrsd/LOKA/releases/l
 Then:
 
 1. Open LOKA on both computers.
-2. On one, click the other's Oka. Check that both show the same code, then accept on the other.
-3. Pick the edge and slide the glowing bar until it lines up with where the other device sits.
+2. On one, drag the other's Oka next to the screen edge it sits beside on your desk (or click it). Check that both show the same code, then accept on the other.
+3. Slide its box along the edge until the glow lines up with where the other device sits. The other computer puts this one on its matching edge by itself.
 
 Both devices must be on the same local network. LOKA uses UDP 53318 (discovery) and TCP 53319–53321 (telemetry, files, input). Guest Wi-Fi or routers with client isolation block discovery: LOKA shows **This computer's address** under **Add by IP**; type it into **Add by IP** on the other computer.
 

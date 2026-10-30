@@ -4,8 +4,8 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Face } from "./Face";
 import type { Portal } from "./calibration";
 
-/** `proto`: wire version (`kvm::PROTOCOL`); devices with another one can't pair or connect. */
-export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string; proto: number };
+/** `proto`: wire version (`kvm::PROTOCOL`); devices with another one can't pair or connect. `aspectRatio`: its screen's width / height. */
+export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string; proto: number; aspectRatio: number };
 export type Peer = { info: DeviceInfo; addr: string };
 export type PairedDevice = { fingerprint: string; alias: string };
 export type CursorPrefs = { speed: number; edgeDelayMs: number; swapCtrlCmd: boolean };

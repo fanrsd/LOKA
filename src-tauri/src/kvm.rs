@@ -74,6 +74,9 @@ pub enum Msg {
     /// First frame of a connection for one of the device's services; it answers one byte (1 = shared)
     /// and from then on the stream belongs to that service.
     Open(Service),
+    /// First and only frame of a layout stream: the sender put this device on its `edge` (`None`: took it
+    /// off), so this one puts the sender on the opposite edge; answered with one byte (1 = done, 0 = no room).
+    Place(Option<Edge>),
 }
 
 /// What a paired device can open on this one, each only if this one's user shares it.
@@ -140,6 +143,10 @@ fn edge_byte(e: Edge) -> u8 {
     }
 }
 
+fn byte_edge(b: u8) -> Option<Edge> {
+    [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom].into_iter().find(|e| edge_byte(*e) == b)
+}
+
 impl Msg {
     pub fn encode(&self) -> [u8; FRAME] {
         let mut b = [0u8; FRAME];
@@ -186,6 +193,7 @@ impl Msg {
             Msg::Open(s) => put(0, &[15, s as u8]),
             Msg::PairNonce => put(0, &[16]),
             Msg::PairReveal => put(0, &[17]),
+            Msg::Place(edge) => put(0, &[18, edge.map_or(255, edge_byte)]),
         }
         b
     }
@@ -194,16 +202,7 @@ impl Msg {
         let i32_at = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let f32_at = |at: usize| Some(f32::from_le_bytes(b[at..at + 4].try_into().unwrap())).filter(|v| (0.0..=1.0).contains(v));
         Some(match b[0] {
-            1 => Msg::Enter {
-                edge: match b[1] {
-                    0 => Edge::Left,
-                    1 => Edge::Right,
-                    2 => Edge::Top,
-                    3 => Edge::Bottom,
-                    _ => return None,
-                },
-                y: f32_at(2)?,
-            },
+            1 => Msg::Enter { edge: byte_edge(b[1])?, y: f32_at(2)? },
             2 => Msg::Input(InputEvent::Move { dx: i32_at(1), dy: i32_at(5) }),
             3 if (1..=5).contains(&b[1]) => Msg::Input(InputEvent::Button { button: b[1], down: b[2] != 0 }),
             4 => Msg::Input(InputEvent::Wheel { dx: i32_at(1), dy: i32_at(5) }),
@@ -227,6 +226,8 @@ impl Msg {
             15 => Msg::Open(Service::from_u8(b[1])?),
             16 => Msg::PairNonce,
             17 => Msg::PairReveal,
+            18 if b[1] == 255 => Msg::Place(None),
+            18 => Msg::Place(Some(byte_edge(b[1])?)),
             _ => return None,
         })
     }
@@ -732,15 +733,24 @@ pub async fn open(tls: &Tls, to: SocketAddr, expect: &str, service: Service) -> 
     }
 }
 
+/// Tell paired device `expect` it now sits on this device's `edge` (`None`: off its screens), so it puts
+/// this one on its opposite edge. `false`: it has no room left there.
+pub async fn place(tls: &Tls, to: SocketAddr, expect: &str, edge: Option<Edge>) -> io::Result<bool> {
+    let (mut s, _) = tls.connect(to, Some(expect)).await?;
+    send(&mut s, Msg::Place(edge)).await?;
+    Ok(timeout(Duration::from_secs(5), s.read_u8()).await?? == 1)
+}
+
 /// A driver's connection waiting for the screen: stream, its fingerprint, entry edge and position.
 type Incoming = (Stream, String, Edge, f32);
 
 /// Receiving side. Every stream is handled on its own: a pairing request (answered by `ask_pair` with
 /// the address and fingerprint of the asking device and the code to show), a service (`allow_service`,
-/// then `on_service` owns the stream), or an input session, which only devices passing `allow_session`
-/// (paired fingerprints) may start. One session at a time: a new driver takes over, handing the cursor
-/// back to the current one.
+/// then `on_service` owns the stream), a layout change (`on_place`, whose answer goes back), or an
+/// input session, which only devices passing `allow_session` (paired fingerprints) may start. One
+/// session at a time: a new driver takes over, handing the cursor back to the current one.
 /// `make_sink` gets the driving device's fingerprint and the edge the cursor enters (and leaves) through.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
     tls: Arc<Tls>,
     port: u16,
@@ -748,17 +758,18 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
     ask_pair: impl Fn(IpAddr, String, String) -> F + Send + Sync + 'static,
     allow_service: impl Fn(Service, &str) -> bool + Send + Sync + 'static,
     on_service: impl Fn(Service, String, Stream) + Send + Sync + 'static,
+    on_place: impl Fn(&str, Option<Edge>) -> bool + Send + Sync + 'static,
     mut make_sink: impl FnMut(&str, Edge) -> Option<S>,
 ) -> io::Result<()> {
     let mut listener = tls.listen(port)?;
     let (tx, mut rx) = mpsc::channel::<Incoming>(1);
-    let host = Arc::new((allow_session, ask_pair, allow_service, on_service));
+    let host = Arc::new((allow_session, ask_pair, allow_service, on_service, on_place));
     let t = tls.clone();
     tokio::spawn(async move {
         while let Ok((mut s, who, from)) = listener.accept().await {
             let (t, tx, host) = (t.clone(), tx.clone(), host.clone());
             tokio::spawn(async move {
-                let (allow_session, ask_pair, allow_service, on_service) = &*host;
+                let (allow_session, ask_pair, allow_service, on_service, on_place) = &*host;
                 let Ok(Ok(first)) = timeout(Duration::from_secs(5), read_msg(&mut s)).await else { return };
                 match first {
                     Msg::PairRequest => {
@@ -778,6 +789,14 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
                         if s.write_all(&[ok as u8]).await.is_ok() && s.flush().await.is_ok() && ok {
                             on_service(service, who, s);
                         }
+                    }
+                    Msg::Place(edge) => {
+                        let ok = on_place(&who, edge);
+                        let _ = timeout(WRITE_TIMEOUT, async {
+                            s.write_all(&[ok as u8]).await?;
+                            s.shutdown().await
+                        })
+                        .await;
                     }
                     _ => {}
                 }
@@ -1035,6 +1054,8 @@ mod tests {
             Msg::PairNonce,
             Msg::PairReveal,
             Msg::Clipboard { len: MAX_CLIPBOARD },
+            Msg::Place(Some(Edge::Top)),
+            Msg::Place(None),
         ];
         for m in all {
             assert_eq!(Msg::decode(&m.encode()), Some(m));
@@ -1148,7 +1169,7 @@ mod tests {
         let g = got.clone();
         let port = 53398;
         let (them, me) = devices();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(g.clone()))));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
         for m in [
@@ -1185,7 +1206,7 @@ mod tests {
                 PairAnswer::Accepted
             }
         };
-        tokio::spawn(serve(them, port, allow, ask, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(g.clone()))));
+        tokio::spawn(serve(them, port, allow, ask, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
         let enter = Msg::Enter { edge: Edge::Left, y: 0.0 };
@@ -1237,13 +1258,34 @@ mod tests {
         let port = 53394;
         let (them, me) = devices();
         let them_fp = them.me.clone();
-        tokio::spawn(serve(them, port, |_| Err(Refusal::NotPaired), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| None::<Recorder>));
+        tokio::spawn(serve(them, port, |_| Err(Refusal::NotPaired), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, |_, _| None::<Recorder>));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
         let e = send_session(&me, engine.clone(), ([127, 0, 0, 1], port).into(), &them_fp, portal, 0.5, Tune::new(1.0, false), None).await.unwrap_err();
         assert_eq!(e.to_string(), Refusal::NotPaired.text());
         assert_eq!(*engine.warped.lock().unwrap(), Some(portal.point(0.5, RETURN_INSET)));
+    }
+
+    #[tokio::test]
+    async fn a_layout_change_reaches_the_other_device_and_its_answer_comes_back() {
+        let port = 53377;
+        let (them, me) = devices();
+        let (them_fp, me_fp) = (them.me.clone(), me.me.clone());
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        // room on every edge but the bottom
+        let on_place = move |who: &str, edge: Option<Edge>| {
+            g.lock().unwrap().push((who.to_string(), edge));
+            edge != Some(Edge::Bottom)
+        };
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, on_place, |_, _| None::<Recorder>));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let to = ([127, 0, 0, 1], port).into();
+        assert!(place(&me, to, &them_fp, Some(Edge::Right)).await.unwrap());
+        assert!(!place(&me, to, &them_fp, Some(Edge::Bottom)).await.unwrap());
+        assert!(place(&me, to, &them_fp, None).await.unwrap());
+        assert_eq!(*got.lock().unwrap(), vec![(me_fp.clone(), Some(Edge::Right)), (me_fp.clone(), Some(Edge::Bottom)), (me_fp, None)]);
     }
 
     /// A Mac without Accessibility: the hook can't be installed.
@@ -1267,7 +1309,7 @@ mod tests {
         let them_fp = them.me.clone();
         let entered = Arc::new(AtomicBool::new(false));
         let seen = entered.clone();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| {
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| {
             seen.store(true, Ordering::SeqCst);
             None::<Recorder>
         }));
@@ -1297,7 +1339,7 @@ mod tests {
         let d = drags.clone();
         let (them, me) = devices();
         let them_fp = them.me.clone();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Drags(d.clone()))));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Drags(d.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let engine = Arc::new(Captor::default());
         let portal = Portal { edge: Edge::Right, monitor: AREA, start: 0.0, end: 1.0, reach: 100.0 };
@@ -1336,7 +1378,7 @@ mod tests {
     async fn crossing(port: u16, own: Arc<Mutex<Option<String>>>, text: Option<&str>, copy_on_client: Option<&str>) -> Option<String> {
         let o = own.clone();
         let (them, me) = devices();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Clip { own: o.clone() })));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Clip { own: o.clone() })));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
         send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.5 }).await.unwrap();
@@ -1427,9 +1469,9 @@ mod tests {
         let c = Arc::new(Tls::new(&crate::network::secure::Identity::generate()));
         let (c_port, b_port) = (53391, 53390);
         let cr = c_rec.clone();
-        tokio::spawn(serve(c.clone(), c_port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(cr.clone()))));
+        tokio::spawn(serve(c.clone(), c_port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(cr.clone()))));
         let (br, next) = (b_rec.clone(), (SocketAddr::from(([127, 0, 0, 1], c_port)), c.me.clone()));
-        tokio::spawn(serve(b, b_port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Hopper { rec: br.clone(), next: next.clone() })));
+        tokio::spawn(serve(b, b_port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Hopper { rec: br.clone(), next: next.clone() })));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, b_port).await;
         let step = |ms| tokio::time::sleep(Duration::from_millis(ms));
@@ -1458,7 +1500,7 @@ mod tests {
         let second = Tls::new(&crate::network::secure::Identity::generate());
         let port = 53379; // UDP 53389 is held by a Windows service on some machines
         let r = rec.clone();
-        tokio::spawn(serve(b, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(r.clone()))));
+        tokio::spawn(serve(b, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(r.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut one = dial(&first, port).await;
         send(&mut one, Msg::Enter { edge: Edge::Right, y: 0.5 }).await.unwrap();
@@ -1489,7 +1531,7 @@ mod tests {
             let answer = if sh.len() == 1 { PairAnswer::Accepted } else { PairAnswer::NoAnswer };
             async move { answer }
         };
-        tokio::spawn(serve(them, port, |_| Ok(()), ask, |_, _| false, |_, _, _| {}, |_, _| None::<Recorder>));
+        tokio::spawn(serve(them, port, |_| Ok(()), ask, |_, _| false, |_, _, _| {}, |_, _| false, |_, _| None::<Recorder>));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
         let mut mine = None;
@@ -1538,7 +1580,7 @@ mod tests {
         let (them, me) = devices();
         let them_fp = them.me.clone();
         let r = rec.clone();
-        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, move |_, _| Some(Recorder(r.clone()))));
+        tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(r.clone()))));
         let cut = Arc::new(AtomicBool::new(false));
         tokio::spawn(black_hole(proxy, port, cut.clone()));
         tokio::time::sleep(Duration::from_millis(100)).await;

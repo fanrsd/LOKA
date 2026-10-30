@@ -138,8 +138,9 @@ async fn serve() {
         println!("{alias} is using this computer.");
         Some(Sink { engine: engine.clone(), alias })
     };
-    // shortcut: no services (terminal, files, sound) and no file transfers without a desktop; add them if servers need them
-    if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, |_, _| false, |_, _, _| {}, make).await {
+    // shortcut: no services (terminal, files, sound) and no file transfers without a desktop; add them if servers need them.
+    // Never drives, so a layout change from a desktop needs nothing here.
+    if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, |_, _| false, |_, _, _| {}, |_, _| true, make).await {
         eprintln!("LOKA stopped: {e}");
     }
 }
