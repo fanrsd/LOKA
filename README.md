@@ -36,6 +36,13 @@ Meet **Oka**, the little one from LOKA: a cursor, the thing that actually travel
 | <img src="docs/screenshots/home.webp" alt="Nearby devices, each shown as an Oka"> | <img src="docs/screenshots/pairing.webp" alt="Pairing prompt with two Okas facing each other"> |
 | <img src="docs/screenshots/waiting.webp" alt="Waiting for the MacBook Air to accept, with the pairing code to compare"> | <img src="docs/screenshots/glow-violet.webp" alt="The same screen with a violet glow"> |
 
+## Security
+
+- **Encrypted, always.** Every link between devices (input, clipboard, files, services) is QUIC over **TLS 1.3**, with certificates on both ends.
+- **Pinned to the device, not the address.** Each LOKA has its own certificate; its SHA-256 **fingerprint** is its identity. A paired device is remembered by that fingerprint, so a computer that merely takes its IP address gets nowhere, and an unpaired one is refused.
+- **A pairing code nobody can fake.** Both screens show the same 6-digit code, derived from both fingerprints and a random number from each side. The asker commits to its number before seeing the other's, so a man in the middle can't try certificates until the codes happen to match.
+- **Nothing leaves your network.** No account, no server, no cloud. Sharing a folder, sound, notifications, the mic or a terminal is off until you turn it on.
+
 ## Platforms
 
 | Platform | Status |
@@ -82,10 +89,6 @@ npm run tauri dev        # run
 npm run sim              # run with a simulated phone client
 npm run tauri build      # installers in src-tauri/target/release/bundle
 ```
-
-## Security
-
-LOKA is built for a home or office network. Every connection between devices is encrypted (TLS 1.3), and each device has its own certificate: once paired, only that exact device can send input or files, even if someone else on the network copies its name or address.
 
 ## License
 

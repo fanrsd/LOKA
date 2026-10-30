@@ -37,6 +37,13 @@ Kenalan dengan **Oka**, si kecil dari LOKA: sebuah kursor, benda yang memang ber
 | <img src="docs/screenshots/home.webp" alt="Perangkat di sekitar, masing-masing tampil sebagai Oka"> | <img src="docs/screenshots/pairing.webp" alt="Permintaan pairing dengan dua Oka saling berhadapan"> |
 | <img src="docs/screenshots/waiting.webp" alt="Menunggu MacBook Air menerima, dengan kode pairing untuk dicocokkan"> | <img src="docs/screenshots/glow-violet.webp" alt="Layar yang sama dengan glow ungu"> |
 
+## Keamanan
+
+- **Selalu terenkripsi.** Setiap koneksi antar perangkat (input, clipboard, file, layanan) memakai QUIC dengan **TLS 1.3**, dengan sertifikat di kedua sisi.
+- **Terikat ke perangkat, bukan alamat.** Setiap LOKA punya sertifikat sendiri; **fingerprint** SHA-256-nya adalah identitasnya. Perangkat pasangan diingat lewat fingerprint itu, jadi komputer yang sekadar memakai alamat IP-nya tidak bisa masuk, dan perangkat yang belum di-pairing ditolak.
+- **Kode pairing yang tidak bisa dipalsukan.** Kedua layar menampilkan kode 6 digit yang sama, dihitung dari kedua fingerprint dan angka acak dari tiap sisi. Peminta mengunci angkanya sebelum melihat angka lawan, jadi penyusup di tengah tidak bisa mencoba-coba sertifikat sampai kodenya kebetulan cocok.
+- **Tidak ada yang keluar dari jaringanmu.** Tanpa akun, server, atau cloud. Berbagi folder, suara, notifikasi, mic, atau terminal mati sampai kamu nyalakan.
+
 ## Platform
 
 | Platform | Status |
@@ -83,10 +90,6 @@ npm run tauri dev        # jalankan
 npm run sim              # jalankan dengan simulasi ponsel
 npm run tauri build      # installer ada di src-tauri/target/release/bundle
 ```
-
-## Keamanan
-
-LOKA dibuat untuk jaringan rumah atau kantor. Setiap koneksi antarperangkat dienkripsi (TLS 1.3) dan setiap perangkat punya sertifikat sendiri: setelah di-pairing, hanya perangkat itu yang bisa mengirim input atau file, meskipun ada yang meniru nama atau alamatnya di jaringan.
 
 ## Lisensi
 
