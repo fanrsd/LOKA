@@ -235,7 +235,7 @@ function ControlCard({ device, computer, control, onSetup, onChange }: { device:
     );
   return (
     <div className="mt-6 rounded-[24px] bg-raised p-4 ring-1 ring-line">
-      <p className="font-semibold">{s.paired ? `${computer} can't move into this phone right now` : `Let ${computer} move into this phone`}</p>
+      <p className="font-semibold">{s.paired ? `${alias} can't move into this phone right now` : `Let ${alias} move into this phone`}</p>
       <p className={"mt-1 text-sm leading-relaxed " + (control.error ? "text-danger" : "text-muted")}>
         {s.paired ? (control.error ?? "Starting…") : "Push its cursor past the screen edge and keep working here. One-time setup in Android settings."}
       </p>
