@@ -472,15 +472,19 @@ fn alias() -> String {
 
 /// Open a web page in the default browser.
 #[tauri::command]
-fn open_url(url: String) -> Result<(), String> {
+fn open_url(app: AppHandle, url: String) -> Result<(), String> {
     if !url.starts_with("https://") {
         return Err("only https links".into());
     }
+    #[cfg(target_os = "android")]
+    let r = app.state::<tauri::plugin::PluginHandle<tauri::Wry>>().run_mobile_plugin::<serde_json::Value>("openUrl", serde_json::json!({ "url": url }));
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
     #[cfg(target_os = "windows")]
     let r = std::process::Command::new("explorer").arg(&url).spawn();
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(&url).spawn();
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "android")))]
     let r = std::process::Command::new("xdg-open").arg(&url).spawn();
     r.map(drop).map_err(|e| e.to_string())
 }
@@ -942,6 +946,7 @@ pub fn run() {
 
             #[cfg(desktop)]
             {
+                platform::keep_running();
                 setup_overlays(app, state.clone(), tls)?;
                 setup_tray(app)?;
                 clip::watch(handle.clone());

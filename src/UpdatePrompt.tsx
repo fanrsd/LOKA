@@ -7,8 +7,9 @@ import { primaryButton, quietButton } from "./Pairing";
 
 type Phase = { at: "ready" } | { at: "downloading"; done: number; total?: number } | { at: "installing" } | { at: "failed"; error: string };
 
-/** A newer LOKA: Oka hops in with what's new; installs in place where the updater can, else opens the download page. */
-export function UpdatePrompt({ update, seed, onClose }: { update: Update; seed: string; onClose: () => void }) {
+/** A newer LOKA: Oka hops in with what's new; installs in place where the updater can, else opens `downloadUrl`
+ *  (default: the release page). */
+export function UpdatePrompt({ update, seed, downloadUrl, onClose }: { update: Update; seed: string; downloadUrl?: string; onClose: () => void }) {
   const [phase, setPhase] = useState<Phase>({ at: "ready" });
   const busy = phase.at === "downloading" || phase.at === "installing";
   const version = update.installable?.version ?? update.available!.name.replace(/^LOKA\s*/i, "").replace(/^v/, "");
@@ -31,7 +32,7 @@ export function UpdatePrompt({ update, seed, onClose }: { update: Update; seed: 
     // resolves only on failure: success restarts LOKA (Windows: its installer closes and reopens it)
     invoke("install_update").catch((e) => setPhase({ at: "failed", error: String(e) }));
   };
-  const download = () => invoke("open_url", { url: update.available?.url ?? "https://github.com/fanrsd/LOKA/releases/latest" });
+  const download = () => invoke("open_url", { url: downloadUrl ?? update.available?.url ?? "https://github.com/fanrsd/LOKA/releases/latest" });
   const pct = phase.at === "downloading" && phase.total ? Math.round((phase.done / phase.total) * 100) : null;
 
   return (

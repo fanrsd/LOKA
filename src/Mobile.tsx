@@ -6,6 +6,8 @@ import { Face, type Mood } from "./Face";
 import { AddHost } from "./Home";
 import { PairPrompt, osLabel, primaryButton, quietButton, type Device, type PairedDevice, type Peer } from "./Pairing";
 import type { Portal } from "./calibration";
+import { useUpdate } from "./About";
+import { UpdatePrompt } from "./UpdatePrompt";
 
 type PairAnswer = "accepted" | "declined" | "noAnswer" | "unknown";
 type Pairing = { state: "waiting"; code?: string } | { state: "failed"; note: string };
@@ -20,6 +22,9 @@ export function Mobile() {
   const [screen, setScreen] = useState<"home" | "wizard" | "settings">("home");
   const [note, setNote] = useState("");
   const control = useControl();
+  // once per launch, as on computers; phones can't update in place, so Download fetches the APK
+  const [prompt, setPrompt] = useState(true);
+  const update = useUpdate();
   const files = useRef<HTMLInputElement>(null);
   const sendTo = useRef("");
   const refreshDevice = () => invoke<Device>("get_device").then(setDevice);
@@ -189,6 +194,14 @@ export function Mobile() {
 
       <AddHost hosts={device.hosts} ips={device.ips} onChange={refreshDevice} />
       <PairPrompt selfSeed={device.info.fingerprint} />
+      {prompt && update.available && (
+        <UpdatePrompt
+          update={update}
+          seed={device.info.fingerprint}
+          downloadUrl={`https://github.com/fanrsd/LOKA/releases/download/${update.available.tag}/LOKA_${update.available.tag.slice(1)}_android.apk`}
+          onClose={() => setPrompt(false)}
+        />
+      )}
     </main>
   );
 }

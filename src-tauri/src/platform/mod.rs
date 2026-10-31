@@ -142,6 +142,15 @@ pub fn engine() -> Box<dyn SpatialPlatformEngine> {
     Box::new(TouchEngine)
 }
 
+/// LOKA works with its window minimized or in the tray: no App Nap (macOS) and no automatic power throttling
+/// (Windows 11 lowers minimized/hidden apps to low QoS and coarse timers), which would stall the 60 Hz tracker.
+pub fn keep_running() {
+    #[cfg(target_os = "windows")]
+    windows::keep_running();
+    #[cfg(target_os = "macos")]
+    macos::keep_running();
+}
+
 /// A password manager marked what's on the clipboard as secret: it never leaves this computer.
 pub fn clipboard_concealed() -> bool {
     #[cfg(target_os = "windows")]

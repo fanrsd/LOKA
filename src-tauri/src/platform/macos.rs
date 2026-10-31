@@ -236,6 +236,17 @@ fn release() {
     set_cursor_hidden(false);
 }
 
+/// Holds off App Nap for LOKA's lifetime: with every window hidden or minimized macOS would otherwise defer its
+/// timers and network (the tracker, discovery, sessions). The display and the system may still sleep when idle.
+pub fn keep_running() {
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | NSActivityOptions::LatencyCritical,
+        &NSString::from_str("LOKA shares this Mac's mouse and keyboard"),
+    );
+    std::mem::forget(token); // ending the activity would let App Nap back in
+}
+
 /// Password managers mark secrets with this (nspasteboard.org convention).
 pub fn clipboard_concealed() -> bool {
     let pb = objc2_app_kit::NSPasteboard::generalPasteboard();

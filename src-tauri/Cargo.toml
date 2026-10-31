@@ -1,6 +1,6 @@
 [package]
 name = "loka"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/fanrsd/LOKA"
@@ -40,7 +40,7 @@ windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_UI_Wind
 objc2 = "0.6"
 block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "NSWindow", "NSResponder", "NSPasteboard", "NSFilePromiseProvider", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSView", "NSApplication", "NSImage", "NSGraphicsContext"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSEnumerator", "NSURL", "NSError", "NSOperation", "NSGeometry", "NSData", "NSDictionary"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSEnumerator", "NSURL", "NSError", "NSOperation", "NSGeometry", "NSData", "NSDictionary", "NSProcessInfo"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13"

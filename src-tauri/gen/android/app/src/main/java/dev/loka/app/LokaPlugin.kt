@@ -38,6 +38,7 @@ import org.conscrypt.Conscrypt
 @InvokeArg class PageArgs { var page: String = "developer" }
 @InvokeArg class CodeArgs { var code: String = "" }
 @InvokeArg class StartArgs { var port: Int = 0; var token: String = "" }
+@InvokeArg class UrlArgs { var url: String = "" }
 @InvokeArg class CursorArgs { var x: Double = 0.0; var y: Double = 0.0; var show: Boolean = false }
 
 /**
@@ -95,6 +96,18 @@ class LokaPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve()
     } catch (e: Exception) {
       invoke.reject("Android has no such settings page here")
+    }
+  }
+
+  /** A web page in the browser (`open_url`; an APK link downloads there and Android offers to install it). */
+  @Command
+  fun openUrl(invoke: Invoke) {
+    val url = invoke.parseArgs(UrlArgs::class.java).url
+    try {
+      activity.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+      invoke.resolve()
+    } catch (e: Exception) {
+      invoke.reject("No browser to open $url")
     }
   }
 

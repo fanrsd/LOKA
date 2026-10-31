@@ -286,6 +286,21 @@ fn show_cursors() {
     }
 }
 
+/// Opts out of Windows 11's automatic throttling of minimized/hidden apps (low QoS, timer resolution ignored).
+pub fn keep_running() {
+    use windows_sys::Win32::System::Threading::*;
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0, // controlled and off = never throttled
+    };
+    // SAFETY: a valid struct of the documented size for ProcessPowerThrottling on our own process
+    let ok = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(), size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) };
+    if ok == 0 {
+        eprintln!("power throttling opt-out failed"); // Windows before 10 1709: nothing to opt out of
+    }
+}
+
 /// Password managers (KeePass, 1Password, Bitwarden…) tag secrets with these formats.
 pub fn clipboard_concealed() -> bool {
     use windows_sys::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
