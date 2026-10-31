@@ -1,5 +1,9 @@
+// the phone build has no capture, overlays or clipboard pictures yet: desktop-only paths stay unused there
+#![cfg_attr(mobile, allow(dead_code, unused))]
+#[cfg(desktop)]
 mod audio;
 mod carry;
+#[cfg(desktop)]
 mod clip;
 mod kvm;
 mod network;
@@ -8,9 +12,14 @@ mod headless;
 mod platform;
 mod notify;
 mod settings;
+#[cfg(desktop)]
 mod share;
+#[cfg(desktop)]
 mod shell;
+#[cfg(desktop)]
 mod sim;
+#[cfg(desktop)]
+mod update;
 
 use network::{
     discovery::{self, DeviceInfo, DeviceType, Peer},
@@ -36,6 +45,16 @@ use tokio::sync::{oneshot, watch};
 /// While another device drives this one: the band on the edge leading back to it.
 const BAND: &str = "edge-overlay";
 const MAIN_WINDOW: &str = "main";
+
+/// Telemetry, transfer and kvm ports this device listens on. The Android emulator sits behind NAT on the
+/// same computer as a desktop LOKA, so it takes its own, forwarded with `adb emu redir add udp:N:N`.
+static PORTS: std::sync::LazyLock<(u16, u16, u16)> = std::sync::LazyLock::new(|| {
+    #[cfg(target_os = "android")]
+    if std::process::Command::new("getprop").arg("ro.hardware").output().is_ok_and(|o| matches!(o.stdout.trim_ascii(), b"ranchu" | b"goldfish")) {
+        return (telemetry::PORT + 20, transfer::PORT + 20, kvm::PORT + 20);
+    }
+    (telemetry::PORT, transfer::PORT, kvm::PORT)
+});
 
 /// Overlay window of the portal leading to device `fp`.
 fn portal_label(fp: &str) -> String {
@@ -137,6 +156,23 @@ async fn send_paths(app: AppHandle, state: State<'_, AppState>, fingerprint: Str
     Ok(())
 }
 
+/// A file picked on the phone, as base64: Android hands the web view file contents, not paths, and its IPC
+/// bridge carries JSON only.
+// shortcut: the whole file passes through memory (and base64); stream it in chunks if phones send multi-GB videos
+#[tauri::command]
+async fn send_upload(app: AppHandle, fingerprint: String, name: String, data: String) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| "unreadable file")?;
+    let to = app.state::<AppState>().lock().unwrap().addr(&fingerprint, |i| i.transfer_port).ok_or("that device isn't on the network")?;
+    let name = transfer::file_name(std::path::Path::new(&name)); // a plain file name, never a path
+    let dir = app.path().app_cache_dir().map_err(|e| e.to_string())?.join("outgoing");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(&name);
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    send_files(app, to, fingerprint, vec![(path, name)], None).await;
+    Ok(())
+}
+
 /// Files waiting for a device to go to (Send to / Open With), emptied by reading.
 #[tauri::command]
 fn take_outbox(state: State<AppState>) -> Vec<PathBuf> {
@@ -156,6 +192,7 @@ fn receive_outbox(app: &AppHandle, paths: Vec<PathBuf>) {
 
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+        #[cfg(desktop)]
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
@@ -176,8 +213,26 @@ async fn control(app: AppHandle, fingerprint: String) -> Result<(), String> {
             }
         }
     }
-    let portal = app.state::<AppState>().lock().unwrap().settings.portals.get(&fingerprint).copied().ok_or("place that device next to a screen first")?;
+    let portal = app.state::<AppState>().lock().unwrap().settings.portals.get(&fingerprint).copied();
+    // a phone drives from its touchpad screen: the computer counts as sitting off its right edge
+    #[cfg(mobile)]
+    let portal = portal.or(Some(Portal { edge: Edge::Right, monitor: Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }, start: 0.0, end: 1.0, reach: 0.0 }));
+    let portal = portal.ok_or("place that device next to a screen first")?;
     start_session(&app, portal_label(&fingerprint), fingerprint, portal, 0.5, None).map_err(String::from)
+}
+
+/// The phone's touchpad: input for the computer it drives (`control`).
+#[cfg(mobile)]
+#[tauri::command]
+fn touch(event: platform::InputEvent) {
+    platform::touch(event);
+}
+
+/// Port and token `Injector.kt` dials back with (LokaPlugin `start`).
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn injector_ticket() -> Option<(u16, String)> {
+    platform::android::ticket()
 }
 
 /// End whatever session runs: give this computer's input back, or hand the cursor back to whoever drives it.
@@ -294,13 +349,23 @@ fn answer_pair(state: State<AppState>, id: u64, accept: bool) {
 }
 
 #[tauri::command]
-fn unpair(app: AppHandle, state: State<AppState>, fingerprint: String) {
-    state.lock().unwrap().settings.unpair(&fingerprint);
-    if let Some(w) = app.get_webview_window(&portal_label(&fingerprint)) {
+fn unpair(app: AppHandle, state: State<AppState>, tls: State<Arc<Tls>>, fingerprint: String) {
+    // tell it first (its address goes with the pairing), so it drops this one and its glow too
+    if let Some(to) = state.lock().unwrap().addr(&fingerprint, |i| i.kvm_port) {
+        let (tls, fp) = (tls.inner().clone(), fingerprint.clone());
+        tauri::async_runtime::spawn(async move { kvm::unpair(&tls, to, &fp).await });
+    }
+    forget(&app, &fingerprint);
+}
+
+/// Drop a paired device here: pairing, portal and its overlay.
+fn forget(app: &AppHandle, fingerprint: &str) {
+    app.state::<AppState>().lock().unwrap().settings.unpair(fingerprint);
+    if let Some(w) = app.get_webview_window(&portal_label(fingerprint)) {
         let _ = w.close();
     }
     let _ = app.emit("paired", ());
-        refresh_tray(&app);
+    refresh_tray(app);
 }
 
 /// Remember a device by address (networks that drop multicast) and ask it to answer now.
@@ -393,6 +458,14 @@ fn alias() -> String {
         .ok()
         // macOS GUI apps get no HOSTNAME and have no /proc: ask for the name set in System Settings
         .or_else(|| cfg!(target_os = "macos").then(|| std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok()).flatten().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|h| !h.is_empty()))
+        // Android: the name in Settings › About ("Galaxy S23 Ultra", or the one the user gave it), else the model
+        // ("SM-S918B"); its hostname is just "localhost"
+        .or_else(|| {
+            #[cfg(target_os = "android")]
+            return platform::android::device_name().or_else(|| std::process::Command::new("getprop").arg("ro.product.model").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|h| !h.is_empty()));
+            #[cfg(not(target_os = "android"))]
+            None
+        })
         .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|h| h.trim().to_string()).filter(|h| !h.is_empty()))
         .unwrap_or_else(|| "LOKA".into())
 }
@@ -476,16 +549,26 @@ fn show_portal(app: &AppHandle, fingerprint: &str, portal: Option<Portal>) -> Re
         }
         return Ok(());
     };
-    if app.get_webview_window(sim::LABEL).is_some() && app.state::<AppState>().lock().unwrap().peers.get(fingerprint).is_some_and(|p| p.info.os == "sim") {
-        sim::place(app, &portal).map_err(|e| e.to_string())?;
+    // a phone has no overlay windows (yet)
+    #[cfg(mobile)]
+    return {
+        let _ = portal;
+        Ok(())
+    };
+    #[cfg(desktop)]
+    {
+        if app.get_webview_window(sim::LABEL).is_some() && app.state::<AppState>().lock().unwrap().peers.get(fingerprint).is_some_and(|p| p.info.os == "sim") {
+            sim::place(app, &portal).map_err(|e| e.to_string())?;
+        }
+        open_overlay(app, &label, Some(fingerprint.to_string()), portal.edge).map_err(|e| e.to_string())?;
+        let _ = app.emit_to(&label, "portal", portal.edge); // redraw for a new edge without a restart
+        place_overlay(app, &label, &portal).map_err(|e| e.to_string())
     }
-    open_overlay(app, &label, Some(fingerprint.to_string()), portal.edge).map_err(|e| e.to_string())?;
-    let _ = app.emit_to(&label, "portal", portal.edge); // redraw for a new edge without a restart
-    place_overlay(app, &label, &portal).map_err(|e| e.to_string())
 }
 
 /// The overlay window `label`, created if needed. `to`: the paired device a drop on it goes to
 /// (`None`: the band, whose drops go back to whoever drives us).
+#[cfg(desktop)]
 fn open_overlay(app: &AppHandle, label: &str, to: Option<String>, edge: Edge) -> tauri::Result<tauri::WebviewWindow> {
     use tauri::{DragDropEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
     if let Some(w) = app.get_webview_window(label) {
@@ -609,9 +692,12 @@ impl Drop for EngineSink {
             to
         };
         refresh_tray(&self.app);
+        #[cfg(desktop)]
         if let Some((addr, fp)) = to {
             sync_clipboard(self.app.clone(), addr, fp);
         }
+        #[cfg(mobile)]
+        let _ = to;
         if let Some(w) = self.app.get_webview_window(BAND) {
             let _ = w.hide();
         }
@@ -697,6 +783,17 @@ pub fn run() {
         }
     }
     let mut builder = tauri::Builder::default();
+    // Android side of being driven: Wireless debugging, the injector, the cursor overlay (LokaPlugin.kt)
+    builder = builder.plugin(
+        tauri::plugin::Builder::<tauri::Wry>::new("loka")
+            .setup(|app, api| {
+                #[cfg(target_os = "android")]
+                app.manage(api.register_android_plugin("dev.loka.app", "LokaPlugin")?);
+                let _ = (app, api);
+                Ok(())
+            })
+            .build(),
+    );
     #[cfg(desktop)]
     {
         use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
@@ -721,7 +818,8 @@ pub fn run() {
                         }
                     })
                     .build(),
-            );
+            )
+            .plugin(tauri_plugin_updater::Builder::new().build());
     }
     let app = builder
         .plugin(tauri_plugin_notification::init())
@@ -742,6 +840,7 @@ pub fn run() {
             firewall_status,
             allow_input,
             open_url,
+            #[cfg(desktop)]
             sim::start_sim,
             set_sharing,
             set_received,
@@ -750,15 +849,33 @@ pub fn run() {
             take_outbox,
             control,
             disconnect,
+            #[cfg(mobile)]
+            touch,
+            #[cfg(target_os = "android")]
+            injector_ticket,
+            send_upload,
+            #[cfg(desktop)]
             clip::clip_history,
+            #[cfg(desktop)]
             clip::clip_restore,
+            #[cfg(desktop)]
             shell::term_open,
+            #[cfg(desktop)]
             shell::term_write,
+            #[cfg(desktop)]
             shell::term_resize,
+            #[cfg(desktop)]
             shell::term_close,
+            #[cfg(desktop)]
             share::open_share,
+            #[cfg(desktop)]
             audio::set_listening,
+            #[cfg(desktop)]
             audio::set_mic,
+            #[cfg(desktop)]
+            update::check_update,
+            #[cfg(desktop)]
+            update::install_update,
             notify::set_mirroring
         ])
         // closing the window keeps LOKA sharing from the tray; "Quit LOKA" there ends it
@@ -785,9 +902,9 @@ pub fn run() {
                 os: std::env::consts::OS.into(),
                 fingerprint: tls.me.clone(),
                 aspect_ratio,
-                telemetry_port: telemetry::PORT,
-                transfer_port: transfer::PORT,
-                kvm_port: kvm::PORT,
+                telemetry_port: PORTS.0,
+                transfer_port: PORTS.1,
+                kvm_port: PORTS.2,
                 proto: kvm::PROTOCOL,
                 mac: mac_address::get_mac_address().ok().flatten().map(|m| m.to_string()),
             };
@@ -814,7 +931,7 @@ pub fn run() {
             spawn_transfer_server(&handle, state.clone(), tls.clone())?;
             let h = handle.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = telemetry::listen(telemetry::PORT, |p| {
+                if let Err(e) = telemetry::listen(PORTS.0, |p| {
                     let _ = h.emit("spatial-remote", p);
                 })
                 .await
@@ -829,8 +946,25 @@ pub fn run() {
                 setup_tray(app)?;
                 clip::watch(handle.clone());
             }
+            // drives a computer from the touchpad; is driven through the injector once Wireless debugging is set up
+            #[cfg(mobile)]
+            {
+                #[cfg(target_os = "android")]
+                let engine: Arc<dyn SpatialPlatformEngine> = {
+                    let plugin = app.state::<tauri::plugin::PluginHandle<tauri::Wry>>().inner().clone();
+                    Arc::new(platform::android::AndroidEngine::new(Box::new(move |at| {
+                        let (x, y, show) = at.map_or((0.0, 0.0, false), |(x, y)| (x, y, true));
+                        let _ = plugin.run_mobile_plugin::<serde_json::Value>("cursor", serde_json::json!({ "x": x, "y": y, "show": show }));
+                    })))
+                };
+                #[cfg(not(target_os = "android"))]
+                let engine: Arc<dyn SpatialPlatformEngine> = platform::engine().into();
+                app.manage(engine.clone());
+                spawn_kvm_receiver(handle.clone(), engine, state.clone(), tls);
+            }
             #[cfg(target_os = "windows")]
             install_send_to();
+            #[cfg(desktop)]
             if std::env::args().any(|a| a == "--sim-mobile") {
                 sim::start(&handle, &state)?;
             }
@@ -886,8 +1020,9 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState, tls: Arc<Tls>) -> tau
         // paired devices only, recognised by certificate
         let allow = move |fp: &str| state.lock().unwrap().settings.is_paired(fp);
         let clip_root = clip_dir.clone();
-        let r = transfer::serve(tls, transfer::PORT, dir, clip_dir, allow, move |e| {
+        let r = transfer::serve(tls, PORTS.1, dir, clip_dir, allow, move |e| {
             match e {
+                #[cfg(desktop)]
                 transfer::TransferEvent::ClipImage { png } => {
                     tauri::async_runtime::spawn_blocking(move || clip::apply_image(&png));
                     return;
@@ -904,6 +1039,7 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState, tls: Arc<Tls>) -> tau
                     carry_out(&h, step);
                     return;
                 }
+                #[cfg(desktop)]
                 transfer::TransferEvent::ClipFiles { roots, .. } => {
                     let root = clip_root.clone();
                     tauri::async_runtime::spawn_blocking(move || {
@@ -974,6 +1110,7 @@ async fn send_files(app: AppHandle, to: SocketAddr, fp: String, files: Vec<(Path
 
 /// Hand this computer's clipboard picture or files to device `fp` (where the cursor is going), if they
 /// changed. Runs beside the crossing, never delaying it.
+#[cfg(desktop)]
 fn sync_clipboard(app: AppHandle, to: SocketAddr, fp: String) {
     tauri::async_runtime::spawn(async move {
         match tokio::task::spawn_blocking(clip::outgoing).await.ok().flatten() {
@@ -1037,6 +1174,9 @@ fn hold_drag(app: &AppHandle, window: &str, batch: u64) {
 
 fn carry_out(app: &AppHandle, step: carry::Step) {
     match step {
+        #[cfg(mobile)]
+        carry::Step::Start(files) => carry_out(app, carry::Step::Save(files)),
+        #[cfg(desktop)]
         carry::Step::Start(files) => {
             let label = app.state::<AppState>().lock().unwrap().carry_window.clone();
             let Some(w) = app.get_webview_window(&label) else { return };
@@ -1176,7 +1316,6 @@ fn setup_overlays(app: &mut tauri::App, state: AppState, tls: Arc<Tls>) -> tauri
 }
 
 /// This computer's screens, in the canonical space.
-#[cfg(desktop)]
 fn screens(app: &AppHandle) -> Vec<Rect> {
     let monitors = app.available_monitors().unwrap_or_default();
     monitors.iter().map(|m| Rect { x: m.position().x as f64, y: m.position().y as f64, w: m.size().width as f64, h: m.size().height as f64 }).collect()
@@ -1218,7 +1357,6 @@ fn mirror_portal(app: &AppHandle, fp: &str, edge: Option<Edge>) -> bool {
 }
 
 /// Answers pairing requests and accepts input sessions from paired devices.
-#[cfg(desktop)]
 fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: AppState, tls: Arc<Tls>) {
     tauri::async_runtime::spawn(async move {
         let (st, e) = (state.clone(), engine.clone());
@@ -1228,8 +1366,18 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
             _ => Ok(()),
         };
         let a = app.clone();
-        // the other device moved this one to its `edge` of its screens: it goes on the opposite edge here
-        let on_place = move |fp: &str, edge: Option<Edge>| mirror_portal(&a, fp, edge.map(Edge::opposite));
+        // the other device moved this one to its `edge` of its screens: it goes on the opposite edge here;
+        // or it unpaired: forget it here too
+        let on_place = move |fp: &str, l: kvm::Layout| match l {
+            #[cfg(desktop)]
+            kvm::Layout::Place(edge) => mirror_portal(&a, fp, edge.map(Edge::opposite)),
+            #[cfg(mobile)]
+            kvm::Layout::Place(_) => false,
+            kvm::Layout::Unpair => {
+                forget(&a, fp);
+                true
+            }
+        };
         let (a, st) = (app.clone(), state.clone());
         let ask = move |_: IpAddr, fp: String, code: String| {
             let (app, state) = (a.clone(), st.clone());
@@ -1240,6 +1388,7 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                 let Some(from) = from else { return kvm::PairAnswer::Unknown };
                 // a prompt hidden in the tray would just time out
                 if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+                    #[cfg(desktop)]
                     let _ = w.unminimize();
                     let _ = w.show();
                 }
@@ -1256,6 +1405,17 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                 answer
             }
         };
+        // the phone's whole screen; no band or portal windows
+        #[cfg(mobile)]
+        let make = move |fp: &str, edge: Edge| {
+            let screens = screens(&app);
+            let monitor = *screens.first()?;
+            let band = Portal { edge, monitor, start: 0.0, end: 1.0, reach: 120.0 };
+            app.state::<AppState>().lock().unwrap().session = Some((fp.to_string(), band));
+            engine.show_cursor(true);
+            Some(EngineSink { engine: engine.clone(), screens, app: app.clone() })
+        };
+        #[cfg(desktop)]
         let make = move |fp: &str, edge: Edge| {
             let screens = screens(&app);
             if screens.is_empty() {
@@ -1285,11 +1445,11 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
             let sh = &s.settings.sharing;
             s.settings.is_paired(fp)
                 && match service {
-                    kvm::Service::Shell => sh.terminal,
-                    kvm::Service::Files => sh.folder.is_some(),
-                    kvm::Service::Sound => sh.sound,
+                    kvm::Service::Shell => cfg!(desktop) && sh.terminal,
+                    kvm::Service::Files => cfg!(desktop) && sh.folder.is_some(),
+                    kvm::Service::Sound => cfg!(desktop) && sh.sound,
                     kvm::Service::Notifications => sh.notifications,
-                    kvm::Service::Mic => sh.mic,
+                    kvm::Service::Mic => cfg!(desktop) && sh.mic,
                 }
         };
         let st = state.clone();
@@ -1297,13 +1457,19 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
             let folder = st.lock().unwrap().settings.sharing.folder.clone();
             tauri::async_runtime::spawn(async move {
                 let r = match service {
+                    #[cfg(desktop)]
                     kvm::Service::Shell => shell::serve(stream).await,
+                    #[cfg(desktop)]
                     kvm::Service::Files => match folder {
                         Some(root) => share::serve(stream, root).await,
                         None => Ok(()),
                     },
+                    #[cfg(desktop)]
                     kvm::Service::Sound => audio::serve(stream, false).await,
+                    #[cfg(desktop)]
                     kvm::Service::Mic => audio::serve(stream, true).await,
+                    #[cfg(mobile)]
+                    kvm::Service::Shell | kvm::Service::Files | kvm::Service::Sound | kvm::Service::Mic => Ok(drop((stream, folder))),
                     kvm::Service::Notifications => notify::serve(stream).await,
                 };
                 if let Err(e) = r {
@@ -1311,7 +1477,7 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                 }
             });
         };
-        if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, allow_service, on_service, on_place, make).await {
+        if let Err(e) = kvm::serve(tls, PORTS.2, allow, ask, allow_service, on_service, on_place, make).await {
             eprintln!("kvm receiver stopped: {e}");
         }
     });
@@ -1329,7 +1495,6 @@ struct Door {
 
 /// Hand mouse & keyboard to device `fp` through `portal` (overlay `label`) at `y` along it, with a file
 /// drag going along if `drag`. Runs the session in the background.
-#[cfg(desktop)]
 fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: f32, drag: Option<u64>) -> Result<(), &'static str> {
     let state = app.state::<AppState>();
     let (to, transfer_to, prefs, peer_is_mac, alias) = {
@@ -1342,6 +1507,7 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
     if DRIVING.swap(true, Ordering::SeqCst) {
         return Err("already controlling another device");
     }
+    #[cfg(desktop)]
     if let Some(t) = transfer_to {
         sync_clipboard(app.clone(), t, fp.clone());
     }
@@ -1357,6 +1523,10 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
         // TimedOut: the link went silent (Wi-Fi drop, sleep, crash), not a refusal or a hang-up
         let error = r.as_ref().err().map(|e| if e.kind() == std::io::ErrorKind::TimedOut { format!("{alias} stopped answering") } else { e.to_string() });
         let _ = app.emit("kvm", serde_json::json!({ "active": false, "error": error }));
+        // it unpaired while this one was away (its certificate is pinned, so it really is that device)
+        if error.as_deref() == Some(kvm::Refusal::NotPaired.text()) {
+            forget(&app, &fp);
+        }
         if let Some(e) = &error {
             crossing_failed(&app, e.clone());
         }
@@ -1370,7 +1540,6 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
 
 /// The reason a crossing failed, as a notification: the main window showing it is usually hidden.
 /// The same reason again within 30 s stays quiet (the cursor keeps pushing the edge).
-#[cfg(desktop)]
 fn crossing_failed(app: &AppHandle, error: String) {
     use tauri_plugin_notification::NotificationExt;
     static LAST: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
@@ -1393,6 +1562,8 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
     let remote = &DRIVING;
     // cursor lock key edge, last lock state shown, since when the cursor rests on a portal edge
     let (mut lock_key, mut shown_lock, mut resting) = (false, false, None::<std::time::Instant>);
+    // overlay the cursor is near (its `hover` events)
+    let mut hovering = None::<String>;
     loop {
         tick.tick().await;
         let (doors, prefs) = {
@@ -1471,6 +1642,15 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
         } else {
             resting = None;
         }
+        // near a portal, button or not: its overlay may be hidden until then (glow auto-hide); local only
+        let near = hit.map(|(d, y, p)| (d.label.clone(), y, p));
+        if let Some((label, y, p)) = &near {
+            let _ = app.emit_to(label, "hover", (y, p));
+        }
+        if let Some(gone) = hovering.take().filter(|l| near.as_ref().is_none_or(|(n, ..)| n != l)) {
+            let _ = app.emit_to(&gone, "hover", (0.5, 0.0));
+        }
+        hovering = near.map(|(l, ..)| l);
         // only a drag (button held) inside a portal may make its overlay catch input
         let catching = hit.filter(|_| c.button_down);
         let want = catching.map(|(d, _, _)| d.label.clone());

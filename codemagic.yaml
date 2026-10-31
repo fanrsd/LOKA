@@ -1,5 +1,6 @@
 # macOS build. Runs on tags like v0.1.0 (or start it from the Codemagic UI / API).
-# The universal .dmg is a build artifact; attach it to the GitHub release with `gh release upload`.
+# Attach both artifacts to the GitHub release with `gh release upload` (the .dmg for downloads, the .app.tar.gz for
+# in-app updates), then run `node scripts/release.mjs vX.Y.Z` to sign them into latest.json.
 workflows:
   macos:
     name: LOKA macOS
@@ -21,7 +22,13 @@ workflows:
         script: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Install npm packages
         script: npm ci
-      - name: Build universal dmg
-        script: npx tauri build --target universal-apple-darwin --bundles dmg
+      - name: Build universal app and dmg
+        script: npx tauri build --target universal-apple-darwin --bundles app,dmg
+      # what the in-app updater downloads: the .app itself, as tauri's own updater bundle would pack it
+      - name: Pack the app for updates
+        script: |
+          cd src-tauri/target/universal-apple-darwin/release/bundle/macos
+          COPYFILE_DISABLE=1 tar -czf "LOKA_$(node -p "require('../../../../../tauri.conf.json').version")_universal.app.tar.gz" LOKA.app
     artifacts:
       - src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+      - src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz

@@ -77,6 +77,16 @@ pub enum Msg {
     /// First and only frame of a layout stream: the sender put this device on its `edge` (`None`: took it
     /// off), so this one puts the sender on the opposite edge; answered with one byte (1 = done, 0 = no room).
     Place(Option<Edge>),
+    /// First and only frame of a layout stream: the sender forgot this device, so this one forgets the
+    /// sender too (pairing and portal); answered with one byte.
+    Unpair,
+}
+
+/// What a paired device changed about the two of them (`serve`'s `on_place`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Layout {
+    Place(Option<Edge>),
+    Unpair,
 }
 
 /// What a paired device can open on this one, each only if this one's user shares it.
@@ -125,7 +135,7 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    fn text(self) -> &'static str {
+    pub fn text(self) -> &'static str {
         match self {
             Refusal::NotPaired => "the other device isn't paired with this one, pair them again",
             Refusal::NoScreen => "the other device has no screen to show the cursor on",
@@ -194,6 +204,7 @@ impl Msg {
             Msg::PairNonce => put(0, &[16]),
             Msg::PairReveal => put(0, &[17]),
             Msg::Place(edge) => put(0, &[18, edge.map_or(255, edge_byte)]),
+            Msg::Unpair => put(0, &[19]),
         }
         b
     }
@@ -228,6 +239,7 @@ impl Msg {
             17 => Msg::PairReveal,
             18 if b[1] == 255 => Msg::Place(None),
             18 => Msg::Place(Some(byte_edge(b[1])?)),
+            19 => Msg::Unpair,
             _ => return None,
         })
     }
@@ -736,8 +748,17 @@ pub async fn open(tls: &Tls, to: SocketAddr, expect: &str, service: Service) -> 
 /// Tell paired device `expect` it now sits on this device's `edge` (`None`: off its screens), so it puts
 /// this one on its opposite edge. `false`: it has no room left there.
 pub async fn place(tls: &Tls, to: SocketAddr, expect: &str, edge: Option<Edge>) -> io::Result<bool> {
+    layout(tls, to, expect, Msg::Place(edge)).await
+}
+
+/// Tell paired device `expect` this one forgot it, so it forgets this one too.
+pub async fn unpair(tls: &Tls, to: SocketAddr, expect: &str) -> io::Result<bool> {
+    layout(tls, to, expect, Msg::Unpair).await
+}
+
+async fn layout(tls: &Tls, to: SocketAddr, expect: &str, m: Msg) -> io::Result<bool> {
     let (mut s, _) = tls.connect(to, Some(expect)).await?;
-    send(&mut s, Msg::Place(edge)).await?;
+    send(&mut s, m).await?;
     Ok(timeout(Duration::from_secs(5), s.read_u8()).await?? == 1)
 }
 
@@ -746,7 +767,7 @@ type Incoming = (Stream, String, Edge, f32);
 
 /// Receiving side. Every stream is handled on its own: a pairing request (answered by `ask_pair` with
 /// the address and fingerprint of the asking device and the code to show), a service (`allow_service`,
-/// then `on_service` owns the stream), a layout change (`on_place`, whose answer goes back), or an
+/// then `on_service` owns the stream), a layout change (`on_place`: placed, taken off or unpaired; its answer goes back), or an
 /// input session, which only devices passing `allow_session` (paired fingerprints) may start. One
 /// session at a time: a new driver takes over, handing the cursor back to the current one.
 /// `make_sink` gets the driving device's fingerprint and the edge the cursor enters (and leaves) through.
@@ -758,7 +779,7 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
     ask_pair: impl Fn(IpAddr, String, String) -> F + Send + Sync + 'static,
     allow_service: impl Fn(Service, &str) -> bool + Send + Sync + 'static,
     on_service: impl Fn(Service, String, Stream) + Send + Sync + 'static,
-    on_place: impl Fn(&str, Option<Edge>) -> bool + Send + Sync + 'static,
+    on_place: impl Fn(&str, Layout) -> bool + Send + Sync + 'static,
     mut make_sink: impl FnMut(&str, Edge) -> Option<S>,
 ) -> io::Result<()> {
     let mut listener = tls.listen(port)?;
@@ -790,8 +811,8 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
                             on_service(service, who, s);
                         }
                     }
-                    Msg::Place(edge) => {
-                        let ok = on_place(&who, edge);
+                    m @ (Msg::Place(_) | Msg::Unpair) => {
+                        let ok = on_place(&who, if let Msg::Place(edge) = m { Layout::Place(edge) } else { Layout::Unpair });
                         let _ = timeout(WRITE_TIMEOUT, async {
                             s.write_all(&[ok as u8]).await?;
                             s.shutdown().await
@@ -1056,6 +1077,7 @@ mod tests {
             Msg::Clipboard { len: MAX_CLIPBOARD },
             Msg::Place(Some(Edge::Top)),
             Msg::Place(None),
+            Msg::Unpair,
         ];
         for m in all {
             assert_eq!(Msg::decode(&m.encode()), Some(m));
@@ -1275,9 +1297,9 @@ mod tests {
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
         // room on every edge but the bottom
-        let on_place = move |who: &str, edge: Option<Edge>| {
-            g.lock().unwrap().push((who.to_string(), edge));
-            edge != Some(Edge::Bottom)
+        let on_place = move |who: &str, l: Layout| {
+            g.lock().unwrap().push((who.to_string(), l));
+            l != Layout::Place(Some(Edge::Bottom))
         };
         tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, on_place, |_, _| None::<Recorder>));
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1285,7 +1307,9 @@ mod tests {
         assert!(place(&me, to, &them_fp, Some(Edge::Right)).await.unwrap());
         assert!(!place(&me, to, &them_fp, Some(Edge::Bottom)).await.unwrap());
         assert!(place(&me, to, &them_fp, None).await.unwrap());
-        assert_eq!(*got.lock().unwrap(), vec![(me_fp.clone(), Some(Edge::Right)), (me_fp.clone(), Some(Edge::Bottom)), (me_fp, None)]);
+        assert!(unpair(&me, to, &them_fp).await.unwrap());
+        let want = [Layout::Place(Some(Edge::Right)), Layout::Place(Some(Edge::Bottom)), Layout::Place(None), Layout::Unpair];
+        assert_eq!(*got.lock().unwrap(), want.map(|l| (me_fp.clone(), l)).to_vec(), "every change arrives, tagged with who sent it");
     }
 
     /// A Mac without Accessibility: the hook can't be installed.

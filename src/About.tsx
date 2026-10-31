@@ -33,21 +33,33 @@ async function fetchReleases(): Promise<Release[]> {
     .map((x) => ({ tag: x.tag_name, name: x.name || x.tag_name, url: x.html_url, date: x.published_at, notes: x.body ?? "" }));
 }
 
-export type Update = { current?: string; releases?: Release[]; error?: string; checking: boolean; available?: Release; check: () => void };
+/** `installable`: what the in-app updater can install here (signed `latest.json` entry for this platform + bundle). */
+export type Update = {
+  current?: string;
+  releases?: Release[];
+  error?: string;
+  checking: boolean;
+  available?: Release;
+  installable?: { version: string; notes?: string | null };
+  check: () => void;
+};
 
 /** Checks GitHub Releases once on mount (60 unauthenticated requests/hour is plenty) and on demand. */
 export function useUpdate(): Update {
-  const [s, setS] = useState<Omit<Update, "available" | "check">>({ checking: true });
+  const [s, setS] = useState<Omit<Update, "available" | "check" | "installable">>({ checking: true });
+  const [installable, setInstallable] = useState<Update["installable"]>();
   const check = () => {
     setS((x) => ({ ...x, checking: true, error: undefined }));
     const version = getVersion();
     Promise.all([version, fetchReleases()])
       .then(([current, releases]) => setS({ current, releases, checking: false }))
       .catch((e) => version.then((current) => setS({ current, checking: false, error: e instanceof Error ? e.message : String(e) })));
+    // phones and releases without latest.json: none, and the download page stays the way
+    invoke<Update["installable"] | null>("check_update").then((u) => setInstallable(u ?? undefined), () => setInstallable(undefined));
   };
   useEffect(check, []);
   const latest = s.releases?.[0];
-  return { ...s, available: latest && s.current && isNewer(latest.tag, s.current) ? latest : undefined, check };
+  return { ...s, available: latest && s.current && isNewer(latest.tag, s.current) ? latest : undefined, installable, check };
 }
 
 /** One-time permission fix per OS: Windows Firewall, Linux input devices. */
@@ -68,7 +80,7 @@ const FIX: Record<string, { title: string; text: string; button: string; command
   },
 };
 
-export function About({ update, seed, os, onClose }: { update: Update; seed: string; os: string; onClose: () => void }) {
+export function About({ update, seed, os, onClose, onUpdate }: { update: Update; seed: string; os: string; onClose: () => void; onUpdate: () => void }) {
   const [fixed, setFixed] = useState<"idle" | "busy" | "done" | string>("idle");
   const fix = FIX[os];
 
@@ -119,14 +131,20 @@ export function About({ update, seed, os, onClose }: { update: Update; seed: str
           <section aria-live="polite" className="rounded-[20px] bg-white/[0.04] p-4">
             {update.checking ? (
               <p className="text-sm text-muted">Checking for updates…</p>
-            ) : update.available ? (
+            ) : update.available || update.installable ? (
               <div className="flex items-center gap-3">
                 <p className="flex-1 text-sm">
-                  <span className="font-semibold text-accent">{update.available.name}</span> is available.
+                  <span className="font-semibold text-accent">{update.available?.name ?? `LOKA ${update.installable!.version}`}</span> is available.
                 </p>
-                <button onClick={() => invoke("open_url", { url: update.available!.url })} className={primaryButton}>
-                  Download
-                </button>
+                {update.installable ? (
+                  <button onClick={onUpdate} className={primaryButton}>
+                    Update now
+                  </button>
+                ) : (
+                  <button onClick={() => invoke("open_url", { url: update.available!.url })} className={primaryButton}>
+                    Download
+                  </button>
+                )}
               </div>
             ) : (
               <div className="flex items-center gap-3">
@@ -197,7 +215,7 @@ export function About({ update, seed, os, onClose }: { update: Update; seed: str
 }
 
 /** The small markdown subset release notes use: paragraphs, "- " lists, **bold**, `code`. Install steps are skipped. */
-function Notes({ text }: { text: string }) {
+export function Notes({ text }: { text: string }) {
   const out: ReactNode[] = [];
   let items: string[] = [];
   const flush = () => {

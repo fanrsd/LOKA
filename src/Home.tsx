@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Menu, type MenuItemOptions, type PredefinedMenuItemOptions } from "@tauri-apps/api/menu";
+import { message, open } from "@tauri-apps/plugin-dialog";
 import { About, useUpdate } from "./About";
+import { UpdatePrompt } from "./UpdatePrompt";
 import { Calibrate } from "./Calibrate";
 import { Face, type Mood } from "./Face";
 import { PairPrompt, osLabel, quietButton, type Device, type Peer } from "./Pairing";
@@ -18,6 +21,8 @@ export function Home() {
   const [device, setDevice] = useState<Device | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [about, setAbout] = useState(false);
+  // the update popup shows once per launch; "Later" keeps it away until LOKA starts again
+  const [prompt, setPrompt] = useState(true);
   const update = useUpdate();
   const refreshDevice = () => invoke<Device>("get_device").then(setDevice);
 
@@ -72,7 +77,8 @@ export function Home() {
       </footer>
 
       <Outbox device={device} peers={peers} />
-      {about && <About update={update} seed={fingerprint} os={device.info.os} onClose={() => setAbout(false)} />}
+      {about && <About update={update} seed={fingerprint} os={device.info.os} onClose={() => setAbout(false)} onUpdate={() => (setAbout(false), setPrompt(true))} />}
+      {prompt && !about && (update.installable || update.available) && <UpdatePrompt update={update} seed={fingerprint} onClose={() => setPrompt(false)} />}
     </main>
   );
 }
@@ -101,6 +107,14 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
       unCode.then((f) => f());
     };
   }, []);
+
+  // a failed crossing is news for a moment, not a state: it goes by itself (or with its ×)
+  const dismiss = () => setKvm((k) => ({ ...k, error: null }));
+  useEffect(() => {
+    if (!kvm.error) return;
+    const t = setTimeout(dismiss, 8000);
+    return () => clearTimeout(t);
+  }, [kvm.error]);
 
   const isPaired = (f: string) => device.paired.some((p) => p.fingerprint === f);
   const outdated = (p: Peer) => p.info.proto !== device.info.proto;
@@ -140,6 +154,33 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
     if (s?.state === "unknown") return { mood: "sad", note: "Can't see this computer", tone: "danger" };
     if (s?.state === "error") return { mood: "sad", note: "Couldn't reach it", tone: "danger" };
     return { mood: "idle", note: "Click to pair", tone: "muted" };
+  };
+
+  /** Right-click on a device: the OS's own menu with what can be done to it right now. */
+  const menu = async (e: React.MouseEvent, items: (MenuItemOptions | PredefinedMenuItemOptions | false)[]) => {
+    e.preventDefault();
+    const m = await Menu.new({ items: items.filter((i) => i !== false) });
+    await m.popup();
+  };
+  const sendFiles = async (f: string) => {
+    const paths = await open({ multiple: true });
+    if (paths?.length) invoke("send_paths", { fingerprint: f, paths }).catch((err) => message(String(err), { title: "Couldn't send", kind: "error" }));
+  };
+  const unpair = (f: string) => {
+    invoke("unpair", { fingerprint: f });
+    if (selected === f) select(null);
+  };
+  const peerMenu = (p: Peer): (MenuItemOptions | PredefinedMenuItemOptions | false)[] => {
+    const f = p.info.fingerprint;
+    if (outdated(p)) return [{ text: "Needs a LOKA update", enabled: false }];
+    if (!isPaired(f)) return [{ text: "Pair…", enabled: pairing[f]?.state !== "waiting", action: () => void pair(p) }];
+    return [
+      { text: "Control", enabled: placed(f), action: () => void invoke("control", { fingerprint: f }) },
+      { text: "Send files…", action: () => void sendFiles(f) },
+      placed(f) && { text: "Take off screens", action: () => void invoke("set_portal", { fingerprint: f, portal: null, sync: true }).then(onChange) },
+      { item: "Separator" },
+      { text: "Unpair", action: () => unpair(f) },
+    ];
   };
 
   const empty = peers.length === 0 && offlinePaired.length === 0;
@@ -188,7 +229,8 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
               const v = view(p);
               const active = selected === f && isPaired(f);
               return (
-                <li key={f} className="rise" style={{ "--i": 2 + i } as React.CSSProperties}>
+                // on the <li>: a disabled button (waiting, outdated) gets no mouse events at all
+                <li key={f} onContextMenu={(e) => menu(e, peerMenu(p))} className="rise" style={{ "--i": 2 + i } as React.CSSProperties}>
                   <button
                     disabled={pairing[f]?.state === "waiting" || outdated(p)}
                     onClick={() => (isPaired(f) ? select(f) : pair(p))}
@@ -206,7 +248,14 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
               );
             })}
             {offlinePaired.map((p, i) => (
-              <li key={p.fingerprint} className="rise flex w-32 flex-col items-center px-2 pb-3 pt-4 opacity-60" style={{ "--i": 2 + peers.length + i } as React.CSSProperties}>
+              <li
+                key={p.fingerprint}
+                onContextMenu={(e) =>
+                  menu(e, [device.wakeable.includes(p.fingerprint) && { text: "Wake up", action: () => void invoke("wake", { fingerprint: p.fingerprint }) }, { text: "Forget", action: () => unpair(p.fingerprint) }])
+                }
+                className="rise flex w-32 flex-col items-center px-2 pb-3 pt-4 opacity-60"
+                style={{ "--i": 2 + peers.length + i } as React.CSSProperties}
+              >
                 <span className="p-1 grayscale">
                   <Face seed={p.fingerprint} size={68} mood="sad" />
                 </span>
@@ -251,7 +300,7 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
       {(kvm.active || kvm.error || locked) && (
         <div
           role="status"
-          className="fixed bottom-5 left-1/2 flex -translate-x-1/2 items-center gap-3 rounded-full bg-raised py-2 pl-2 pr-4 text-sm ring-1 ring-line"
+          className="fixed bottom-5 left-1/2 z-20 flex w-max max-w-[calc(100%-2.5rem)] -translate-x-1/2 items-center gap-3 rounded-full bg-raised py-2 pl-2 pr-4 text-sm ring-1 ring-line"
           style={{ animation: "sheet-in 0.4s var(--ease-spring)" }}
         >
           {kvm.active && kvm.device ? <Face seed={kvm.device} size={26} mood="happy" /> : <Face seed={kvm.error ? "error" : device.info.fingerprint} size={26} mood={kvm.error ? "sad" : "idle"} />}
@@ -261,7 +310,18 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
               {locked && " · locked"} · <kbd className="rounded-md bg-white/10 px-1.5 py-0.5 font-sans text-xs text-muted">{mac ? "⌃ ⌥ Esc" : "Ctrl Alt Esc"}</kbd> to return
             </span>
           ) : kvm.error ? (
-            <span className="text-danger">Couldn't move over: {kvm.error}</span>
+            <>
+              <span className="text-danger">Couldn't move over: {kvm.error}</span>
+              <button
+                onClick={dismiss}
+                aria-label="Dismiss"
+                className="-mr-2 grid h-7 w-7 shrink-0 place-items-center rounded-full text-faint transition-colors hover:bg-white/[0.08] hover:text-fg focus-visible:outline-2 focus-visible:outline-accent"
+              >
+                <svg aria-hidden viewBox="0 0 12 12" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                  <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
+                </svg>
+              </button>
+            </>
           ) : (
             <span>
               Pointer locked here · <kbd className="rounded-md bg-white/10 px-1.5 py-0.5 font-sans text-xs text-muted">{mac ? "F14" : "Scroll Lock"}</kbd> to release
@@ -274,7 +334,7 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
 }
 
 /** Fallback for networks that drop discovery (guest Wi-Fi, client isolation): reach a device by its address. */
-function AddHost({ hosts, ips, onChange }: { hosts: string[]; ips: string[]; onChange: () => void }) {
+export function AddHost({ hosts, ips, onChange }: { hosts: string[]; ips: string[]; onChange: () => void }) {
   const [ip, setIp] = useState("");
   const [error, setError] = useState("");
 
@@ -312,7 +372,7 @@ function AddHost({ hosts, ips, onChange }: { hosts: string[]; ips: string[]; onC
       </form>
       {ips.length > 0 && (
         <p className="mt-2 text-xs text-faint">
-          This computer's address: <span className="select-text font-mono text-fg">{ips.join(", ")}</span>
+          This device's address: <span className="select-text font-mono text-fg">{ips.join(", ")}</span>
         </p>
       )}
       {error && (

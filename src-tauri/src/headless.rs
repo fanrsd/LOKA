@@ -139,8 +139,15 @@ async fn serve() {
         Some(Sink { engine: engine.clone(), alias })
     };
     // shortcut: no services (terminal, files, sound) and no file transfers without a desktop; add them if servers need them.
-    // Never drives, so a layout change from a desktop needs nothing here.
-    if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, |_, _| false, |_, _, _| {}, |_, _| true, make).await {
+    // Never drives, so a placement needs nothing here; an unpair is forgotten on this side too.
+    let st = settings.clone();
+    let on_place = move |fp: &str, l: kvm::Layout| {
+        if l == kvm::Layout::Unpair {
+            st.lock().unwrap().unpair(fp);
+        }
+        true
+    };
+    if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, |_, _| false, |_, _, _| {}, on_place, make).await {
         eprintln!("LOKA stopped: {e}");
     }
 }

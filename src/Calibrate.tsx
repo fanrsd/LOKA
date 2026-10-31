@@ -306,7 +306,7 @@ export function Calibrate({ device, peers, selected, onSelect, onPair, onChange 
       <div className="mt-5 grid grid-cols-[6rem_1fr] items-center gap-x-4 gap-y-4 text-sm">
         {sel && selPortal && (
           <>
-            <span id="edge-label" className="text-muted">
+            <span id="edge-label" className="min-w-0 text-muted [overflow-wrap:anywhere]">
               {selAlias} on
             </span>
             <div role="radiogroup" aria-labelledby="edge-label" className="flex flex-wrap gap-1.5">
@@ -393,6 +393,38 @@ export function Calibrate({ device, peers, selected, onSelect, onPair, onChange 
             style={{ "--fill": `${((look.opacity - 0.1) / 0.9) * 100}%` } as React.CSSProperties}
           />
           <span className="w-10 text-right tabular-nums text-muted">{Math.round(look.opacity * 100)}%</span>
+        </div>
+
+        <label htmlFor="glow-width" className="text-muted">Thickness</label>
+        <div className="flex items-center gap-3">
+          <input
+            id="glow-width"
+            type="range"
+            min={0.5}
+            max={2}
+            step={0.1}
+            value={look.width}
+            onChange={(e) => restyle({ width: +e.target.value })}
+            aria-valuetext={`${look.width.toFixed(1)}×`}
+            className="loka-range flex-1"
+            style={{ "--fill": `${((look.width - 0.5) / 1.5) * 100}%` } as React.CSSProperties}
+          />
+          <span className="w-10 text-right tabular-nums text-muted">{look.width.toFixed(1)}×</span>
+        </div>
+
+        <span id="show-label" className="text-muted">Show</span>
+        <div role="radiogroup" aria-labelledby="show-label" className="flex flex-wrap gap-1.5">
+          {([["Always", false], ["When near", true]] as const).map(([name, hide]) => (
+            <button
+              key={name}
+              role="radio"
+              aria-checked={look.autoHide === hide}
+              onClick={() => restyle({ autoHide: hide })}
+              className={`rounded-full px-3.5 py-1.5 font-medium transition-[background-color,color,transform] duration-200 active:scale-[0.96] focus-visible:outline-2 focus-visible:outline-accent ${look.autoHide === hide ? "bg-fg text-ink" : "bg-white/[0.05] text-muted hover:text-fg"}`}
+            >
+              {name}
+            </button>
+          ))}
         </div>
 
         <span id="motion-label" className="text-muted">Crossing</span>

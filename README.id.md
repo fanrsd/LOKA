@@ -23,8 +23,9 @@ Dorong kursor melewati tepi layar yang menyala, dan kursor langsung pindah ke pe
 - **Lempar file ke tepi layar, dua arah.** Seret file atau folder ke garis yang menyala lalu lepaskan. Semuanya masuk ke `Downloads/LOKA` (atau folder pilihanmu) di perangkat pasangan, folder lengkap dengan isinya, beberapa file sekaligus. Saat kamu sedang mengendalikan komputer lain, tepinya yang mengarah balik juga menyala: seret file ke sana untuk mengirim ke arah sebaliknya. File lama tidak pernah ditimpa.
  Garis yang menyala terisi seiring file berjalan, dan kedua komputer menampilkan progres, kecepatan, serta sisa waktunya. Transfer bisa dibatalkan, foldernya bisa langsung dibuka saat file tiba, dan ada notifikasi sistem ketika file masuk. **Ctrl+Alt+V** menempel file yang baru tiba ke aplikasi di depan (chat, email). Bisa juga kirim dari **Send to → LOKA** di Explorer atau **Open With → LOKA** di Finder.
 - **Pairing ala LocalSend.** Perangkat di jaringan yang sama saling menemukan. Klik salah satunya, lalu konfirmasi di perangkat itu. Di jaringan yang memblokir pencarian perangkat (Wi-Fi tamu), tambahkan komputer lain lewat alamat IP-nya. Saat pairing, kedua layar menampilkan kode 6 digit yang sama, jadi kamu tahu perangkatnya benar, dan tidak ada orang di jaringan yang bisa memalsukannya.
-- **Selalu terbaru.** Menu **About** menampilkan versi, isi tiap rilis, dan memberi tahu jika ada versi baru di GitHub.
-- **Sesuaikan sendiri.** Pilih warna glow (sekaligus jadi warna aksen aplikasi), seberapa transparan glow-nya, dan animasi saat menyeberang: Ripple, Pulse, atau Calm. Setiap klik di LOKA berbunyi "tik" pelan; ikon speaker di pojok kanan atas mematikannya.
+- **Update sendiri.** Saat ada versi baru, Oka muncul dengan isi pembaruannya; sekali klik LOKA mengunduh, memasang, lalu membuka ulang dirinya (Windows, macOS, Linux). Menu **About** menampilkan versi dan riwayat perubahan.
+- **Sesuaikan sendiri.** Pilih warna glow (sekaligus jadi warna aksen aplikasi), seberapa transparan dan setebal apa glow-nya, apakah selalu tampil atau hanya saat kursor mendekat, dan animasi saat menyeberang: Ripple, Pulse, atau Calm. Setiap klik di LOKA berbunyi "tik" pelan; ikon speaker di pojok kanan atas mematikannya.
+- **HP Android juga.** Dorong kursor komputer ke tepi tempat HP berada dan kursor pindah ke HP: tap, scroll, dan mengetik di sana dengan mouse dan keyboard komputer (tombol kanan = Back, tengah = Home). Atau pakai HP sebagai touchpad dan keyboard untuk komputer, dan kirim file dari HP. LOKA menyiapkannya dari HP sendiri lewat Wireless debugging (Android 11+), tanpa kabel atau aplikasi di PC.
 - **Berbagi lebih, hanya kalau kamu mau.** Setiap komputer bisa berbagi folder (terbuka sebagai drive di komputer lain), suaranya (diputar lewat speaker komputer lain), notifikasinya (Windows), mikrofonnya (dipakai sebagai mic untuk call di komputer lain, lewat VB-CABLE atau BlackHole yang gratis), dan terminal. Semuanya mati sampai kamu nyalakan.
 - **Koneksi yang tahu diri.** Kalau komputer lain tidur, lepas dari Wi-Fi, atau macet, kursor pulang dalam sekitar 3 detik dan tidak ada tombol yang tertahan di sana. Pindah Wi-Fi di tengah sesi tetap jalan.
 - **Bangunkan dari jauh.** Komputer pasangan yang sedang tidur punya tombol **Wake up** (Wake-on-LAN).
@@ -51,7 +52,7 @@ Kenalan dengan **Oka**, si kecil dari LOKA: sebuah kursor, benda yang memang ber
 | Windows 10/11 | Berjalan |
 | macOS | Kode lengkap, masih diuji di perangkat asli. Perlu izin **Accessibility**. |
 | Linux | Baru: desktop X11 dan Wayland, serta server tanpa desktop (`loka --headless`). Masih diuji di perangkat asli. |
-| Android | Direncanakan |
+| Android 11+ | Baru: dikendalikan dari komputer (sekali setup lewat Wireless debugging), HP sebagai touchpad dan keyboard, kirim file. Masih diuji di HP asli. |
 | iOS | Tidak direncanakan: iOS tidak mengizinkan aplikasi mengendalikan input perangkat |
 
 ## Instalasi
@@ -71,6 +72,7 @@ Unduh installer dari [Releases](https://github.com/fanrsd/LOKA/releases/latest):
   Izinkan **Accessibility** saat diminta (System Settings → Privacy & Security → Accessibility), di setiap Mac; di macOS 15+ izinkan juga **Local Network**. Setelah update, jika mouse tidak bisa pindah lagi, hapus LOKA dari daftar Accessibility dengan tombol **−** lalu aktifkan lagi.
 - **Linux:** `LOKA_x.y.z_amd64.deb` (Debian, Ubuntu), `.rpm` (Fedora), atau `.AppImage`. LOKA membaca mouse dan keyboard di bawah desktop, jadi perlu izin sekali: **About → Allow input access** (minta password).
 - **Server Linux tanpa desktop:** pasang `.deb` atau `.rpm`, lalu jalankan `sudo loka --headless` di server (atau `sudo loka --allow-input` sekali, lalu `loka --headless` sebagai user biasa). Pair dari LOKA di komputer lain dan jawab kodenya di terminal. Ketikan keyboard masuk ke console server.
+- **Android:** `LOKA_x.y.z_android.apk` di HP (izinkan pemasangan dari browser atau Files saat diminta). Buka LOKA, pair dengan komputer, lalu ketuk **Set up** supaya komputer bisa masuk ke HP: LOKA memandu Developer options → Wireless debugging → kode pairing, yang diketik langsung di notifikasi LOKA. Xiaomi/POCO juga perlu **USB debugging (Security settings)**.
 
 Lalu:
 

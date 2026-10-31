@@ -1,6 +1,6 @@
 [package]
 name = "loka"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/fanrsd/LOKA"
@@ -47,6 +47,11 @@ evdev = "0.13"
 x11rb = { version = "0.13", features = ["randr"] }
 libc = "0.2"
 
+# the phone's name from Settings (already in the tree via tao)
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -56,3 +61,4 @@ portable-pty = "0.9.0"
 dav-server = "0.11.0"
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+tauri-plugin-updater = "2.14.1"

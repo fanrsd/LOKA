@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { BezelPortal } from "./BezelPortal";
 import { Home } from "./Home";
 import { PhoneView } from "./PhoneView";
+import { Mobile } from "./Mobile";
 import { TitleBar, isMac } from "./TitleBar";
 import { tickOnPress } from "./sound";
 import { useEdge, useOnline } from "./calibration";
@@ -40,7 +41,8 @@ const overlay = label === "edge-overlay" || label.startsWith("portal-");
 
 function App() {
   if (overlay) return <Overlay />;
-  if (label === "mobile-view" || isPhone) return <PhoneView />;
+  if (label === "mobile-view") return <PhoneView />;
+  if (isPhone) return <Mobile />;
   return (
     <div className="flex h-full flex-col">
       <TitleBar />

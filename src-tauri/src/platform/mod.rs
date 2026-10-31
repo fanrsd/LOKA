@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use tauri::WebviewWindow;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[cfg(target_os = "android")]
+pub mod android;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -24,7 +26,7 @@ pub struct CursorSample {
 
 /// Platform-neutral input. Keys are PC/AT set-1 scancodes; extended keys are `0xE0xx`.
 /// Buttons: 1 left, 2 right, 3 middle, 4 back, 5 forward. Wheel: 120 per notch.
-#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum InputEvent {
     Move { dx: i32, dy: i32 },
@@ -35,7 +37,7 @@ pub enum InputEvent {
     Gesture { gesture: Gesture },
 }
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum Gesture {
     /// the desktop (Space) to the left / right
     SpaceLeft = 1,
@@ -100,7 +102,13 @@ pub trait SpatialPlatformEngine: Send + Sync {
     fn prepare_overlay(&self, window: &WebviewWindow) -> tauri::Result<()>;
     /// Toggle click-through. Overridable because some OS layers reset window styles when it changes.
     fn set_click_through(&self, window: &WebviewWindow, ignore: bool) -> tauri::Result<()> {
-        window.set_ignore_cursor_events(ignore)
+        #[cfg(desktop)]
+        return window.set_ignore_cursor_events(ignore);
+        #[cfg(mobile)]
+        {
+            let _ = (window, ignore);
+            Ok(())
+        }
     }
     /// Global cursor; polled because webviews get no mouse events during external OS drags.
     fn cursor(&self) -> Option<CursorSample>;
@@ -131,7 +139,7 @@ pub fn engine() -> Box<dyn SpatialPlatformEngine> {
     #[cfg(target_os = "linux")]
     return Box::new(linux::LinuxEngine::new());
     #[allow(unreachable_code)]
-    Box::new(NoopEngine)
+    Box::new(TouchEngine)
 }
 
 /// A password manager marked what's on the clipboard as secret: it never leaves this computer.
@@ -201,14 +209,35 @@ pub fn set_clipboard_files(paths: &[std::path::PathBuf]) {
     }
 }
 
-/// Mobile (and unsupported desktops): the phone only renders received telemetry.
-struct NoopEngine;
-impl SpatialPlatformEngine for NoopEngine {
+/// Where the phone's touchpad input goes while it drives another device (`None`: not driving).
+static TOUCH: std::sync::Mutex<Option<UnboundedSender<Captured>>> = std::sync::Mutex::new(None);
+
+/// Input from the app's own touchpad (the phone driving a computer); dropped while not driving.
+#[cfg_attr(desktop, allow(dead_code))]
+pub fn touch(e: InputEvent) {
+    if let Some(tx) = TOUCH.lock().unwrap().as_ref() {
+        let _ = tx.send(Captured::Input(e));
+    }
+}
+
+/// Mobile (and unsupported desktops): nothing to capture or inject; "capturing" is the touchpad screen feeding `touch`.
+struct TouchEngine;
+impl SpatialPlatformEngine for TouchEngine {
     fn prepare_overlay(&self, _: &WebviewWindow) -> tauri::Result<()> {
         Ok(())
     }
     fn cursor(&self) -> Option<CursorSample> {
         None
+    }
+    fn start_capture(&self, _park: (f64, f64), out: UnboundedSender<Captured>) -> Result<(), String> {
+        *TOUCH.lock().unwrap() = Some(out);
+        Ok(())
+    }
+    fn stop_capture(&self, _warp_to: (f64, f64)) {
+        *TOUCH.lock().unwrap() = None;
+    }
+    fn can_inject(&self) -> bool {
+        false
     }
 }
 

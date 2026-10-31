@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "LOKA",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "identifier": "dev.loka.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -19,5 +19,12 @@
     "targets": "all",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
     "macOS": { "signingIdentity": "-" }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc3NjZCNkUyNTFCOEE5ODMKUldTRHFiaFI0clptZHl5aXpiYlUxYTRLanZQcnRXK2t6cWE4eW5mNEVhdWQ4NG8zMnI1bGRnS2wK",
+      "endpoints": ["https://github.com/fanrsd/LOKA/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
+    }
   }
 }

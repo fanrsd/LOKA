@@ -22,8 +22,9 @@ Push the cursor through a glowing edge of your screen and it lands on the device
 - **Drag files across the edge.** Pick up files in Explorer or Finder and keep dragging past the glowing edge: the cursor carries them over, and you drop them in any folder or app on the other computer. Big files stream: the drop starts right away and fills in as they arrive.
 - **Drop files on the edge, both ways.** Drag files or whole folders to the glowing edge and let go. They arrive in `Downloads/LOKA` (or a folder you choose) on the paired device, folders with their structure, several files at once. While you control another computer, its edge leading back glows too: drag files there to send them the other way. Existing files are never overwritten. The glow fills up as the files travel, and both computers show progress, speed and time left. You can cancel, open the folder when it lands, and get a system notification on arrival. **Ctrl+Alt+V** pastes what just arrived into the app in front (a chat, an email). Or send from Explorer's **Send to → LOKA** or Finder's **Open With → LOKA**.
 - **LocalSend-style pairing.** Devices on the same network find each other. Click one, then confirm on the other device. On networks that block discovery (guest Wi-Fi), add the other computer by its IP address. Pairing shows the same 6-digit code on both screens, so you know you paired the right one, and nobody on the network can fake it.
-- **Stays up to date.** **About** shows the version, what's new in each release, and tells you when a newer one is on GitHub.
-- **Make it yours.** Pick the glow colour, which also becomes the app's accent, how see-through the glow is, and the crossing animation: Ripple, Pulse or Calm. Every click in LOKA makes a soft tick; the speaker in the top-right corner mutes it.
+- **Updates itself.** When a new version is out, Oka pops up with what's new; one click downloads, installs and restarts LOKA (Windows, macOS, Linux). **About** shows the version and the changelog.
+- **Make it yours.** Pick the glow colour, which also becomes the app's accent, how see-through and how thick the glow is, whether it shows always or only when the cursor comes near, and the crossing animation: Ripple, Pulse or Calm. Every click in LOKA makes a soft tick; the speaker in the top-right corner mutes it.
+- **Your Android phone too.** Push the computer's cursor off the edge where the phone sits and it lands on the phone: tap, scroll and type there with the computer's mouse and keyboard (right button = Back, middle = Home). Or use the phone as a touchpad and keyboard for the computer, and send files from it. LOKA sets it up from the phone itself through Wireless debugging (Android 11+), no cable or PC tools needed.
 - **Share more, only if you want to.** Each computer can share a folder (it opens as a drive on the other one), its sound (play it through the other computer's speakers), its notifications (Windows), its microphone (use it as the mic in calls on the other computer, through the free VB-CABLE or BlackHole), and a terminal. Everything starts off.
 - **A link that notices.** If the other computer sleeps, drops off Wi-Fi or freezes, the cursor comes home within about 3 seconds and nothing stays pressed over there. Switching Wi-Fi mid-session keeps going.
 - **Wake it up.** A paired computer that went to sleep gets a **Wake up** button (Wake-on-LAN).
@@ -50,7 +51,7 @@ Meet **Oka**, the little one from LOKA: a cursor, the thing that actually travel
 | Windows 10/11 | Works |
 | macOS | Code complete, still being tested on real hardware. Needs the **Accessibility** permission. |
 | Linux | New: X11 and Wayland desktops, and servers without a desktop (`loka --headless`). Still being tested on real hardware. |
-| Android | Planned |
+| Android 11+ | New: be controlled by a computer (set up once through Wireless debugging), use the phone as touchpad and keyboard, send files. Still being tested on real phones. |
 | iOS | Not planned: iOS does not allow apps to control the device's input |
 
 ## Install
@@ -70,6 +71,7 @@ Download the installer from [Releases](https://github.com/fanrsd/LOKA/releases/l
   Allow **Accessibility** when asked (System Settings → Privacy & Security → Accessibility), on every Mac; on macOS 15+ also allow **Local Network**. After updating, if the mouse stops crossing, remove LOKA from the Accessibility list with **−** and turn it on again.
 - **Linux:** `LOKA_x.y.z_amd64.deb` (Debian, Ubuntu), the `.rpm` (Fedora), or the `.AppImage`. LOKA reads the mouse and keyboard below the desktop, so it needs permission once: **About → Allow input access** (asks for your password).
 - **Linux server without a desktop:** install the `.deb` or `.rpm`, then run `sudo loka --headless` on it (or `sudo loka --allow-input` once, then `loka --headless` as your user). Pair from LOKA on another computer and answer the code in the terminal. Its keyboard input lands on the server's console.
+- **Android:** `LOKA_x.y.z_android.apk` on the phone (allow installing from your browser or Files when asked). Open LOKA, pair with a computer, then tap **Set up** so the computer can move into the phone: LOKA walks you through Developer options → Wireless debugging → pairing code, typed straight into LOKA's notification. Xiaomi/POCO also need **USB debugging (Security settings)**.
 
 Then:
 

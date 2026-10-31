@@ -150,7 +150,6 @@
 
   /* download */
   .downloads { margin-top: 48px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
-  .os.soon { background: none; box-shadow: none; outline: 1px dashed var(--line); outline-offset: -1px; }
   .os { border-radius: 22px; padding: 30px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); display: flex; flex-direction: column; gap: 14px; }
   .os h3 { font-size: 30px; font-weight: 800; letter-spacing: -.03em; display: flex; align-items: center; gap: 14px; }
   .os p { color: var(--muted); font-size: 13.5px; }
@@ -246,7 +245,7 @@
     <ul class="checks">
       <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Free and open source</span><span lang="id">Gratis dan open source</span></li>
       <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">No account, no cloud</span><span lang="id">Tanpa akun, tanpa cloud</span></li>
-      <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Windows, macOS and Linux</span><span lang="id">Windows, macOS dan Linux</span></li>
+      <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Windows, macOS, Linux and Android</span><span lang="id">Windows, macOS, Linux dan Android</span></li>
       <li><span class="dot"><svg width="13" height="13"><use href="#ok"/></svg></span><span lang="en">Drop files across screens</span><span lang="id">Lempar file antar layar</span></li>
     </ul>
 
@@ -375,9 +374,15 @@
         <div class="cmd"><code>sudo loka --headless</code><button type="button" class="copy"><span lang="en">Copy</span><span lang="id">Salin</span></button></div>
         <a class="btn" href="https://github.com/fanrsd/LOKA/releases/latest"><span lang="en">Download for Linux</span><span lang="id">Unduh untuk Linux</span></a>
       </article>
-      <article class="os soon">
+      <article class="os">
         <h3><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M10.5 18.5h3"/></svg>Android</h3>
-        <p><span lang="en">Coming soon. Your phone as one more screen beside your computer.</span><span lang="id">Segera hadir. Ponselmu jadi satu layar lagi di samping komputer.</span></p>
+        <p><span lang="en">Android 11 or newer. Your phone as one more screen beside your computer, or as its touchpad.</span><span lang="id">Android 11 ke atas. Ponselmu jadi satu layar lagi di samping komputer, atau jadi touchpad-nya.</span></p>
+        <ol>
+          <li><span lang="en">Install the <b>.apk</b> on the phone (allow installing from your browser when asked) and pair with a computer.</span><span lang="id">Pasang <b>.apk</b> di ponsel (izinkan pemasangan dari browser saat diminta) lalu pair dengan komputer.</span></li>
+          <li><span lang="en">Tap <b>Set up</b>: LOKA walks you through Developer options → Wireless debugging → pairing code, typed into its notification.</span><span lang="id">Ketuk <b>Set up</b>: LOKA memandu Developer options → Wireless debugging → kode pairing, diketik di notifikasinya.</span></li>
+          <li><span lang="en">Choose which side of the computer the phone sits on. Push the cursor off that edge.</span><span lang="id">Pilih di sisi mana ponsel berada. Dorong kursor melewati tepi itu.</span></li>
+        </ol>
+        <a class="btn" href="https://github.com/fanrsd/LOKA/releases/latest"><span lang="en">Download for Android</span><span lang="id">Unduh untuk Android</span></a>
       </article>
     </div>
   </section>
@@ -431,7 +436,7 @@
       </details>
       <details>
         <summary><span lang="en">What about iPhone, iPad and Android?</span><span lang="id">Bagaimana dengan iPhone, iPad, dan Android?</span></summary>
-        <p><span lang="en">Android is planned. iOS does not let apps control a device's input, so iPhone and iPad can't be controlled.</span><span lang="id">Android direncanakan. iOS tidak mengizinkan aplikasi mengendalikan input perangkat, jadi iPhone dan iPad tidak bisa dikendalikan.</span></p>
+        <p><span lang="en">Android 11 and newer works: the computer's mouse and keyboard move onto the phone (set up once through Wireless debugging, from the phone itself), and the phone can be a touchpad and keyboard for the computer. iOS does not let apps control a device's input, so iPhone and iPad can't be controlled.</span><span lang="id">Android 11 ke atas sudah bisa: mouse dan keyboard komputer pindah ke ponsel (sekali setup lewat Wireless debugging, langsung dari ponsel), dan ponsel bisa jadi touchpad serta keyboard untuk komputer. iOS tidak mengizinkan aplikasi mengendalikan input perangkat, jadi iPhone dan iPad tidak bisa dikendalikan.</span></p>
       </details>
     </div>
   </section>

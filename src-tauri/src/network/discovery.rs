@@ -147,6 +147,10 @@ pub async fn run(
                 if a.announce {
                     let reply = encode(&me.borrow(), false);
                     let _ = sock.send_to(&reply, (from.ip(), PORT)).await;
+                    // behind NAT (Android emulator) the sender's discovery port shows up remapped: answer there too
+                    if from.port() != PORT {
+                        let _ = sock.send_to(&reply, from).await;
+                    }
                 }
                 on_peer(Peer { info: a.info, addr: from.ip(), seen: Instant::now() });
             }

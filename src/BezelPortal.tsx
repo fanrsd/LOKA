@@ -36,6 +36,9 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
     // file transfer progress drawn along the edge, summed over files in flight; `end` starts the fade-out
     const xfer = { pct: 0, end: -1e9, active: false };
     const files = new Map<number, [number, number]>();
+    // auto-hide: how near the cursor is (tracker `hover`, button or not) and how visible the glow is (-1: not yet drawn)
+    const hover = { p: 0 };
+    let shown = -1, applied = "";
 
     // crossing / drop / preview
     const splash = (y: number) => {
@@ -53,6 +56,9 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
         }
         if (payload.kind === "drop") splash(payload.normalizedY);
       }),
+      getCurrentWebviewWindow().listen<[number, number]>("hover", ({ payload }) => {
+        hover.p = payload[1];
+      }),
       listen<{ active: boolean; y?: number }>("kvm", ({ payload }) => payload.active && splash(payload.y ?? cur.y)),
       listen<{ type: string; id?: number; done?: number; total?: number }>("transfer", ({ payload: e }) => {
         if (e.type === "text") return;
@@ -64,14 +70,13 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
         else if (xfer.active) Object.assign(xfer, { active: false, end: performance.now() });
       }),
       listen<Look>("look", ({ payload }) => {
-        const opacityOnly = payload.color === look.color && payload.motion === look.motion;
+        // preview the crossing in the new style (and show a hidden glow once)
+        const preview = payload.color !== look.color || payload.motion !== look.motion || (payload.autoHide && !look.autoHide);
         look = payload;
         motion = reduced ? "calm" : look.motion;
-        el.style.opacity = String(look.opacity);
-        if (!opacityOnly) splash(cur.y); // preview the crossing in the new style
+        if (preview) splash(cur.y);
       }),
     ];
-    el.style.opacity = String(look.opacity);
 
     const frame = (now: number) => {
       const dpr = devicePixelRatio || 1;
@@ -117,6 +122,13 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
       const breathe = motion === "calm" ? 0.4 : 0.35 + 0.1 * Math.sin(now / 900);
       const flare = Math.max(0, 1 - (now - flash) / 700);
       const glow = Math.min(1, breathe + cur.p * 0.65 + ripples.length * 0.05 + flare);
+      // auto-hide: fades in as the cursor nears; crossings, drops and transfers always show
+      const busy = cur.p > 0.02 || ripples.length > 0 || flare > 0 || xfer.active || now - xfer.end < 900;
+      const want = !look.autoHide || busy ? 1 : Math.min(1, hover.p * 1.5);
+      shown = shown < 0 ? want : shown + (want - shown) * 0.12;
+      const op = (look.opacity * shown).toFixed(3); // only touch the style when it changes
+      if (op !== applied) el.style.opacity = applied = op;
+      const thick = look.width;
       const grad = vertical ? ctx.createLinearGradient(0, 0, 0, h) : ctx.createLinearGradient(0, 0, w, 0);
       // the chosen colour along the edge, a white-hot core where the cursor is
       grad.addColorStop(0, look.color);
@@ -133,8 +145,8 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
       ctx.strokeStyle = grad;
       ctx.globalCompositeOperation = "lighter";
       for (const [width, blur, alpha] of [[10, 28, 0.35], [5, 14, 0.6], [2, 4, 1]] as const) {
-        ctx.lineWidth = width * (1 + flare);
-        ctx.shadowBlur = blur * (1 + flare);
+        ctx.lineWidth = width * thick * (1 + flare);
+        ctx.shadowBlur = blur * thick * (1 + flare);
         ctx.shadowColor = look.color;
         ctx.globalAlpha = alpha * glow;
         ctx.stroke();
@@ -151,7 +163,7 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
         ctx.strokeStyle = core(look.color);
         ctx.shadowColor = look.color;
         ctx.shadowBlur = 16;
-        ctx.lineWidth = 4;
+        ctx.lineWidth = 4 * thick;
         ctx.globalAlpha = xAlpha;
         ctx.stroke();
         ctx.globalAlpha = 1;
