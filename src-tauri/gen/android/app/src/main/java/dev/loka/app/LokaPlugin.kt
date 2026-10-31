@@ -57,9 +57,11 @@ class LokaPlugin(private val activity: Activity) : Plugin(activity) {
     super.load(webView)
     instance = this
     Security.insertProviderAt(Conscrypt.newProvider(), 1) // TLS 1.3 + key export for ADB pairing on every Android version
-    if (Build.VERSION.SDK_INT >= 33 && ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-      activity.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-    }
+    val wanted = listOfNotNull(
+      if (Build.VERSION.SDK_INT >= 37) Manifest.permission.ACCESS_LOCAL_NETWORK else null,
+      if (Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS else null,
+    ).filter { ctx.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+    if (wanted.isNotEmpty()) activity.requestPermissions(wanted.toTypedArray(), 1)
     ReachableService.start(ctx)
   }
 
@@ -136,7 +138,8 @@ class LokaPlugin(private val activity: Activity) : Plugin(activity) {
         prefs.edit().putBoolean("paired", true).apply()
         mdns?.stop()
         result.put("ok", true)
-      } catch (e: Exception) {
+      } catch (e: Throwable) {
+        android.util.Log.w("LOKA", "pairing failed", e)
         result.put("ok", false)
         result.put("error", e.message ?: "pairing failed")
       }
