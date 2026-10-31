@@ -35,6 +35,8 @@ object Injector {
   private var buttons = 0
   private var downAt = 0L
   private var meta = 0
+  // shortcut: starts on and only follows Num Lock presses made while driving the phone, not the computer's own state
+  private var numLock = true
 
   @JvmStatic
   fun main(args: Array<String>) {
@@ -120,6 +122,7 @@ object Injector {
 
   private fun key(scan: Int, down: Boolean) {
     val code = KEYS[scan] ?: return
+    if (code == KeyEvent.KEYCODE_NUM_LOCK && down) numLock = !numLock
     val bit = MODIFIERS[code] ?: 0
     if (down) meta = meta or bit else meta = meta and bit.inv()
     keyEvent(code, down)
@@ -127,7 +130,8 @@ object Injector {
 
   private fun keyEvent(code: Int, down: Boolean) {
     val now = SystemClock.uptimeMillis()
-    inject(KeyEvent(now, now, if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, 0, meta, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD))
+    val state = if (numLock) meta or KeyEvent.META_NUM_LOCK_ON else meta // keypad keys type digits only with it
+    inject(KeyEvent(now, now, if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, code, 0, state, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD))
   }
 
   private fun tap(code: Int) {
@@ -167,6 +171,12 @@ object Injector {
       0xE048 to KeyEvent.KEYCODE_DPAD_UP, 0xE050 to KeyEvent.KEYCODE_DPAD_DOWN, 0xE04B to KeyEvent.KEYCODE_DPAD_LEFT, 0xE04D to KeyEvent.KEYCODE_DPAD_RIGHT,
       0xE047 to KeyEvent.KEYCODE_MOVE_HOME, 0xE04F to KeyEvent.KEYCODE_MOVE_END, 0xE049 to KeyEvent.KEYCODE_PAGE_UP, 0xE051 to KeyEvent.KEYCODE_PAGE_DOWN,
       0xE052 to KeyEvent.KEYCODE_INSERT, 0xE053 to KeyEvent.KEYCODE_FORWARD_DEL,
+      // keypad (Num Lock is 0xE045 from Windows; 0x45 there is Pause)
+      0x47 to KeyEvent.KEYCODE_NUMPAD_7, 0x48 to KeyEvent.KEYCODE_NUMPAD_8, 0x49 to KeyEvent.KEYCODE_NUMPAD_9, 0x4A to KeyEvent.KEYCODE_NUMPAD_SUBTRACT,
+      0x4B to KeyEvent.KEYCODE_NUMPAD_4, 0x4C to KeyEvent.KEYCODE_NUMPAD_5, 0x4D to KeyEvent.KEYCODE_NUMPAD_6, 0x4E to KeyEvent.KEYCODE_NUMPAD_ADD,
+      0x4F to KeyEvent.KEYCODE_NUMPAD_1, 0x50 to KeyEvent.KEYCODE_NUMPAD_2, 0x51 to KeyEvent.KEYCODE_NUMPAD_3, 0x52 to KeyEvent.KEYCODE_NUMPAD_0,
+      0x53 to KeyEvent.KEYCODE_NUMPAD_DOT, 0x37 to KeyEvent.KEYCODE_NUMPAD_MULTIPLY, 0xE035 to KeyEvent.KEYCODE_NUMPAD_DIVIDE,
+      0xE045 to KeyEvent.KEYCODE_NUM_LOCK,
     ))
   }
 }
