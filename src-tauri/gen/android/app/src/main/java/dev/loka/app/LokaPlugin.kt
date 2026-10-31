@@ -49,7 +49,7 @@ class LokaPlugin(private val activity: Activity) : Plugin(activity) {
   private val ctx: Context = activity.applicationContext
   private val prefs by lazy { ctx.getSharedPreferences("loka", Context.MODE_PRIVATE) }
   private val main = Handler(Looper.getMainLooper())
-  private var injector: AdbStream? = null
+  @Volatile private var injector: AdbStream? = null
   private var pairingPort = 0
   private var mdns: AdbMdns? = null
 
@@ -154,30 +154,49 @@ class LokaPlugin(private val activity: Activity) : Plugin(activity) {
     val args = invoke.parseArgs(StartArgs::class.java)
     Thread {
       try {
-        val adb = AdbManager.get(ctx)
-        // after a restart or a Wi-Fi change Android turns Wireless debugging off; LOKA may turn it back on
-        if (!global("adb_wifi_enabled") && ctx.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED) {
-          Settings.Global.putInt(ctx.contentResolver, "adb_wifi_enabled", 1)
-          Thread.sleep(1500)
-        }
-        if (!adb.isConnected && !adb.connectTls(ctx, 10_000)) throw IllegalStateException("Wireless debugging isn't answering. Is it on?")
-        shell(adb, "pm grant ${ctx.packageName} android.permission.WRITE_SECURE_SETTINGS; appops set ${ctx.packageName} SYSTEM_ALERT_WINDOW allow")
-        injector?.close()
-        val apk = ctx.applicationInfo.sourceDir
-        val stream = adb.openStream("shell:CLASSPATH=$apk app_process / ${Injector::class.java.name} ${args.port} ${args.token}")
-        injector = stream
-        Thread {
-          // the injector prints nothing; this read ends when it (or the ADB link) dies
-          val buf = ByteArray(256)
-          try { while (stream.openInputStream().read(buf) >= 0) Unit } catch (_: Exception) {}
-          trigger("injector", JSObject().apply { put("running", false) })
-        }.start()
+        launch(args)
         invoke.resolve()
       } catch (e: AdbPairingRequiredException) {
         prefs.edit().putBoolean("paired", false).apply()
         invoke.reject("pair again")
       } catch (e: Exception) {
         invoke.reject(e.message ?: e.toString())
+      }
+    }.start()
+  }
+
+  private fun launch(args: StartArgs) {
+    val adb = AdbManager.get(ctx)
+    // after a restart or a Wi-Fi change Android turns Wireless debugging off; LOKA may turn it back on
+    if (!global("adb_wifi_enabled") && ctx.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) == PackageManager.PERMISSION_GRANTED) {
+      Settings.Global.putInt(ctx.contentResolver, "adb_wifi_enabled", 1)
+      Thread.sleep(1500)
+    }
+    if (!adb.isConnected && !adb.connectTls(ctx, 10_000)) throw IllegalStateException("Wireless debugging isn't answering. Is it on?")
+    shell(adb, "pm grant ${ctx.packageName} android.permission.WRITE_SECURE_SETTINGS; appops set ${ctx.packageName} SYSTEM_ALERT_WINDOW allow")
+    injector?.close()
+    val apk = ctx.applicationInfo.sourceDir
+    val stream = adb.openStream("shell:CLASSPATH=$apk app_process / ${Injector::class.java.name} ${args.port} ${args.token}")
+    injector = stream
+    Thread {
+      // the injector prints nothing; this read ends when it (or the ADB link) dies
+      val buf = ByteArray(256)
+      try { while (stream.openInputStream().read(buf) >= 0) Unit } catch (_: Exception) {}
+      trigger("injector", JSObject().apply { put("running", false) })
+      // adbd restarts (Wi-Fi change, Wireless debugging toggled) kill it: start it again until it runs,
+      // unless a newer `start` replaced it; a computer's cursor would otherwise move in with no input
+      while (injector === stream) {
+        Thread.sleep(3000)
+        try {
+          try { adb.disconnect() } catch (_: java.io.IOException) {} // the old link is dead even if it doesn't know yet
+          launch(args)
+          trigger("injector", JSObject().apply { put("running", true) })
+        } catch (e: AdbPairingRequiredException) {
+          prefs.edit().putBoolean("paired", false).apply()
+          break
+        } catch (e: Exception) {
+          android.util.Log.w("LOKA", "injector restart failed", e)
+        }
       }
     }.start()
   }
