@@ -157,6 +157,10 @@
   .os ol { color: var(--muted); font-size: 13.5px; padding-left: 20px; display: grid; gap: 6px; }
   .os ol b, .os p b { color: var(--fg); font-weight: 600; }
   .os { min-width: 0; }
+  .tut { display: grid; grid-template-columns: 1.6fr 1fr; gap: 40px; align-items: start; margin-top: 40px; }
+  .tut video { width: 100%; height: auto; border-radius: 22px; box-shadow: inset 0 0 0 1px var(--line); background: var(--panel); }
+  .tut ol { color: var(--muted); font-size: 15px; padding-left: 22px; display: grid; gap: 14px; }
+  .tut ol b { color: var(--fg); font-weight: 600; }
   .cmd { display: flex; align-items: center; gap: 10px; border-radius: 12px; padding: 10px 10px 10px 14px; box-shadow: inset 0 0 0 1px var(--line); font: 400 12.5px/1.5 var(--mono); color: var(--fg); }
   .cmd code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; }
   .cmd button { flex: none; font: 600 12px/1 var(--mono); color: var(--fg); background: none; border: 0; border-radius: 999px; padding: 8px 12px; box-shadow: inset 0 0 0 1px var(--line); cursor: pointer; }
@@ -192,7 +196,7 @@
   @media (max-width: 860px) {
     .nav .links { display: none; }
     .lang { margin-left: auto; }
-    .how, .faq, .tilt { grid-template-columns: 1fr; }
+    .how, .faq, .tilt, .tut { grid-template-columns: 1fr; }
     .features, .downloads { grid-template-columns: 1fr; }
     .checks { grid-template-columns: auto; }
     footer .cols { grid-template-columns: repeat(2, 1fr); }
@@ -382,8 +386,23 @@
           <li><span lang="en">Tap <b>Set up</b>: LOKA walks you through Developer options → Wireless debugging → pairing code, typed into its notification.</span><span lang="id">Ketuk <b>Set up</b>: LOKA memandu Developer options → Wireless debugging → kode pairing, diketik di notifikasinya.</span></li>
           <li><span lang="en">Choose which side of the computer the phone sits on. Push the cursor off that edge.</span><span lang="id">Pilih di sisi mana ponsel berada. Dorong kursor melewati tepi itu.</span></li>
         </ol>
+        <a href="#android"><span lang="en">Watch the setup (2 min)</span><span lang="id">Tonton cara setup (2 menit)</span></a>
         <a class="btn" href="https://github.com/fanrsd/LOKA/releases/latest"><span lang="en">Download for Android</span><span lang="id">Unduh untuk Android</span></a>
       </article>
+    </div>
+  </section>
+
+  <section id="android" class="wrap block">
+    <h2><span lang="en">Set up LOKA on Android.</span><span lang="id">Setup LOKA di Android.</span></h2>
+    <p class="lead"><span lang="en">The phone on the left, the computer on the right: two minutes, once.</span><span lang="id">Ponsel di kiri, komputer di kanan: dua menit, cukup sekali.</span></p>
+    <div class="tut">
+      <video src="android-setup.mp4" poster="android-setup.jpg" controls muted playsinline preload="none" width="1920" height="1080"></video>
+      <ol>
+        <li><span lang="en">Install the <b>.apk</b>, open LOKA and allow <b>Nearby devices</b> (Android 17 needs it to find your computer) and <b>notifications</b>.</span><span lang="id">Pasang <b>.apk</b>, buka LOKA, izinkan <b>Perangkat sekitar</b> (Android 17 butuh ini untuk menemukan komputer) dan <b>notifikasi</b>.</span></li>
+        <li><span lang="en">Your computer shows up (LOKA open on it, same Wi-Fi). Tap <b>Pair</b>, check both show the same code, then click <b>Pair</b> on the computer.</span><span lang="id">Komputermu muncul (LOKA terbuka di sana, Wi-Fi sama). Ketuk <b>Pair</b>, pastikan kodenya sama, lalu klik <b>Pair</b> di komputer.</span></li>
+        <li><span lang="en">Tap <b>Set up</b>. Once: turn on <b>Developer options</b> (Settings → About phone → tap <b>Build number</b> 7 times) and <b>Wireless debugging</b>. There, tap <b>Pair device with pairing code</b>, pull down the notifications and type the 6 digits into LOKA's notification. LOKA shows <b>Ready</b>.</span><span lang="id">Ketuk <b>Set up</b>. Sekali saja: nyalakan <b>Developer options</b> (Settings → About phone → ketuk <b>Build number</b> 7 kali) dan <b>Wireless debugging</b>. Di sana ketuk <b>Pair device with pairing code</b>, tarik panel notifikasi, lalu ketik 6 digitnya di notifikasi LOKA. LOKA menampilkan <b>Ready</b>.</span></li>
+        <li><span lang="en">Tap <b>Left</b> or <b>Right</b>: where the phone sits next to the computer. Push the computer's cursor past that edge; move back (or press <b>Ctrl+Alt+Esc</b>) to return.</span><span lang="id">Ketuk <b>Left</b> atau <b>Right</b>: letak ponsel di samping komputer. Dorong kursor komputer melewati tepi itu; kembali (atau tekan <b>Ctrl+Alt+Esc</b>) untuk pulang.</span></li>
+      </ol>
     </div>
   </section>
 
