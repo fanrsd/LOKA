@@ -95,6 +95,7 @@ export function About({ update, seed, os, onClose, onUpdate, downloadUrl, extra 
 
   const copy = async () => {
     try {
+      setCopied("Collecting from this and paired devices…");
       const report = await invoke<string>("diagnostics");
       await navigator.clipboard.writeText(extra ? `${report}\n${extra}\n` : report);
       setCopied("Copied");
@@ -212,12 +213,12 @@ export function About({ update, seed, os, onClose, onUpdate, downloadUrl, extra 
 
           <section className="mt-6">
             <h3 className="text-xs font-medium text-faint">Troubleshooting</h3>
-            <p className="mt-2 text-sm leading-relaxed text-muted">Something not working? Copy a short report (versions, network, devices; no keys) and paste it into your problem report.</p>
+            <p className="mt-2 text-sm leading-relaxed text-muted">Something not working? Copy a report from this device and the paired ones nearby (versions, network, screens, recent events; no keys) and paste it into your problem report.</p>
             <div className="mt-3 flex items-center gap-3">
-              <button onClick={copy} className={quietButton + " min-h-11 ring-1 ring-line"}>
+              <button onClick={copy} disabled={copied.endsWith("…")} className={quietButton + " min-h-11 ring-1 ring-line"}>
                 Copy diagnostics
               </button>
-              <span role="status" className={`text-xs ${copied === "Copied" ? "text-fg" : "text-danger"}`}>
+              <span role="status" className={`text-xs ${copied === "Copied" || copied.endsWith("…") ? "text-fg" : "text-danger"}`}>
                 {copied}
               </span>
             </div>

@@ -102,11 +102,13 @@ pub enum Service {
     Sound = 3,
     Notifications = 4,
     Mic = 5,
+    /// its diagnostics report and log tail, for a support report covering both sides (any paired device)
+    Diagnostics = 6,
 }
 
 impl Service {
     fn from_u8(b: u8) -> Option<Self> {
-        [Service::Shell, Service::Files, Service::Sound, Service::Notifications, Service::Mic].into_iter().find(|s| *s as u8 == b)
+        [Service::Shell, Service::Files, Service::Sound, Service::Notifications, Service::Mic, Service::Diagnostics].into_iter().find(|s| *s as u8 == b)
     }
 
     fn not_shared(self) -> &'static str {
@@ -116,6 +118,7 @@ impl Service {
             Service::Sound => "the other computer isn't sharing its sound",
             Service::Notifications => "the other computer isn't sharing its notifications",
             Service::Mic => "the other computer isn't sharing its microphone",
+            Service::Diagnostics => "the other device didn't send its report",
         }
     }
 }
@@ -828,6 +831,20 @@ pub fn end_sessions() {
     END.notify_waiters();
 }
 
+/// When the driven session's loop last ran, in ms since `EPOCH`; it ticks every second, so a much older
+/// beat means the loop is stuck (the watchdog then clears the session).
+static BEAT: AtomicU64 = AtomicU64::new(0);
+static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+fn beat() {
+    BEAT.store(EPOCH.elapsed().as_millis() as u64, Ordering::SeqCst);
+}
+
+/// How long ago the driven session's loop last ran.
+pub fn beat_age() -> Duration {
+    EPOCH.elapsed().saturating_sub(Duration::from_millis(BEAT.load(Ordering::SeqCst)))
+}
+
 /// One frame, pushed out now.
 async fn send(w: &mut (impl AsyncWrite + Unpin), m: Msg) -> io::Result<()> {
     w.write_all(&m.encode()).await?;
@@ -954,7 +971,10 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
                         Ok(()) => {
                             let _ = tx.send((s, who, edge, y)).await;
                         }
-                        Err(r) => refuse(s, r).await,
+                        Err(r) => {
+                            journal!("kvm: refused a session from {}… ({r:?})", &who[..who.len().min(12)]);
+                            refuse(s, r).await
+                        }
                     },
                     Msg::Open(service) => {
                         let ok = allow_service(service, &who);
@@ -986,8 +1006,12 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
             continue;
         };
         match session(s, &mut sink, edge, y, &tls, &mut rx).await {
-            Ok(taken) => next = taken,
-            Err(e) => eprintln!("kvm session ended: {e}"),
+            Ok(Some(taken)) => {
+                journal!("kvm: driven session handed over to {}…", &taken.1[..taken.1.len().min(12)]);
+                next = Some(taken)
+            }
+            Ok(None) => journal!("kvm: driven session ended"),
+            Err(e) => journal!("kvm: driven session ended: {e}"),
         }
     }
 }
@@ -1082,7 +1106,10 @@ async fn session(
         Back(Back),
         Waiting(Option<Incoming>),
         End,
+        Beat,
     }
+    beat();
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
     let (mut rcv, first) = Receiver::enter(sink.screens(), edge, y);
     sink.inject(first);
     DRAG_OUT.store(0, Ordering::SeqCst);
@@ -1103,6 +1130,7 @@ async fn session(
             } => Ev::Back(b),
             i = waiting.recv() => Ev::Waiting(i),
             _ = &mut ended => Ev::End,
+            _ = ticks.tick() => Ev::Beat,
         };
         let m = match ev {
             Ev::Frame(Ok(m)) => m,
@@ -1111,6 +1139,10 @@ async fn session(
             // another device takes over, or the user ended it here: the cursor goes back to its driver
             Ev::Waiting(Some(i)) => break hand_back(&mut s, sink, &seen, None, rcv.along()).await.map(|()| Some(i)),
             Ev::End => break hand_back(&mut s, sink, &seen, None, rcv.along()).await.map(|()| None),
+            Ev::Beat => {
+                beat();
+                continue;
+            }
             Ev::Back(Back::Clipboard(text)) => {
                 sink.set_clipboard(text);
                 continue;
@@ -1177,7 +1209,7 @@ async fn session(
                             match start_relay(tls, hop, sink.clipboard()).await {
                                 Ok(r) => relay = Some(r),
                                 Err(e) => {
-                                    eprintln!("kvm chain: {e}");
+                                    journal!("kvm chain: {e}");
                                     retry_at = Instant::now() + Duration::from_secs(1); // no reconnect storm at that edge
                                 }
                             }

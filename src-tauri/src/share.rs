@@ -56,7 +56,7 @@ async fn proxy(listener: TcpListener, app: AppHandle, fingerprint: String) {
                 Ok(mut remote) => {
                     let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
                 }
-                Err(e) => eprintln!("shared folder: {e}"),
+                Err(e) => journal!("shared folder: {e}"),
             }
         });
     }

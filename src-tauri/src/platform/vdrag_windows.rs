@@ -216,7 +216,7 @@ impl ISequentialStream_Impl for Stream_Impl {
                 Some(Ok(0)) => break,
                 Some(Ok(n)) => done += n,
                 Some(Err(e)) => {
-                    eprintln!("streamed drag: {e}");
+                    journal!("streamed drag: {e}");
                     return STG_E_READFAULT;
                 }
                 None => pump(),

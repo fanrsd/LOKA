@@ -101,7 +101,7 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
         })
         .await;
         if let Err(e) = r {
-            eprintln!("sim telemetry stopped: {e}");
+            journal!("sim telemetry stopped: {e}");
         }
     });
 
@@ -120,7 +120,7 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
         })
         .await;
         if let Err(e) = r {
-            eprintln!("sim transfer server stopped: {e}");
+            journal!("sim transfer server stopped: {e}");
         }
     });
 
@@ -142,7 +142,7 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
         let sink = move |_: &str, _| Some(WindowSink(h.clone()));
         // the simulated phone keeps no layout of its own: the host already moves its window (`place`)
         if let Err(e) = kvm::serve(tls, KVM_PORT, allow, ask, |_, _| false, |_, _, _| {}, |_, _| true, sink).await {
-            eprintln!("sim kvm receiver stopped: {e}");
+            journal!("sim kvm receiver stopped: {e}");
         }
     });
     Ok(())

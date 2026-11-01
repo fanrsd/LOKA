@@ -60,7 +60,7 @@ define_class!(
             match r {
                 Ok(()) => done.call((std::ptr::null_mut(),)),
                 Err(e) => {
-                    eprintln!("streamed drag: {e}");
+                    journal!("streamed drag: {e}");
                     let error = NSError::new(1, &NSString::from_str("LOKA"));
                     done.call((Retained::as_ptr(&error) as *mut NSError,));
                 }

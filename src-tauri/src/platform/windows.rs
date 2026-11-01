@@ -124,6 +124,8 @@ impl SpatialPlatformEngine for WindowsEngine {
             // input utilities running), so keys and moves leak to this machine. Watch for leaks and
             // move our hooks back to the front; Ctrl+Alt+Esc also works from what leaked.
             let mut was_down = keys_down();
+            // hooks moved back to the front because input leaked past them (another app's hook): keys, mouse
+            let (mut key_fixes, mut mouse_fixes) = (0u32, 0u32);
             SetTimer(null_mut(), 0, 15, None);
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
                 if msg.message != WM_TIMER {
@@ -133,6 +135,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                 if cap.as_ref().is_some_and(|c| c.out.is_closed() || super::starved()) {
                     // the session task died or hangs: give input back without it
                     let _ = cap.take().unwrap().out.send(Captured::Escape);
+                    journal!("capture: dead-man switch released input (session task gone or stalled)");
                     drop(cap);
                     let _ = HOOK_THREAD.compare_exchange(GetCurrentThreadId(), 0, Ordering::SeqCst, Ordering::SeqCst);
                     show_cursors();
@@ -143,6 +146,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                 if (0..256).any(|vk| down[vk] && !was_down[vk]) {
                     UnhookWindowsHookEx(keys);
                     keys = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_proc), module, 0);
+                    key_fixes += 1;
                     if let Some(c) = CAPTURE.lock().unwrap().as_ref() {
                         let held = |vk: u16| down[vk as usize];
                         if held(VK_ESCAPE) && (c.ctrl || held(VK_CONTROL)) && (c.alt || held(VK_MENU)) {
@@ -156,15 +160,20 @@ impl SpatialPlatformEngine for WindowsEngine {
                     SetCursorPos(park.x, park.y);
                     UnhookWindowsHookEx(mouse);
                     mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
+                    mouse_fixes += 1;
                 }
             }
             UnhookWindowsHookEx(mouse);
             UnhookWindowsHookEx(keys);
+            if key_fixes + mouse_fixes > 0 {
+                journal!("capture: input leaked past our hooks, re-hooked keyboard {key_fixes}×, mouse {mouse_fixes}× (another app's input hook?)");
+            }
         });
         if ready_rx.recv() == Ok(true) {
             Ok(())
         } else {
             *CAPTURE.lock().unwrap() = None;
+            journal!("capture: SetWindowsHookExW failed");
             Err("SetWindowsHookExW failed".into())
         }
     }
@@ -186,6 +195,7 @@ impl SpatialPlatformEngine for WindowsEngine {
             }
             SetCursorPos(warp_to.0 as i32, warp_to.1 as i32);
             show_cursors();
+            journal!("capture stopped, cursors restored, at ({}, {})", warp_to.0 as i32, warp_to.1 as i32);
         }
     }
 
@@ -295,6 +305,7 @@ impl SpatialPlatformEngine for WindowsEngine {
         if !on {
             if let Some(mut old) = saved.take() {
                 set(&mut old);
+                journal!("MouseKeys restored");
             }
             return;
         }
@@ -309,6 +320,7 @@ impl SpatialPlatformEngine for WindowsEngine {
         // profile, so a crash leaves it on only until sign-out. Injected numpad keys don't drive it (checked).
         set(&mut MOUSEKEYS { dwFlags: MKF_AVAILABLE | MKF_MOUSEKEYSON, ..old });
         *saved = Some(old);
+        journal!("no mouse attached: MouseKeys forced on so Windows draws the cursor");
     }
 
     fn lock_key_down(&self) -> bool {
@@ -352,7 +364,7 @@ pub fn keep_running() {
     // SAFETY: a valid struct of the documented size for ProcessPowerThrottling on our own process
     let ok = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, (&state as *const PROCESS_POWER_THROTTLING_STATE).cast(), size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) };
     if ok == 0 {
-        eprintln!("power throttling opt-out failed"); // Windows before 10 1709: nothing to opt out of
+        journal!("power throttling opt-out failed"); // Windows before 10 1709: nothing to opt out of
     }
 }
 

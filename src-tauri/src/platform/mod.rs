@@ -224,7 +224,7 @@ pub fn clipboard_text() -> Option<String> {
 pub fn set_clipboard_text(text: &str) {
     #[cfg(desktop)]
     if let Err(e) = with_clipboard(|c| if c.get_text().ok().as_deref() == Some(text) { Ok(()) } else { c.set_text(text) }) {
-        eprintln!("clipboard: {e}");
+        journal!("clipboard: {e}");
     }
     #[cfg(target_os = "android")]
     if android::clipboard_text().as_deref() != Some(text) {
@@ -243,7 +243,7 @@ pub fn clipboard_image() -> Option<(usize, usize, Vec<u8>)> {
 pub fn set_clipboard_image(width: usize, height: usize, rgba: Vec<u8>) {
     #[cfg(desktop)]
     if let Err(e) = with_clipboard(|c| c.set_image(arboard::ImageData { width, height, bytes: rgba.into() })) {
-        eprintln!("clipboard image: {e}");
+        journal!("clipboard image: {e}");
     }
 }
 
@@ -259,7 +259,7 @@ pub fn clipboard_files() -> Vec<std::path::PathBuf> {
 pub fn set_clipboard_files(paths: &[std::path::PathBuf]) {
     #[cfg(desktop)]
     if let Err(e) = with_clipboard(|c| c.set().file_list(paths)) {
-        eprintln!("clipboard files: {e}");
+        journal!("clipboard files: {e}");
     }
 }
 
@@ -442,9 +442,35 @@ pub fn fit(screens: &[Rect], edge: Edge, taken: &[Portal]) -> Option<Portal> {
     Some(Portal { edge, monitor, start, end: start + len, reach: 120.0 })
 }
 
+/// The screen a portal saved on `monitor` belongs to now that its resolution changed: the current screen
+/// overlapping it most. `None`: `monitor` is still a screen, or no screen overlaps it (unplugged, or not
+/// up yet right after boot: guessing then would move the portal for good).
+pub fn refit(monitor: Rect, screens: &[Rect]) -> Option<Rect> {
+    if screens.contains(&monitor) {
+        return None;
+    }
+    let span = |a: f64, aw: f64, b: f64, bw: f64| ((a + aw).min(b + bw) - a.max(b)).max(0.0);
+    let overlap = |s: &Rect| span(s.x, s.w, monitor.x, monitor.w) * span(s.y, s.h, monitor.y, monitor.h);
+    screens.iter().filter(|s| overlap(s) > 0.0).max_by(|a, b| overlap(a).total_cmp(&overlap(b))).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portals_follow_their_screen_when_the_screens_change() {
+        let r = |x, y, w, h| Rect { x, y, w, h };
+        let (main, side) = (r(0.0, 0.0, 1920.0, 1080.0), r(1920.0, 0.0, 1280.0, 1024.0));
+        assert_eq!(refit(side, &[main, side]), None, "unchanged");
+        // resolution changed: the screen in the same spot, not the other one of the old size
+        let big = r(0.0, 0.0, 2560.0, 1440.0);
+        assert_eq!(refit(main, &[big, r(2560.0, 0.0, 1920.0, 1080.0)]), Some(big));
+        assert_eq!(refit(side, &[main, r(1920.0, 0.0, 1024.0, 768.0)]), Some(r(1920.0, 0.0, 1024.0, 768.0)));
+        // unplugged or not up yet: stays where it was
+        assert_eq!(refit(side, &[main]), None);
+        assert_eq!(refit(main, &[]), None);
+    }
 
     #[test]
     fn clipboard_pictures_can_be_read_from_several_threads_at_once() {

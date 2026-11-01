@@ -265,7 +265,7 @@ pub async fn serve(
         let (dir, clip_dir, on_event, batches) = (dir.clone(), clip_dir.clone(), on_event.clone(), batches.clone());
         tokio::spawn(async move {
             if let Err(e) = receive(s, &dir(), &clip_dir, &batches, &*on_event).await {
-                eprintln!("transfer from {from} failed: {e}");
+                journal!("transfer from {from} failed: {e}");
             }
         });
     }

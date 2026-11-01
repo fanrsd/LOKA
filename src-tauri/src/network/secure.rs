@@ -111,7 +111,7 @@ impl Identity {
         let id = Self::generate();
         let _ = std::fs::create_dir_all(dir);
         if let Err(e) = std::fs::write(&cert_path, &id.cert).and_then(|()| std::fs::write(&key_path, id.key.secret_pkcs8_der())) {
-            eprintln!("saving identity failed: {e}");
+            journal!("saving identity failed: {e}");
         }
         id
     }

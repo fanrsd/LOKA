@@ -54,7 +54,7 @@ pub fn clipboard_text() -> Option<String> {
         s.read_exact(&mut text)?;
         Ok(String::from_utf8_lossy(&text).into_owned())
     };
-    ask(s).inspect_err(|e| eprintln!("injector clipboard: {e}")).ok()
+    ask(s).inspect_err(|e| journal!("injector clipboard: {e}")).ok()
 }
 
 pub fn set_clipboard_text(text: &str) {

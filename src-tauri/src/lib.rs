@@ -1,5 +1,7 @@
 // the phone build has no capture, overlays or clipboard pictures yet: desktop-only paths stay unused there
 #![cfg_attr(mobile, allow(dead_code, unused))]
+#[macro_use]
+mod journal;
 #[cfg(desktop)]
 mod audio;
 mod carry;
@@ -111,6 +113,7 @@ pub(crate) async fn watch_controllable(engine: Arc<dyn SpatialPlatformEngine>, m
         let e = engine.clone();
         let now = tokio::task::spawn_blocking(move || e.can_inject()).await.unwrap_or(false);
         if me.send_if_modified(|i| std::mem::replace(&mut i.controllable, now) != now) {
+            journal!("controllable: {now}");
             on_change();
         }
     }
@@ -162,13 +165,16 @@ async fn check_device(state: State<'_, AppState>, tls: State<'_, Arc<Tls>>, fing
     Ok(Check { kvm: probe(k), transfer: probe(t), hint })
 }
 
-/// Plain-text report for support: this device, what it hears, its pairings and layout. No keys.
-#[tauri::command]
-fn diagnostics(state: State<AppState>, me: State<watch::Sender<DeviceInfo>>) -> String {
+/// Plain-text report for support: this device, what it hears, its pairings, layout, screens, state right now
+/// and the log's tail. No keys.
+fn report(app: &AppHandle) -> String {
     use std::fmt::Write;
-    let me = me.borrow().clone();
+    let me = app.state::<watch::Sender<DeviceInfo>>().borrow().clone();
+    let screens = screens(app);
+    let state = app.state::<AppState>();
     let s = state.lock().unwrap();
     let yes = |b: bool| if b { "yes" } else { "no" };
+    let rect = |r: &Rect| format!("{},{} {}×{}", r.x, r.y, r.w, r.h);
     let mut r = format!("LOKA {} · {} {}\n", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
     let _ = writeln!(r, "This device: {} ({}…), controllable: {}", me.alias, &me.fingerprint[..me.fingerprint.len().min(12)], yes(me.controllable));
     let ips: Vec<String> = discovery::local_ipv4().iter().map(|ip| ip.to_string()).collect();
@@ -182,12 +188,48 @@ fn diagnostics(state: State<AppState>, me: State<watch::Sender<DeviceInfo>>) -> 
     }
     let offline: Vec<&str> = s.settings.paired.iter().filter(|d| s.live_peers().all(|p| p.info.fingerprint != d.fingerprint)).map(|d| d.alias.as_str()).collect();
     let _ = writeln!(r, "Paired, offline: {}", if offline.is_empty() { "none".to_string() } else { offline.join(", ") });
+    let _ = writeln!(r, "Screens: {}", screens.iter().map(rect).collect::<Vec<_>>().join(" | "));
     let _ = writeln!(r, "Layout:");
     for (fp, p) in &s.settings.portals {
-        let _ = writeln!(r, "  {}: {:?} edge", s.who(fp).0, p.edge);
+        let window = app.get_webview_window(&portal_label(fp)).and_then(|w| Some((w.outer_position().ok()?, w.outer_size().ok()?)));
+        let window = window.map_or("none".into(), |(at, size)| format!("{},{} {}×{}", at.x, at.y, size.width, size.height));
+        let _ = writeln!(r, "  {}: {:?} edge of {}, {:.2}–{:.2}, overlay window {window}", s.who(fp).0, p.edge, rect(&p.monitor), p.start, p.end);
     }
+    let driven = s.session.as_ref().map_or("no".into(), |(fp, _)| format!("by {} (session loop ran {} ms ago)", s.who(fp).0, kvm::beat_age().as_millis()));
+    let _ = writeln!(r, "Being driven: {driven} · driving another device: {} · cursor lock: {}", yes(DRIVING.load(Ordering::SeqCst)), yes(kvm::LOCKED.load(Ordering::SeqCst)));
+    let _ = writeln!(r, "Start with computer: {}", yes(!s.settings.manual_start));
     if let Some((e, at)) = &*LAST_CROSSING.lock().unwrap() {
         let _ = writeln!(r, "Last crossing error ({} s ago): {e}", at.elapsed().as_secs());
+    }
+    let _ = write!(r, "Log (UTC):\n{}\n", journal::tail(300));
+    r
+}
+
+/// This device's report plus every reachable paired device's, so one copy shows both sides of a problem.
+#[tauri::command]
+async fn diagnostics(app: AppHandle) -> String {
+    let mut r = report(&app);
+    if let Ok(fw) = firewall_status().await {
+        r.insert_str(r.find("Log (UTC)").unwrap_or(r.len()), &format!("Windows Firewall: {fw}\n"));
+    }
+    let others: Vec<(String, String)> = {
+        let state = app.state::<AppState>();
+        let s = state.lock().unwrap();
+        s.settings.paired.iter().filter(|d| s.live_peers().any(|p| p.info.fingerprint == d.fingerprint)).map(|d| (d.fingerprint.clone(), d.alias.clone())).collect()
+    };
+    for (fp, alias) in others {
+        let theirs = async {
+            use tokio::io::AsyncReadExt;
+            let s = open_service(&app, &fp, kvm::Service::Diagnostics).await?;
+            let mut buf = Vec::new();
+            s.take(4 << 20).read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>(String::from_utf8_lossy(&buf).into_owned())
+        };
+        match tokio::time::timeout(Duration::from_secs(8), theirs).await {
+            Ok(Ok(text)) => r.push_str(&format!("\n===== {alias} =====\n{text}")),
+            Ok(Err(e)) => r.push_str(&format!("\n===== {alias}: no report ({e}; LOKA before 0.9.4 doesn't send one) =====\n")),
+            Err(_) => r.push_str(&format!("\n===== {alias}: no report (no answer in 8 s) =====\n")),
+        }
     }
     r
 }
@@ -707,7 +749,7 @@ fn open_overlay(app: &AppHandle, label: &str, to: Option<String>, edge: Edge) ->
     // AppKit window setup belongs on the main thread
     app.run_on_main_thread(move || {
         if let Err(e) = engine.prepare_overlay(&window) {
-            eprintln!("overlay: {e}");
+            journal!("overlay: {e}");
         }
     })?;
 
@@ -801,8 +843,11 @@ impl Drop for EngineSink {
         let to = {
             let state = self.app.state::<AppState>();
             let mut s = state.lock().unwrap();
-            let to = s.session.take().and_then(|(fp, _)| s.addr(&fp, |i| i.transfer_port).map(|a| (a, fp)));
-            to
+            let gone = s.session.take();
+            if let Some((fp, _)) = &gone {
+                journal!("no longer driven by {}", s.who(fp).0);
+            }
+            gone.and_then(|(fp, _)| s.addr(&fp, |i| i.transfer_port).map(|a| (a, fp)))
         };
         refresh_tray(&self.app);
         #[cfg(desktop)]
@@ -877,7 +922,7 @@ pub fn run() {
             match platform::allow_input() {
                 Ok(()) => println!("LOKA can use the mouse and keyboard now."),
                 Err(e) => {
-                    eprintln!("{e}");
+                    journal!("{e}");
                     std::process::exit(1);
                 }
             }
@@ -932,7 +977,9 @@ pub fn run() {
                     })
                     .build(),
             )
-            .plugin(tauri_plugin_updater::Builder::new().build());
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            // started with the computer: straight to the tray (`--autostart`)
+            .plugin(tauri_plugin_autostart::Builder::new().arg("--autostart").build());
     }
     let app = builder
         .plugin(tauri_plugin_notification::init())
@@ -1005,7 +1052,19 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             let data = app.path().app_data_dir()?;
+            journal::init(&data);
+            let autostarted = std::env::args().any(|a| a == "--autostart");
+            journal!("LOKA {} starting on {} {}{}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, if autostarted { ", with the computer" } else { "" });
             let settings = Settings::load(&data);
+            #[cfg(desktop)]
+            {
+                set_autostart(&handle, !settings.manual_start);
+                if autostarted {
+                    if let Some(w) = app.get_webview_window(MAIN_WINDOW) {
+                        let _ = w.hide();
+                    }
+                }
+            }
             let tls = Arc::new(Tls::new(&Identity::load_or_create(&data)));
             let aspect_ratio = app
                 .primary_monitor()?
@@ -1046,6 +1105,7 @@ pub fn run() {
             app.manage(me_tx);
 
             spawn_discovery(handle.clone(), state.clone(), me_rx);
+            spawn_watchdog(handle.clone(), state.clone());
             spawn_transfer_server(&handle, state.clone(), tls.clone())?;
             let h = handle.clone();
             tauri::async_runtime::spawn(async move {
@@ -1054,7 +1114,7 @@ pub fn run() {
                 })
                 .await
                 {
-                    eprintln!("telemetry listener stopped: {e}");
+                    journal!("telemetry listener stopped: {e}");
                 }
             });
 
@@ -1097,6 +1157,9 @@ pub fn run() {
         if let tauri::RunEvent::Opened { urls } = &e {
             receive_outbox(app, urls.iter().filter_map(|u| u.to_file_path().ok()).collect());
         }
+        if let tauri::RunEvent::Exit = e {
+            journal!("LOKA exiting");
+        }
         let _ = (app, e);
     });
 }
@@ -1128,7 +1191,7 @@ fn spawn_discovery(app: AppHandle, state: AppState, me: watch::Receiver<DeviceIn
         })
         .await;
         if let Err(e) = r {
-            eprintln!("discovery stopped: {e}");
+            journal!("discovery stopped: {e}");
         }
     });
 }
@@ -1203,7 +1266,7 @@ fn spawn_transfer_server(app: &AppHandle, state: AppState, tls: Arc<Tls>) -> tau
         })
         .await;
         if let Err(e) = r {
-            eprintln!("transfer server stopped: {e}");
+            journal!("transfer server stopped: {e}");
         }
     });
     Ok(())
@@ -1240,7 +1303,7 @@ fn sync_clipboard(app: AppHandle, to: SocketAddr, fp: String) {
             Some(clip::Outgoing::Image(png)) => {
                 let tls = app.state::<Arc<Tls>>().inner().clone();
                 if let Err(e) = transfer::send_bytes(&tls, to, &fp, transfer::Kind::Image, &png).await {
-                    eprintln!("clipboard picture: {e}");
+                    journal!("clipboard picture: {e}");
                 }
             }
             Some(clip::Outgoing::Files(files)) => {
@@ -1271,7 +1334,7 @@ fn hand_off_drag(app: &AppHandle, engine: &Arc<dyn SpatialPlatformEngine>, state
         let tls = app.state::<Arc<Tls>>().inner().clone();
         // without it the other side just waits for every file
         if let Err(e) = transfer::send_manifest(&tls, to, &fp, batch, &files).await {
-            eprintln!("drag manifest: {e}");
+            journal!("drag manifest: {e}");
         }
         send_files(app, to, fp, files, Some(batch)).await;
     });
@@ -1309,7 +1372,7 @@ fn carry_out(app: &AppHandle, step: carry::Step) {
                 #[cfg(target_os = "linux")]
                 let Ok(w) = w.gtk_window() else { return };
                 if let Err(e) = drag::start_drag(&w, drag::DragItem::Files(files), icon, |_, _| {}, Default::default()) {
-                    eprintln!("drag: {e}");
+                    journal!("drag: {e}");
                 }
             });
         }
@@ -1318,7 +1381,7 @@ fn carry_out(app: &AppHandle, step: carry::Step) {
             let Some(w) = app.get_webview_window(&label) else { return };
             let _ = app.run_on_main_thread(move || {
                 if let Err(e) = carry::stream_drag(&w, batch, files) {
-                    eprintln!("drag: {e}");
+                    journal!("drag: {e}");
                 }
             });
         }
@@ -1330,7 +1393,7 @@ fn carry_out(app: &AppHandle, step: carry::Step) {
                 let dest = (0..1000).map(|i| if i == 0 { dir.join(&name) } else { dir.join(format!("{name} ({i})")) }).find(|p| !p.exists());
                 // shortcut: rename only; cache and received folder on different volumes leave the files in the cache
                 if let Some(Err(e)) = dest.map(|d| std::fs::rename(f, d)) {
-                    eprintln!("saving dragged {name}: {e}");
+                    journal!("saving dragged {name}: {e}");
                 }
             }
             use tauri_plugin_notification::NotificationExt;
@@ -1357,8 +1420,25 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 show_main(app);
                 let _ = app.emit_to(MAIN_WINDOW, "about", ());
             }
-            "disconnect" => kvm::end_sessions(),
-            "quit" => app.exit(0),
+            "disconnect" => {
+                journal!("Disconnect from the tray");
+                kvm::end_sessions()
+            }
+            "quit" => {
+                journal!("quit from the tray");
+                app.exit(0)
+            }
+            "autostart" => {
+                let on = {
+                    let state = app.state::<AppState>();
+                    let mut s = state.lock().unwrap();
+                    s.settings.manual_start = !s.settings.manual_start;
+                    s.settings.save();
+                    !s.settings.manual_start
+                };
+                set_autostart(app, on);
+                refresh_tray(app);
+            }
             id => {
                 if let Some(fp) = id.strip_prefix("control:") {
                     let (app, fp) = (app.clone(), fp.to_string());
@@ -1410,9 +1490,25 @@ fn tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     // so the tray can't be reached and Ctrl+Alt+Esc is the way out
     menu.append(&MenuItem::with_id(app, "disconnect", "Disconnect", busy, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
+    let autostart = !app.state::<AppState>().lock().unwrap().settings.manual_start;
+    menu.append(&tauri::menu::CheckMenuItem::with_id(app, "autostart", "Start with computer", true, autostart, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "about", "About LOKA", true, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "Quit LOKA", true, None::<&str>)?)?;
     Ok(menu)
+}
+
+/// LOKA starts (hidden, in the tray) when the user logs in: on unless they turned it off in the tray.
+#[cfg(desktop)]
+fn set_autostart(app: &AppHandle, on: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let launch = app.autolaunch();
+    if launch.is_enabled().ok() == Some(on) {
+        return;
+    }
+    match if on { launch.enable() } else { launch.disable() } {
+        Ok(()) => journal!("start with computer: {on}"),
+        Err(e) => journal!("start with computer ({on}) failed: {e}"),
+    }
 }
 
 /// Pairings or portals changed: the tray's device list follows.
@@ -1554,13 +1650,18 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                 answer
             }
         };
+        let reporter = app.clone();
         // the phone's whole screen; no band or portal windows
         #[cfg(mobile)]
         let make = move |fp: &str, edge: Edge| {
             let screens = screens(&app);
             let monitor = *screens.first()?;
             let band = Portal { edge, monitor, start: 0.0, end: 1.0, reach: 120.0 };
-            app.state::<AppState>().lock().unwrap().session = Some((fp.to_string(), band));
+            let state = app.state::<AppState>();
+            let mut s = state.lock().unwrap();
+            journal!("driven by {}, entering at the {edge:?} edge", s.who(fp).0);
+            s.session = Some((fp.to_string(), band));
+            drop(s);
             engine.show_cursor(true);
             Some(EngineSink { engine: engine.clone(), screens, app: app.clone() })
         };
@@ -1576,6 +1677,7 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                 let state = app.state::<AppState>();
                 let mut s = state.lock().unwrap();
                 s.session = Some((fp.to_string(), band));
+                journal!("driven by {}, entering at the {edge:?} edge of {screens:?}", s.who(fp).0);
                 s.settings.portals.contains_key(fp)
             };
             // no way to the driver yet: it goes on the entry edge, editable in the layout
@@ -1599,13 +1701,23 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                     kvm::Service::Sound => cfg!(desktop) && sh.sound,
                     kvm::Service::Notifications => sh.notifications,
                     kvm::Service::Mic => cfg!(desktop) && sh.mic,
+                    kvm::Service::Diagnostics => true,
                 }
         };
         let st = state.clone();
-        let on_service = move |service: kvm::Service, _fp: String, stream: secure::Stream| {
+        let on_service = move |service: kvm::Service, _fp: String, mut stream: secure::Stream| {
             let folder = st.lock().unwrap().settings.sharing.folder.clone();
+            let reporter = reporter.clone();
             tauri::async_runtime::spawn(async move {
                 let r = match service {
+                    kvm::Service::Diagnostics => {
+                        use tokio::io::AsyncWriteExt;
+                        let text = report(&reporter);
+                        match stream.write_all(text.as_bytes()).await {
+                            Ok(()) => stream.shutdown().await,
+                            Err(e) => Err(e),
+                        }
+                    }
                     #[cfg(desktop)]
                     kvm::Service::Shell => shell::serve(stream).await,
                     #[cfg(desktop)]
@@ -1622,12 +1734,12 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
                     kvm::Service::Notifications => notify::serve(stream).await,
                 };
                 if let Err(e) = r {
-                    eprintln!("{service:?}: {e}");
+                    journal!("{service:?}: {e}");
                 }
             });
         };
         if let Err(e) = kvm::serve(tls, PORTS.2, allow, ask, allow_service, on_service, on_place, make).await {
-            eprintln!("kvm receiver stopped: {e}");
+            journal!("kvm receiver stopped: {e}");
         }
     });
 }
@@ -1670,8 +1782,14 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
     let (app, engine) = (app.clone(), app.state::<Arc<dyn SpatialPlatformEngine>>().inner().clone());
     tauri::async_runtime::spawn(async move {
         let _ = app.emit("kvm", serde_json::json!({ "active": true, "y": y, "device": fp }));
+        let alias = app.state::<AppState>().lock().unwrap().who(&fp).0;
+        journal!("crossing to {alias} ({to}) at {y:.2} along its {:?} portal{}", portal.edge, if drag.is_some() { ", carrying a file drag" } else { "" });
         let tls = app.state::<Arc<Tls>>().inner().clone();
         let r = kvm::send_session(&tls, engine, to, &fp, portal, y, tune, drag).await;
+        match &r {
+            Ok(_) => journal!("back from {alias}"),
+            Err(e) => journal!("session with {alias} ended: {e} ({:?})", e.kind()),
+        }
         if let Ok(Some(batch)) = r {
             hold_drag(&app, &label, batch); // a drag came back with the cursor
         }
@@ -1695,6 +1813,86 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
 /// The last crossing that failed and when, for `diagnostics`.
 static LAST_CROSSING: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
 
+/// Every 2 s: logs what changed (devices heard, screens, cursor lock), follows screen changes with the
+/// portals, and clears a driven session whose loop stopped running, so a stuck one can't hold the cursor.
+fn spawn_watchdog(app: AppHandle, state: AppState) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        let (mut heard, mut shown, mut lock) = (HashMap::<String, (String, IpAddr)>::new(), Vec::<Rect>::new(), false);
+        loop {
+            tick.tick().await;
+            if kvm::beat_age() > Duration::from_secs(10) {
+                let gone = state.lock().unwrap().session.take();
+                if let Some((fp, _)) = gone {
+                    journal!("watchdog: cleared the session driven by {}: its loop hasn't run for {} s", state.lock().unwrap().who(&fp).0, kvm::beat_age().as_secs());
+                    kvm::end_sessions();
+                    if let Some(engine) = app.try_state::<Arc<dyn SpatialPlatformEngine>>() {
+                        engine.show_cursor(false);
+                    }
+                    if let Some(w) = app.get_webview_window(BAND) {
+                        let _ = w.hide();
+                    }
+                    refresh_tray(&app);
+                }
+            }
+            let now: HashMap<String, (String, IpAddr)> = state.lock().unwrap().live_peers().map(|p| (p.info.fingerprint.clone(), (p.info.alias.clone(), p.addr))).collect();
+            for (fp, (alias, addr)) in &now {
+                if heard.get(fp).is_none_or(|(_, a)| a != addr) {
+                    journal!("heard {alias} at {addr}");
+                }
+            }
+            for (fp, (alias, _)) in &heard {
+                if !now.contains_key(fp) {
+                    journal!("lost {alias}: not heard for {} s", discovery::STALE.as_secs());
+                }
+            }
+            heard = now;
+            if kvm::LOCKED.load(Ordering::SeqCst) != lock {
+                lock = !lock;
+                journal!("cursor lock {}", if lock { "on" } else { "off" });
+            }
+            #[cfg(desktop)]
+            {
+                let screens = screens(&app);
+                if screens.is_empty() || screens == shown {
+                    continue;
+                }
+                journal!("screens: {screens:?}");
+                shown = screens.clone();
+                let (moved, lost): (Vec<(String, String, Portal)>, Vec<String>) = {
+                    let mut s = state.lock().unwrap();
+                    let moved: Vec<(String, Portal)> = s
+                        .settings
+                        .portals
+                        .iter_mut()
+                        .filter_map(|(fp, p)| {
+                            p.monitor = platform::refit(p.monitor, &screens)?;
+                            Some((fp.clone(), *p))
+                        })
+                        .collect();
+                    if !moved.is_empty() {
+                        s.settings.save();
+                    }
+                    let lost = s.settings.portals.iter().filter(|(_, p)| !screens.contains(&p.monitor)).map(|(fp, _)| s.who(fp).0).collect();
+                    (moved.into_iter().map(|(fp, p)| (s.who(&fp).0, fp, p)).collect(), lost)
+                };
+                for (alias, fp, p) in &moved {
+                    journal!("portal to {alias} follows its screen: now {:?}", p.monitor);
+                    let _ = place_overlay(&app, &portal_label(fp), p);
+                }
+                for alias in lost {
+                    journal!("portal to {alias} is on a screen that isn't there now: it works again once that screen is back, or place it again");
+                }
+                if !moved.is_empty() {
+                    let _ = app.emit("device", ());
+                }
+            }
+            #[cfg(mobile)]
+            let _ = &mut shown;
+        }
+    });
+}
+
 /// The reason a crossing failed, as a notification: the main window showing it is usually hidden.
 /// The same reason again within 30 s stays quiet (the cursor keeps pushing the edge).
 fn crossing_failed(app: &AppHandle, error: String) {
@@ -1703,6 +1901,7 @@ fn crossing_failed(app: &AppHandle, error: String) {
     if last.as_ref().is_some_and(|(e, at)| *e == error && at.elapsed() < Duration::from_secs(30)) {
         return;
     }
+    journal!("couldn't cross: {error}");
     let _ = app.notification().builder().title("LOKA couldn't move over").body(&error).show();
     *last = Some((error, std::time::Instant::now()));
 }
@@ -1720,6 +1919,8 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
     let (mut lock_key, mut shown_lock, mut resting) = (false, false, None::<std::time::Instant>);
     // overlay the cursor is near (its `hover` events)
     let mut hovering = None::<String>;
+    // why the cursor at an edge doesn't cross (device, reason), logged once each time it changes
+    let mut stuck = None::<(String, &str)>;
     loop {
         tick.tick().await;
         let (doors, prefs) = {
@@ -1731,7 +1932,7 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
                     .settings
                     .portals
                     .iter()
-                    .filter(|(fp, _)| s.paired_peer(fp).is_some())
+                    .filter(|(fp, _)| s.settings.is_paired(fp))
                     .map(|(fp, p)| Door { label: portal_label(fp), fp: fp.clone(), portal: *p, band: false })
                     .collect(),
             };
@@ -1767,7 +1968,31 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
         }
         let hit = doors.iter().find_map(|d| d.portal.sample(c.x, c.y).map(|(y, p)| (d, y, p)));
         // within a pixel: a Mac reports points, so ×2 on Retina its cursor can stop a pixel short of the right/bottom edge
-        let on_edge = hit.is_some_and(|(d, _, p)| (1.0 - p as f64) * d.portal.reach < 1.5) && !locked;
+        let at_edge = hit.is_some_and(|(d, _, p)| (1.0 - p as f64) * d.portal.reach < 1.5);
+        let on_edge = at_edge && !locked;
+        let why = hit.filter(|_| at_edge).and_then(|(d, ..)| {
+            let reason = if d.band {
+                "the way back while it drives this computer: not crossing from here"
+            } else if locked {
+                "not crossing: cursor lock is on (Scroll Lock / F14)"
+            } else if c.button_down && state.lock().unwrap().hover.is_none() {
+                "not crossing: a button is held (crosses with the button up, or with a file drag)"
+            } else {
+                return None;
+            };
+            Some((d.fp.clone(), reason))
+        });
+        if why != stuck {
+            if let Some((fp, reason)) = &why {
+                let (alias, driven) = {
+                    let s = state.lock().unwrap();
+                    (s.who(fp).0, s.session.is_some())
+                };
+                let beat = if driven { format!(" (session loop ran {} ms ago)", kvm::beat_age().as_millis()) } else { String::new() };
+                journal!("cursor at {alias}'s edge, {reason}{beat}");
+            }
+            stuck = why;
+        }
         if let (true, Some((door, y, _))) = (on_edge, hit) {
             // a file drag pushed against the edge goes over with the cursor, or back with it (band)
             let mut drag = None;
@@ -1787,7 +2012,6 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
                 if drag.is_some() || since.elapsed() >= Duration::from_millis(prefs.edge_delay_ms.into()) {
                     resting = None;
                     if let Err(e) = start_session(&app, door.label.clone(), door.fp.clone(), door.portal, y, drag) {
-                        eprintln!("crossing: {e}");
                         if !DRIVING.load(Ordering::SeqCst) {
                             crossing_failed(&app, e.to_string());
                         }

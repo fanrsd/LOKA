@@ -180,7 +180,7 @@ impl SpatialPlatformEngine for LinuxEngine {
             }
         });
         if let Err(e) = r {
-            eprintln!("uinput: {e}");
+            journal!("uinput: {e}");
         }
     }
 

@@ -59,6 +59,8 @@ pub fn run() {
 async fn serve() {
     let data = data_dir();
     let _ = std::fs::create_dir_all(&data);
+    crate::journal::init(&data);
+    journal!("LOKA {} starting headless", env!("CARGO_PKG_VERSION"));
     let settings = Arc::new(Mutex::new(Settings::load(&data)));
     let tls = Arc::new(Tls::new(&Identity::load_or_create(&data)));
     let me = DeviceInfo {
@@ -89,7 +91,7 @@ async fn serve() {
     tauri::async_runtime::spawn(async move {
         let hosts = move || st.lock().unwrap().hosts.clone();
         if let Err(e) = discovery::run(me_rx, hosts, move |peer| drop(p.lock().unwrap().insert(peer.info.fingerprint.clone(), peer))).await {
-            eprintln!("discovery stopped: {e}");
+            journal!("discovery stopped: {e}");
         }
     });
 
@@ -142,6 +144,7 @@ async fn serve() {
         Some(Sink { engine: engine.clone(), alias })
     };
     // shortcut: no services (terminal, files, sound) and no file transfers without a desktop; add them if servers need them.
+    // Only its log goes to a paired device, for that device's diagnostics.
     // Never drives, so a placement needs nothing here; an unpair is forgotten on this side too.
     let st = settings.clone();
     let on_place = move |fp: &str, l: kvm::Layout| {
@@ -150,7 +153,18 @@ async fn serve() {
         }
         true
     };
-    if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, |_, _| false, |_, _, _| {}, on_place, make).await {
-        eprintln!("LOKA stopped: {e}");
+    let st = settings.clone();
+    let allow_service = move |s: kvm::Service, fp: &str| s == kvm::Service::Diagnostics && st.lock().unwrap().is_paired(fp);
+    let on_service = |_: kvm::Service, _: String, mut stream: crate::network::secure::Stream| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let text = format!("LOKA {} headless · {}\nLog (UTC):\n{}\n", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, crate::journal::tail(300));
+            if stream.write_all(text.as_bytes()).await.is_ok() {
+                let _ = stream.shutdown().await;
+            }
+        });
+    };
+    if let Err(e) = kvm::serve(tls, kvm::PORT, allow, ask, allow_service, on_service, on_place, make).await {
+        journal!("LOKA stopped: {e}");
     }
 }

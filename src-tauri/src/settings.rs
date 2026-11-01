@@ -50,6 +50,8 @@ pub struct Settings {
     pub received: Option<PathBuf>,
     /// Paired devices' hardware addresses as they announced them, to wake them up (Wake-on-LAN).
     pub macs: HashMap<String, String>,
+    /// The user turned "Start with computer" off (desktop; on by default).
+    pub manual_start: bool,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -81,7 +83,7 @@ impl Settings {
             std::fs::write(&self.path, serde_json::to_vec_pretty(self)?)
         };
         if let Err(e) = write() {
-            eprintln!("saving settings failed: {e}");
+            journal!("saving settings failed: {e}");
         }
     }
 

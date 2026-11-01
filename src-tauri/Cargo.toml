@@ -1,6 +1,6 @@
 [package]
 name = "loka"
-version = "0.9.3"
+version = "0.9.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/fanrsd/LOKA"
@@ -62,3 +62,4 @@ dav-server = "0.11.0"
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 tauri-plugin-updater = "2.14.1"
+tauri-plugin-autostart = "2"
