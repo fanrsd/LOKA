@@ -1,4 +1,4 @@
-use super::{Captured, CursorSample, Injected, InputEvent, SpatialPlatformEngine};
+use super::{Captured, CursorSample, Injected, InputEvent, SpatialPlatformEngine, Typed};
 use std::{
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
@@ -15,14 +15,15 @@ use windows_sys::Win32::{
     UI::{
         Accessibility::MOUSEKEYS,
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, SendInput, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-            KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
-            VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_MENU, VK_SCROLL,
+            GetAsyncKeyState, GetKeyState, GetKeyboardLayout, MapVirtualKeyExW, SendInput, ToUnicodeEx, VkKeyScanExW, INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+            KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VSC_TO_VK_EX, MOUSEEVENTF_ABSOLUTE,
+            MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
+            VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_MENU, VK_SCROLL, VK_SHIFT, VK_SPACE,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, CreateCursor, GetCursorPos, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, PeekMessageW,
+            CallNextHookEx, CreateCursor, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
+            GetWindowThreadProcessId, PeekMessageW,
             PostThreadMessageW, SetCursorPos, SetSystemCursor, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, SystemParametersInfoW,
             UnhookWindowsHookEx, GWL_EXSTYLE, MKF_AVAILABLE, MKF_MOUSEKEYSON, SM_MOUSEPRESENT, SPIF_SENDCHANGE, SPI_GETMOUSEKEYS,
             SPI_SETCURSORS, SPI_SETMOUSEKEYS,
@@ -37,6 +38,22 @@ use windows_sys::Win32::{
 
 /// Marks events we inject so our own hooks let them through.
 const TAG: usize = 0x4C4F_4B41; // "LOKA"
+
+/// Every injected key goes out one at a time from this thread. The Windows 11 Notepad (WinUI) reads the modifier
+/// state late: Shift sent in the same burst as its letter is lost, and fast VK_PACKETs garble (12-15 ms per event
+/// measured clean), so typed text is paced; plain key frames aren't, they just keep their place in line.
+static TYPIST: std::sync::LazyLock<std::sync::mpsc::Sender<(INPUT, bool)>> = std::sync::LazyLock::new(|| {
+    let (tx, rx) = std::sync::mpsc::channel::<(INPUT, bool)>();
+    std::thread::spawn(move || {
+        for (input, paced) in rx {
+            unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+            if paced {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+        }
+    });
+    tx
+});
 
 struct Capture {
     out: UnboundedSender<Captured>,
@@ -176,6 +193,41 @@ impl SpatialPlatformEngine for WindowsEngine {
         let mut input: INPUT = unsafe { zeroed() };
         unsafe {
             match event {
+                Injected::Text { text } => {
+                    // characters on the active layout go as real keys (+ Shift/Ctrl/Alt): the Windows 11 Notepad
+                    // garbles fast KEYEVENTF_UNICODE (VK_PACKET) bursts; anything else as UTF-16 units
+                    let hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), null_mut()));
+                    let caps = GetKeyState(VK_CAPITAL as i32) & 1 != 0;
+                    let ki = |vk: u16, scan: u16, flags: u32| {
+                        let mut i: INPUT = zeroed();
+                        i.r#type = INPUT_KEYBOARD;
+                        i.Anonymous.ki = KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: TAG };
+                        i
+                    };
+                    let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
+                    for unit in text.encode_utf16() {
+                        let r = VkKeyScanExW(unit, hkl);
+                        if r == -1 {
+                            inputs.extend([ki(0, unit, KEYEVENTF_UNICODE), ki(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]);
+                            continue;
+                        }
+                        let vk = (r & 0xFF) as u16;
+                        let mut mods = (r >> 8) as u8;
+                        if caps && (b'A' as u16..=b'Z' as u16).contains(&vk) {
+                            mods ^= 1; // Caps Lock already flips letters
+                        }
+                        let held: Vec<u16> = [(1, VK_SHIFT), (2, VK_CONTROL), (4, VK_MENU)].into_iter().filter(|(bit, _)| mods & bit != 0).map(|(_, k)| k).collect();
+                        inputs.extend(held.iter().map(|&m| ki(m, 0, 0)));
+                        let scan = MapVirtualKeyExW(vk as u32, 0, hkl) as u16; // MAPVK_VK_TO_VSC
+                        inputs.extend([ki(vk, scan, 0), ki(vk, scan, KEYEVENTF_KEYUP)]);
+                        inputs.extend(held.iter().rev().map(|&m| ki(m, 0, KEYEVENTF_KEYUP)));
+                    }
+                    let typist = &*TYPIST;
+                    for i in inputs {
+                        let _ = typist.send((i, true));
+                    }
+                    return;
+                }
                 Injected::Key { scan, down } => {
                     input.r#type = INPUT_KEYBOARD;
                     let ki = &mut input.Anonymous.ki;
@@ -184,6 +236,9 @@ impl SpatialPlatformEngine for WindowsEngine {
                         | if scan & 0xFF00 == 0xE000 { KEYEVENTF_EXTENDEDKEY } else { 0 }
                         | if down { 0 } else { KEYEVENTF_KEYUP };
                     ki.dwExtraInfo = TAG;
+                    // behind any text still being typed, so Enter never overtakes it
+                    let _ = TYPIST.send((input, false));
+                    return;
                 }
                 _ => {
                     input.r#type = INPUT_MOUSE;
@@ -226,7 +281,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                             mi.dwFlags = MOUSEEVENTF_WHEEL;
                             mi.mouseData = dy as _;
                         }
-                        Injected::Key { .. } => unreachable!(),
+                        Injected::Key { .. } | Injected::Text { .. } => unreachable!(),
                     }
                 }
             }
@@ -379,4 +434,50 @@ unsafe extern "system" fn key_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         }
     }
     CallNextHookEx(null_mut(), code, w, l)
+}
+
+/// What a key-down types with the foreground app's keyboard layout (`kvm::Tune::typed`; `alt` = AltGr).
+/// A dead key is kept here and pressed again right before the next key, in the same call, so the two
+/// compose whichever thread asks: ToUnicodeEx's dead-key state lives in the OS, not with us.
+pub fn key_text(scan: u16, shift: bool, alt: bool, caps: bool) -> Typed {
+    static DEAD: Mutex<Option<(u32, u32, [u8; 256])>> = Mutex::new(None);
+    unsafe {
+        let hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), null_mut()));
+        let vk = MapVirtualKeyExW(scan as u32, MAPVK_VSC_TO_VK_EX, hkl);
+        if vk == 0 {
+            return Typed::Key;
+        }
+        let mut state = [0u8; 256];
+        for (on, key, bit) in [(shift, VK_SHIFT, 0x80), (alt, VK_CONTROL, 0x80), (alt, VK_MENU, 0x80), (caps, VK_CAPITAL, 1)] {
+            if on {
+                state[key as usize] = bit;
+            }
+        }
+        let (sc, mut buf) = ((scan & 0xFF) as u32, [0u16; 8]);
+        let mut dead = DEAD.lock().unwrap();
+        let n = match dead.take() {
+            Some(d) => {
+                ToUnicodeEx(d.0, d.1, d.2.as_ptr(), buf.as_mut_ptr(), 8, 0, hkl);
+                let n = ToUnicodeEx(vk, sc, state.as_ptr(), buf.as_mut_ptr(), 8, 0, hkl);
+                if n <= 0 {
+                    // whatever is still pending in the OS goes out with a space, unused
+                    ToUnicodeEx(VK_SPACE as u32, 0x39, [0u8; 256].as_ptr(), [0u16; 8].as_mut_ptr(), 8, 0, hkl);
+                    if n == 0 {
+                        *dead = Some(d); // not a character: the dead key still waits for one
+                    }
+                }
+                n
+            }
+            None => ToUnicodeEx(vk, sc, state.as_ptr(), buf.as_mut_ptr(), 8, 4, hkl), // 4: OS dead-key state untouched
+        };
+        if n < 0 {
+            *dead = Some((vk, sc, state));
+            return Typed::Nothing;
+        }
+        let text = String::from_utf16_lossy(&buf[..n as usize]);
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return Typed::Key; // Enter, Tab, Backspace, Esc are control characters
+        }
+        Typed::Text(text)
+    }
 }

@@ -71,6 +71,8 @@ pub fn start(app: &AppHandle, state: &AppState) -> tauri::Result<()> {
             kvm_port: KVM_PORT,
             proto: kvm::PROTOCOL,
             mac: None,
+            controllable: true,
+            text: true,
         },
         addr: Ipv4Addr::LOCALHOST.into(),
         seen: Instant::now(),

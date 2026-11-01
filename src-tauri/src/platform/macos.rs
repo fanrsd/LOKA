@@ -1,10 +1,10 @@
-use super::{Captured, CursorSample, Gesture, Injected, InputEvent, SpatialPlatformEngine};
+use super::{Captured, CursorSample, Gesture, Injected, InputEvent, SpatialPlatformEngine, Typed};
 use objc2_app_kit::{NSMainMenuWindowLevel, NSWindow, NSWindowCollectionBehavior};
 use std::{
     ffi::c_void,
     ptr::{null, null_mut},
     sync::{
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
         Mutex,
     },
 };
@@ -110,6 +110,7 @@ extern "C" {
     fn CGWarpMouseCursorPosition(p: CGPoint) -> i32;
     fn CGEventCreateMouseEvent(source: *const c_void, ty: u32, p: CGPoint, button: u32) -> Ref;
     fn CGEventCreateKeyboardEvent(source: *const c_void, key: u16, down: bool) -> Ref;
+    fn CGEventKeyboardSetUnicodeString(event: Ref, len: usize, chars: *const u16);
     fn CGEventCreateScrollWheelEvent(source: *const c_void, units: u32, count: u32, wheel1: i32, ...) -> Ref;
     fn CGEventPost(tap: u32, event: Ref);
     fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
@@ -133,11 +134,26 @@ extern "C" {
     static kCFTypeDictionaryKeyCallBacks: c_void;
     static kCFTypeDictionaryValueCallBacks: c_void;
     fn CFDictionaryCreate(alloc: *const c_void, keys: *const *const c_void, values: *const *const c_void, n: isize, key_cb: *const c_void, value_cb: *const c_void) -> Ref;
+    fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
 }
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     static kAXTrustedCheckOptionPrompt: *const c_void;
     fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    fn AXIsProcessTrusted() -> bool;
+}
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn TISCopyCurrentKeyboardLayoutInputSource() -> Ref;
+    fn TISGetInputSourceProperty(source: Ref, key: *const c_void) -> *const c_void;
+    static kTISPropertyUnicodeKeyLayoutData: *const c_void;
+    fn LMGetKbdType() -> u8;
+    fn UCKeyTranslate(layout: *const c_void, code: u16, action: u16, modifiers: u32, keyboard: u32, options: u32, dead: *mut u32, max: usize, len: *mut usize, chars: *mut u16) -> i32;
+}
+// libdispatch (libSystem): the text input APIs must run on the main thread (macOS 14 asserts it)
+extern "C" {
+    static _dispatch_main_q: c_void;
+    fn dispatch_sync_f(queue: *const c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
 }
 
 /// Main (event tap) and Client (CGEventPost, silently dropped otherwise) both need Accessibility.
@@ -263,7 +279,23 @@ static INJECTION: Mutex<Injection> = Mutex::new(Injection { at: CGPoint { x: 0.0
 
 pub struct MacEngine;
 
+/// About → Allow: the system prompt (adds LOKA to the list), then the Accessibility pane itself; after an update
+/// the ad-hoc signature changes and the old entry stops counting, so the pane is where it gets switched on again.
+pub fn allow_input() -> Result<(), String> {
+    ask_accessibility();
+    std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        .status()
+        .map(drop)
+        .map_err(|e| format!("Couldn't open System Settings: {e}"))
+}
+
 impl SpatialPlatformEngine for MacEngine {
+    /// Without Accessibility, CGEventPost is dropped silently: the cursor would cross and do nothing.
+    fn can_inject(&self) -> bool {
+        unsafe { AXIsProcessTrusted() }
+    }
+
     fn prepare_overlay(&self, window: &WebviewWindow) -> tauri::Result<()> {
         let ns = window.ns_window()? as *const NSWindow;
         // SAFETY: called from the setup hook (main thread); tauri keeps the NSWindow alive.
@@ -385,6 +417,23 @@ impl SpatialPlatformEngine for MacEngine {
                     }
                     CGEventCreateKeyboardEvent(null(), code, down)
                 }
+                Injected::Text { text } => {
+                    // the string rides on a key event (macOS reads at most 20 units of it), no modifiers
+                    let units: Vec<u16> = text.encode_utf16().collect();
+                    for chunk in units.chunks(20) {
+                        for down in [true, false] {
+                            let ev = CGEventCreateKeyboardEvent(null(), 0, down);
+                            if ev.is_null() {
+                                return;
+                            }
+                            CGEventKeyboardSetUnicodeString(ev, chunk.len(), chunk.as_ptr());
+                            CGEventSetFlags(ev, 0);
+                            CGEventPost(HID_TAP, ev);
+                            CFRelease(ev);
+                        }
+                    }
+                    return;
+                }
             };
             if ev.is_null() {
                 return;
@@ -398,6 +447,50 @@ impl SpatialPlatformEngine for MacEngine {
     fn lock_key_down(&self) -> bool {
         unsafe { CGEventSourceKeyState(COMBINED_SESSION_STATE, 0x6B) } // F14
     }
+}
+
+/// What a key-down types with the current keyboard layout (`kvm::Tune::typed`; `alt` = Option). A dead key
+/// (Option+E, ^ …) leaves its state here and composes with the next key.
+pub fn key_text(scan: u16, shift: bool, alt: bool, caps: bool) -> Typed {
+    struct Ask {
+        code: u16,
+        modifiers: u32,
+        out: Typed,
+    }
+    extern "C" fn on_main(ctx: *mut c_void) {
+        static DEAD: AtomicU32 = AtomicU32::new(0);
+        let ask = unsafe { &mut *(ctx as *mut Ask) };
+        unsafe {
+            let source = TISCopyCurrentKeyboardLayoutInputSource();
+            if source.is_null() {
+                return;
+            }
+            let data = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData);
+            let (mut dead, mut len, mut buf) = (DEAD.load(Ordering::Relaxed), 0usize, [0u16; 8]);
+            // 0: kUCKeyActionDown; options 0: dead keys on
+            let ok = !data.is_null()
+                && UCKeyTranslate(CFDataGetBytePtr(data).cast(), ask.code, 0, ask.modifiers, LMGetKbdType() as u32, 0, &mut dead, 8, &mut len, buf.as_mut_ptr()) == 0;
+            CFRelease(source);
+            if !ok {
+                return;
+            }
+            DEAD.store(dead, Ordering::Relaxed);
+            let text = String::from_utf16_lossy(&buf[..len.min(8)]);
+            ask.out = match text {
+                _ if len == 0 && dead != 0 => Typed::Nothing,
+                // arrows and F-keys come out as control or private-use characters
+                t if t.is_empty() || t.chars().any(|c| c.is_control() || ('\u{F700}'..='\u{F8FF}').contains(&c)) => Typed::Key,
+                t => Typed::Text(t),
+            };
+        }
+    }
+    let Some(code) = mac_key(scan) else { return Typed::Key };
+    // Carbon modifier bits >> 8: shift 2, caps lock 4, option 8
+    let modifiers = (shift as u32) << 1 | (caps as u32) << 2 | (alt as u32) << 3;
+    let mut ask = Ask { code, modifiers, out: Typed::Key };
+    // never called on the main thread itself (a session task), which would deadlock
+    unsafe { dispatch_sync_f(std::ptr::addr_of!(_dispatch_main_q), (&mut ask as *mut Ask).cast(), on_main) };
+    ask.out
 }
 
 unsafe extern "C" fn tap_callback(_proxy: Ref, ty: u32, event: Ref, _info: Ref) -> Ref {

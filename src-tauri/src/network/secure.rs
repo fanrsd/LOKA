@@ -39,6 +39,8 @@ const ALPN: &[u8] = b"loka/2";
 /// A peer that sent nothing (not even a keep-alive) for this long is gone.
 const IDLE: Duration = Duration::from_secs(3);
 const KEEP_ALIVE: Duration = Duration::from_secs(1);
+/// Another certificate answered where a paired device was expected (reinstalled, or the address moved on).
+pub const WRONG_DEVICE: &str = "another device answered at that address";
 
 type Acked = Pin<Box<dyn Future<Output = Result<Option<VarInt>, StoppedError>> + Send + Sync>>;
 
@@ -249,25 +251,36 @@ impl Tls {
         Ok(e.insert(ep).clone())
     }
 
-    /// A new stream to `to`; with `expect`, only if the device there is that fingerprint. The peer sees
-    /// the stream once something is written on it.
-    pub async fn connect(&self, to: SocketAddr, expect: Option<&str>) -> io::Result<(Stream, String)> {
+    /// The connection to `to` (reused while alive); with `expect`, only if the device there is that
+    /// fingerprint. A handshake that never completes fails as `HostUnreachable` (the device was never
+    /// reached), unlike `TimedOut` later (it went silent); the wrong device there fails with `WRONG_DEVICE`.
+    async fn link(&self, to: SocketAddr, expect: Option<&str>) -> io::Result<(Connection, String)> {
         let cached = self.links.lock().unwrap().get(&to).filter(|(c, fp)| c.close_reason().is_none() && expect.is_none_or(|e| e == fp)).cloned();
-        let (conn, fp) = match cached {
-            Some(link) => link,
-            None => {
-                // a host that never answers fails the handshake after IDLE
-                let conn = self.endpoint()?.connect(to, "loka").map_err(io::Error::other)?.await?;
-                let fp = peer_fp(&conn);
-                if expect.is_some_and(|e| e != fp) {
-                    conn.close(0u32.into(), b"");
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "another device answered at that address"));
-                }
-                self.links.lock().unwrap().insert(to, (conn.clone(), fp.clone()));
-                (conn, fp)
-            }
-        };
+        if let Some(link) = cached {
+            return Ok(link);
+        }
+        // a host that never answers fails the handshake after IDLE
+        let unreachable = io::ErrorKind::HostUnreachable;
+        let conn = self.endpoint()?.connect(to, "loka").map_err(|e| io::Error::new(unreachable, e))?.await.map_err(|e| io::Error::new(unreachable, e))?;
+        let fp = peer_fp(&conn);
+        if expect.is_some_and(|e| e != fp) {
+            conn.close(0u32.into(), b"");
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, WRONG_DEVICE));
+        }
+        self.links.lock().unwrap().insert(to, (conn.clone(), fp.clone()));
+        Ok((conn, fp))
+    }
+
+    /// A new stream to `to`; with `expect`, only if the device there is that fingerprint (errors: `link`).
+    /// The peer sees the stream once something is written on it.
+    pub async fn connect(&self, to: SocketAddr, expect: Option<&str>) -> io::Result<(Stream, String)> {
+        let (conn, fp) = self.link(to, expect).await?;
         Ok((Stream::new(conn.open_bi().await?), fp))
+    }
+
+    /// Round-trip time to device `expect` at `to`, connecting first if needed (keep-alives keep it fresh).
+    pub async fn rtt(&self, to: SocketAddr, expect: &str) -> io::Result<Duration> {
+        Ok(self.link(to, Some(expect)).await?.0.rtt())
     }
 
     /// Accept streams on UDP `port`. Handshakes and each connection's streams are handled in their own
@@ -347,6 +360,8 @@ mod tests {
 
         // b is paired as "the device at addr": a connection expecting c there fails
         assert_eq!(a.connect(addr, Some(&c.me)).await.map(|_| ()).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        // nothing answers there: never reached, not "went silent"
+        assert_eq!(a.connect(([127, 0, 0, 1], 53376).into(), None).await.map(|_| ()).unwrap_err().kind(), io::ErrorKind::HostUnreachable);
 
         // a sender that drops everything (its last connection handle too) right after shutdown loses nothing
         let big = vec![7u8; 3 << 20];

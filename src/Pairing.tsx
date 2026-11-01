@@ -4,8 +4,10 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Face } from "./Face";
 import type { Portal } from "./calibration";
 
-/** `proto`: wire version (`kvm::PROTOCOL`); devices with another one can't pair or connect. `aspectRatio`: its screen's width / height. */
-export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string; proto: number; aspectRatio: number };
+/** `proto`: wire version (`kvm::PROTOCOL`); devices with another one can't pair or connect. `aspectRatio`: its screen's width / height.
+ *  `controllable`: whether it can be driven right now (false: an Android phone not set up, a Linux without input access; absent on older LOKA = yes).
+ *  `text`: it takes typed text whatever its keyboard layout (absent on older LOKA). */
+export type DeviceInfo = { alias: string; deviceType: "desktop" | "mobile"; os: string; fingerprint: string; proto: number; aspectRatio: number; controllable?: boolean; text?: boolean };
 export type Peer = { info: DeviceInfo; addr: string };
 export type PairedDevice = { fingerprint: string; alias: string };
 export type CursorPrefs = { speed: number; edgeDelayMs: number; swapCtrlCmd: boolean };
@@ -24,6 +26,97 @@ export type Device = {
 
 const OS_LABEL: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux", android: "Android", ios: "iOS", sim: "Simulator" };
 export const osLabel = (os: string) => OS_LABEL[os] ?? os;
+
+/** How to make a device drivable, per OS (`controllable: false`). */
+export const setupHow = (os: string) =>
+  os === "android"
+    ? "On the phone: open LOKA → Set up"
+    : os === "linux"
+      ? "On it: About → Allow input access, or run sudo loka --allow-input"
+      : os === "macos"
+        ? "On the Mac: LOKA → About → Allow Accessibility (again after each LOKA update)"
+        : "Open LOKA there and follow its setup";
+
+export type DeviceState = "ready" | "setup" | "offline" | "update";
+
+/** Whether a device can be driven right now: the one check behind every badge, note and overlay. `peer` absent = not on the network;
+ *  setup only matters once paired. */
+export const deviceState = (peer: Peer | undefined, paired: boolean, me: DeviceInfo): DeviceState =>
+  !peer ? "offline" : peer.info.proto !== me.proto ? "update" : paired && peer.info.controllable === false ? "setup" : "ready";
+
+export const STATE_LABEL: Record<DeviceState, string> = { ready: "Ready", setup: "Needs setup", offline: "Offline", update: "Needs update" };
+
+/** One line: why `alias` can't be driven and the fix (`os` for setup); `null` when ready. */
+export const stateReason = (state: DeviceState, alias: string, os = "") =>
+  state === "setup"
+    ? `${alias} isn't ready. ${setupHow(os)}`
+    : state === "update"
+      ? `${alias} needs a LOKA update: install the newest LOKA on both devices`
+      : state === "offline"
+        ? `${alias} isn't on the network: turn it on and open LOKA there`
+        : null;
+
+/** Pill naming a blocked state (danger) or offline (muted); `dot` for cramped spots, labelled for screen readers and on hover. */
+export function StateBadge({ state, title, dot }: { state: DeviceState; title?: string | null; dot?: boolean }) {
+  if (state === "ready") return null;
+  const off = state === "offline";
+  if (dot)
+    return <span role="img" aria-label={STATE_LABEL[state]} title={title ?? STATE_LABEL[state]} className={`block h-2.5 w-2.5 rounded-full ring-2 ring-raised ${off ? "bg-muted" : "bg-danger"}`} />;
+  return <span className={`whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-semibold ${off ? "bg-white/10 text-muted" : "bg-danger/15 text-danger"}`}>{STATE_LABEL[state]}</span>;
+}
+
+/** The selected device's state spelled out: badge, reason + fix, and Wake up when it's offline and wakeable. */
+export function StateNote({ state, alias, os, onWake }: { state: DeviceState; alias: string; os?: string; onWake?: () => void }) {
+  const reason = stateReason(state, alias, os);
+  if (!reason) return null;
+  return (
+    <div role="status" className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-[20px] bg-white/[0.04] p-4 text-sm leading-relaxed">
+      <StateBadge state={state} />
+      <p className="min-w-0 flex-1 text-muted">{reason}.</p>
+      {state === "offline" && onWake && (
+        <button onClick={onWake} className={quietButton + " min-h-11 ring-1 ring-line"}>
+          Wake up
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** `check_device`: one QUIC probe per channel; `ms` = round trip. */
+export type Probe = { ok: boolean; ms: number | null; error: string | null };
+export type Check = { kvm: Probe; transfer: Probe; hint: string | null };
+
+const probe = (name: string, p: Probe) => `${name}: ${p.ok ? `reached${p.ms != null ? ` in ${Math.round(p.ms)} ms` : ""}` : `not reached${p.error ? ` (${p.error})` : ""}`}`;
+
+/** "Test connection" for a paired device: whether mouse/keyboard and files get through, and the likely fix when not. */
+export function ConnectionCheck({ fingerprint }: { fingerprint: string }) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<Check | string | null>(null);
+  const run = () => {
+    setBusy(true);
+    invoke<Check>("check_device", { fingerprint })
+      .then(setResult, (e) => setResult(String(e)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="min-w-0">
+      <button onClick={run} disabled={busy} className={quietButton + " min-h-11 ring-1 ring-line disabled:opacity-50"}>
+        {busy ? "Testing…" : "Test connection"}
+      </button>
+      <div role="status" className="px-1 text-xs leading-relaxed text-muted">
+        {typeof result === "string" ? (
+          <p className="mt-2 text-danger">{result}</p>
+        ) : result ? (
+          <div className="mt-2 space-y-1">
+            <p className={result.kvm.ok ? "" : "text-danger"}>{probe("Mouse and keyboard", result.kvm)}</p>
+            <p className={result.transfer.ok ? "" : "text-danger"}>{probe("Files", result.transfer)}</p>
+            {result.hint && <p className="text-fg">{result.hint}</p>}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
 
 /** Primary action: a white pill, like the rest of the system. */
 export const primaryButton =

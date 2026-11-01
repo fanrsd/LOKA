@@ -7,7 +7,7 @@ import { PhoneView } from "./PhoneView";
 import { Mobile } from "./Mobile";
 import { TitleBar, isMac } from "./TitleBar";
 import { tickOnPress } from "./sound";
-import { useEdge, useOnline } from "./calibration";
+import { useEdge, usePortalState } from "./calibration";
 import { type Look, applyAccent, loadLook } from "./look";
 import { listen } from "@tauri-apps/api/event";
 import "./index.css";
@@ -28,10 +28,11 @@ if (!import.meta.env.DEV) {
 }
 
 function Overlay() {
+  const { state, note } = usePortalState();
   // an offline device keeps its doorway (crossing may still work when only discovery is blocked), faded
   return (
-    <div className="h-full w-full transition-opacity duration-700" style={{ opacity: useOnline() ? 1 : 0.25 }}>
-      <BezelPortal side={useEdge()} event="spatial" />
+    <div className="h-full w-full transition-opacity duration-700" style={{ opacity: state === "offline" ? 0.25 : 1 }}>
+      <BezelPortal side={useEdge()} event="spatial" blocked={note} />
     </div>
   );
 }

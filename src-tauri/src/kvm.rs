@@ -3,12 +3,12 @@
 //! drive any other; links are streams of pinned QUIC connections (`network::secure`).
 //!
 //! Wire: fixed 9-byte frames `tag | payload (8 bytes, LE)`. A Clipboard frame is followed by `len` bytes
-//! of UTF-8: the clipboard travels with the cursor (driver → driven on Enter, back on Return). Pairing
-//! frames are followed by 32 bytes: commit, nonce, reveal.
+//! of UTF-8: the clipboard travels with the cursor (driver → driven on Enter, back on Return); so is a Text
+//! frame (driver → driven: type it at the cursor). Pairing frames are followed by 32 bytes: commit, nonce, reveal.
 
 use crate::{
     network::secure::{self, Stream, Tls},
-    platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Gesture, Injected, InputEvent, Portal, Rect, SpatialPlatformEngine, LOCK_SCAN},
+    platform::{clipboard_text, edge_point, set_clipboard_text, Captured, Edge, Gesture, Injected, InputEvent, KeyText, Portal, Rect, SpatialPlatformEngine, Typed, LOCK_SCAN},
 };
 use std::{
     future::Future,
@@ -43,6 +43,8 @@ const RETURN_INSET: f64 = 12.0;
 const ENTER_INSET: f64 = 8.0;
 /// Larger clipboard text stays home (also the receiver's limit).
 const MAX_CLIPBOARD: u32 = 1 << 20;
+/// Longest Text frame; longer text goes as several.
+const MAX_TEXT: u32 = 4096;
 /// Sender: clipboard text last exchanged with a Client, so only new copies travel and an
 /// unchanged clipboard never overwrites the other side's (e.g. an image there).
 static LAST_SHARED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -80,6 +82,9 @@ pub enum Msg {
     /// First and only frame of a layout stream: the sender forgot this device, so this one forgets the
     /// sender too (pairing and portal); answered with one byte.
     Unpair,
+    /// Driver → driven: type this text at the cursor (`len` bytes of UTF-8 follow), whatever the keyboard
+    /// layout; only to peers announcing `text`.
+    Text { len: u32 },
 }
 
 /// What a paired device changed about the two of them (`serve`'s `on_place`).
@@ -144,6 +149,54 @@ impl Refusal {
     }
 }
 
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.text())
+    }
+}
+
+// carried inside the driver's io::Error, so `explain` can tell refusals apart
+impl std::error::Error for Refusal {}
+
+/// What went wrong talking to device `alias` (OS `os`), in words the user can act on; `hint` (from `hint`)
+/// = what to do when it was never reached.
+pub fn explain(e: &io::Error, alias: &str, os: &str, hint: &str) -> String {
+    match e.get_ref().and_then(|i| i.downcast_ref::<Refusal>()) {
+        Some(Refusal::NotPaired) => format!("{alias} isn't paired with this device anymore: pair them again"),
+        Some(Refusal::NoScreen) => format!("{alias} has no screen to show the cursor on"),
+        Some(Refusal::NoInput) => not_controllable(alias, os),
+        None => match e.kind() {
+            io::ErrorKind::HostUnreachable => format!("Can't reach {alias}: {hint}"),
+            io::ErrorKind::TimedOut => format!("{alias} stopped answering (Wi-Fi dropped, it went to sleep, or LOKA closed)"),
+            _ if e.to_string() == secure::WRONG_DEVICE => format!("{alias} has a new identity (reinstalled?): unpair and pair again"),
+            _ => e.to_string(),
+        },
+    }
+}
+
+/// Why device `alias` (OS `os`) can't be driven yet, and what to do there.
+pub fn not_controllable(alias: &str, os: &str) -> String {
+    match os {
+        "android" => format!("{alias} isn't set up to be controlled yet: on the phone, open LOKA → Set up"),
+        "macos" => format!("{alias} doesn't let LOKA control it yet: on the Mac, open LOKA → About → Allow Accessibility (needed again after each LOKA update)"),
+        _ => Refusal::NoInput.text().into(),
+    }
+}
+
+/// The likely reason this device (OS `me`) can't reach `alias` (OS `os`), as one thing to do. `heard`:
+/// its discovery announcements still arrive, so LOKA runs there and something blocks the connection.
+pub fn hint(me: &str, os: &str, alias: &str, heard: bool) -> String {
+    const MAC: &str = "System Settings → Privacy & Security → Local Network → turn LOKA on";
+    match (me, os, heard) {
+        (_, "android", false) => "On the phone: keep LOKA open and allow it to run in the background (Settings → Battery)".into(),
+        ("macos", ..) => format!("On the Mac: {MAC}"),
+        (_, "macos", _) => format!("On {alias}: {MAC}"),
+        (_, "windows", _) => format!("On {alias}: open LOKA → About → Allow through Windows Firewall"),
+        (_, _, false) => format!("Make sure LOKA is open on {alias} and both are on the same Wi-Fi"),
+        _ => "Both must be on the same network, and the router must let devices reach each other (guest Wi-Fi and AP isolation don't)".into(),
+    }
+}
+
 fn edge_byte(e: Edge) -> u8 {
     match e {
         Edge::Left => 0,
@@ -205,6 +258,10 @@ impl Msg {
             Msg::PairReveal => put(0, &[17]),
             Msg::Place(edge) => put(0, &[18, edge.map_or(255, edge_byte)]),
             Msg::Unpair => put(0, &[19]),
+            Msg::Text { len } => {
+                put(0, &[20]);
+                put(1, &len.to_le_bytes());
+            }
         }
         b
     }
@@ -240,6 +297,7 @@ impl Msg {
             18 if b[1] == 255 => Msg::Place(None),
             18 => Msg::Place(Some(byte_edge(b[1])?)),
             19 => Msg::Unpair,
+            20 => Msg::Text { len: Some(u32::from_le_bytes(b[1..5].try_into().unwrap())).filter(|l| *l <= MAX_TEXT)? },
             _ => return None,
         })
     }
@@ -281,7 +339,23 @@ async fn write_clipboard(w: &mut (impl AsyncWrite + Unpin), text: Option<String>
     w.flush().await
 }
 
-/// The bytes after a Clipboard frame; `None` if they are not UTF-8 (still consumed, so framing holds).
+/// `text` as Text frames, cut at character boundaries to at most `MAX_TEXT` bytes each.
+async fn write_text(w: &mut (impl AsyncWrite + Unpin), text: &str) -> io::Result<()> {
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(MAX_TEXT as usize);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut frame = Msg::Text { len: end as u32 }.encode().to_vec();
+        frame.extend_from_slice(&rest.as_bytes()[..end]);
+        w.write_all(&frame).await?;
+        rest = &rest[end..];
+    }
+    w.flush().await
+}
+
+/// The bytes after a Clipboard or Text frame; `None` if they are not UTF-8 (still consumed, so framing holds).
 async fn read_clipboard(r: &mut (impl AsyncRead + Unpin), len: u32) -> io::Result<Option<String>> {
     let mut b = vec![0; len as usize];
     r.read_exact(&mut b).await?;
@@ -453,6 +527,17 @@ pub struct Tune {
     /// double-tap Ctrl: when the Ctrl now held went down (and nothing else since), when the last clean tap ended
     ctrl_down: Option<(Instant, bool)>,
     tapped: Option<Instant>,
+    /// the peer takes Text frames
+    text: bool,
+    /// the driver's layout turns key-downs into text (an Android peer only knows the US layout)
+    layout: Option<KeyText>,
+    /// a Mac's Option types characters; elsewhere plain Alt is for shortcuts
+    mac: bool,
+    /// keys held now, for the modifiers; Caps Lock as toggled while driving
+    held: Vec<u16>,
+    caps: bool,
+    /// keys whose down went as text: their ups go nowhere
+    typed: Vec<u16>,
 }
 
 /// Both Ctrl taps of the "come home" double tap within this.
@@ -461,7 +546,57 @@ const TAP: Duration = Duration::from_millis(400);
 impl Tune {
     /// A session never starts locked: the tracker does not cross while the lock is on.
     pub fn new(speed: f32, swap_ctrl_cmd: bool) -> Self {
-        Self { speed: speed.clamp(0.25, 4.0), swap_ctrl_cmd, rest: (0.0, 0.0), locked: false, ctrl_down: None, tapped: None }
+        Self {
+            speed: speed.clamp(0.25, 4.0),
+            swap_ctrl_cmd,
+            rest: (0.0, 0.0),
+            locked: false,
+            ctrl_down: None,
+            tapped: None,
+            text: false,
+            layout: None,
+            mac: cfg!(target_os = "macos"),
+            held: Vec::new(),
+            caps: false,
+            typed: Vec::new(),
+        }
+    }
+
+    /// `text`: the peer takes Text frames; `layout`: then key-downs that type a character on this
+    /// keyboard's layout go as text.
+    pub fn text(self, text: bool, layout: Option<KeyText>) -> Self {
+        Self { text, layout: layout.filter(|_| text), ..self }
+    }
+
+    /// With a `layout`: what key event `e` types. A key-down that is a character on the driver's layout
+    /// (AltGr / Option included) goes as `Text` and its up as `Nothing`; shortcuts (Ctrl, Win/⌘, plain Alt
+    /// on Windows), modifiers and keys that aren't characters stay `Key`.
+    pub fn typed(&mut self, e: &InputEvent) -> Typed {
+        const MODIFIERS: [u16; 9] = [0x2A, 0x36, 0x1D, 0xE01D, 0x38, 0xE038, 0xE05B, 0xE05C, 0x3A];
+        let (Some(layout), &InputEvent::Key { scan, down }) = (self.layout, e) else { return Typed::Key };
+        let repeat = down && self.held.contains(&scan);
+        self.held.retain(|k| *k != scan);
+        let was = self.typed.len();
+        self.typed.retain(|k| *k != scan);
+        if !down {
+            return if self.typed.len() < was { Typed::Nothing } else { Typed::Key };
+        }
+        self.held.push(scan);
+        if scan == 0x3A && !repeat {
+            self.caps = !self.caps;
+        }
+        let held = |keys: &[u16]| keys.iter().any(|k| self.held.contains(k));
+        let (ctrl, alt, win) = (held(&[0x1D, 0xE01D]), held(&[0x38, 0xE038]), held(&[0xE05B, 0xE05C]));
+        // Windows' AltGr arrives as Ctrl+Alt
+        let shortcut = win || if self.mac { ctrl } else { ctrl != alt };
+        if MODIFIERS.contains(&scan) || scan == LOCK_SCAN || shortcut {
+            return Typed::Key; // a repeat that turned into a shortcut: its up goes out too
+        }
+        let t = layout(scan, held(&[0x2A, 0x36]), alt, self.caps);
+        if t != Typed::Key {
+            self.typed.push(scan);
+        }
+        t
     }
 
     /// `true` when `e` completes a double tap of Ctrl (alone: no other key, click or scroll in between),
@@ -557,7 +692,7 @@ pub async fn send_session(
             match read_msg(&mut rd).await {
                 Ok(Msg::Return { y }) => return Ok((y, drag)),
                 Ok(Msg::Drag { batch }) => drag = Some(batch),
-                Ok(Msg::Refuse(r)) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, r.text())),
+                Ok(Msg::Refuse(r)) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, r)),
                 Ok(Msg::Clipboard { len }) => match read_clipboard(&mut rd, len).await {
                     Ok(Some(text)) => {
                         set_clipboard_text(&text);
@@ -619,6 +754,12 @@ pub async fn send_session(
                     InputEvent::Move { dx, dy }
                 }
                 Some(Captured::Input(e)) => e,
+                Some(Captured::Text(text)) => {
+                    if tune.text {
+                        timeout(WRITE_TIMEOUT, write_text(&mut wr, &text)).await??;
+                    }
+                    continue;
+                }
                 Some(Captured::Escape) | None => {
                     let _ = timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Leave)).await;
                     return Ok(());
@@ -627,6 +768,14 @@ pub async fn send_session(
             if tune.home(&e, Instant::now()) {
                 let _ = timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Leave)).await;
                 return Ok(());
+            }
+            match tune.typed(&e) {
+                Typed::Key => {}
+                Typed::Nothing => continue,
+                Typed::Text(text) => {
+                    timeout(WRITE_TIMEOUT, write_text(&mut wr, &text)).await??;
+                    continue;
+                }
             }
             if let Some(msg) = tune.shape(e) {
                 if let Msg::Lock { on } = msg {
@@ -662,12 +811,14 @@ pub trait Sink: Send {
     }
 }
 
-/// The next device of a chain: where it is, and the portal (and fraction along it) the cursor leaves through.
+/// The next device of a chain: where it is, the portal (and fraction along it) the cursor leaves through,
+/// and whether it takes Text frames.
 pub struct Hop {
     pub to: SocketAddr,
     pub fp: String,
     pub portal: Portal,
     pub y: f32,
+    pub text: bool,
 }
 
 /// Running sessions end on this: driving ones like Ctrl+Alt+Esc, driven ones by handing the cursor back.
@@ -857,6 +1008,8 @@ struct Relay {
     reader: JoinHandle<()>,
     portal: Portal,
     y: f32,
+    /// the next device takes Text frames
+    text: bool,
 }
 
 impl Drop for Relay {
@@ -898,7 +1051,7 @@ async fn start_relay(tls: &Tls, hop: Hop, clipboard: Option<String>) -> io::Resu
             }
         }
     });
-    Ok(Relay { wr, back, reader, portal: hop.portal, y: hop.y })
+    Ok(Relay { wr, back, reader, portal: hop.portal, y: hop.y, text: hop.text })
 }
 
 /// Give the cursor back to the driver at `y` along the entry edge: changed clipboard first (it stops
@@ -986,6 +1139,12 @@ async fn session(
                     Ok(None) => true,
                     Err(e) => break Err(e),
                 },
+                Msg::Text { len } => match read_clipboard(&mut s, len).await {
+                    // a device further on that doesn't know Text frames would end the session on one
+                    Ok(Some(text)) if r.text => matches!(timeout(WRITE_TIMEOUT, write_text(&mut r.wr, &text)).await, Ok(Ok(()))),
+                    Ok(_) => true,
+                    Err(e) => break Err(e),
+                },
                 Msg::Leave => {
                     let _ = timeout(WRITE_TIMEOUT, send(&mut r.wr, Msg::Leave)).await;
                     break Ok(None);
@@ -1008,8 +1167,9 @@ async fn session(
                 }
                 match rcv.apply(e) {
                     Applied::Inject(i) => {
+                        let at = if let Injected::MoveTo { x, y } = i { Some((x, y)) } else { None };
                         sink.inject(i);
-                        let Injected::MoveTo { x, y } = i else { continue };
+                        let Some((x, y)) = at else { continue };
                         if rcv.buttons != 0 || rcv.locked || Instant::now() < retry_at {
                             continue;
                         }
@@ -1032,6 +1192,11 @@ async fn session(
                     sink.set_clipboard(text.clone());
                     seen = Some(text);
                 }
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            },
+            Msg::Text { len } => match read_clipboard(&mut s, len).await {
+                Ok(Some(text)) => sink.inject(Injected::Text { text }),
                 Ok(None) => {}
                 Err(e) => break Err(e),
             },
@@ -1078,6 +1243,7 @@ mod tests {
             Msg::Place(Some(Edge::Top)),
             Msg::Place(None),
             Msg::Unpair,
+            Msg::Text { len: MAX_TEXT },
         ];
         for m in all {
             assert_eq!(Msg::decode(&m.encode()), Some(m));
@@ -1088,6 +1254,43 @@ mod tests {
         assert_eq!(Msg::decode(&[3, 9, 1, 0, 0, 0, 0, 0, 0]), None); // button 9
         assert_eq!(Msg::decode(&[0; FRAME]), None);
         assert_eq!(Msg::decode(&Msg::Clipboard { len: MAX_CLIPBOARD + 1 }.encode()), None);
+        assert_eq!(Msg::decode(&Msg::Text { len: MAX_TEXT + 1 }.encode()), None);
+    }
+
+    #[tokio::test]
+    async fn long_text_goes_as_frames_cut_between_characters() {
+        let text = "é".repeat(MAX_TEXT as usize); // 2 bytes each: never cut in half
+        let mut wire = Vec::new();
+        write_text(&mut wire, &text).await.unwrap();
+        let (mut r, mut back) = (&wire[..], String::new());
+        while !r.is_empty() {
+            let Msg::Text { len } = read_msg(&mut r).await.unwrap() else { panic!("not a Text frame") };
+            assert!(len <= MAX_TEXT);
+            back += &read_clipboard(&mut r, len).await.unwrap().expect("whole characters");
+        }
+        assert_eq!(back, text);
+    }
+
+    #[test]
+    fn errors_say_what_happened_and_what_to_do() {
+        let said = |e: io::Error, os: &str| explain(&e, "Phone", os, "HINT");
+        let refused = |r: Refusal| io::Error::new(io::ErrorKind::PermissionDenied, r);
+        assert_eq!(said(io::Error::new(io::ErrorKind::HostUnreachable, "timed out"), "android"), "Can't reach Phone: HINT");
+        assert!(said(io::Error::new(io::ErrorKind::TimedOut, "timed out"), "android").starts_with("Phone stopped answering"));
+        assert!(said(refused(Refusal::NoInput), "android").contains("open LOKA → Set up"), "a phone without the injector");
+        assert_eq!(said(refused(Refusal::NoInput), "linux"), Refusal::NoInput.text());
+        assert!(said(refused(Refusal::NotPaired), "linux").contains("pair them again"));
+        assert!(said(io::Error::new(io::ErrorKind::PermissionDenied, secure::WRONG_DEVICE), "macos").contains("new identity"));
+        let other = io::Error::new(io::ErrorKind::PermissionDenied, Service::Files.not_shared());
+        assert_eq!(said(other, "macos"), Service::Files.not_shared(), "other reasons pass through verbatim");
+
+        assert!(hint("macos", "android", "Phone", false).starts_with("On the phone"), "a phone that went quiet is likely asleep");
+        assert!(hint("macos", "android", "Phone", true).starts_with("On the Mac"), "it announces, so this Mac blocks it");
+        assert!(hint("windows", "macos", "Mac", true).starts_with("On Mac: System Settings"));
+        assert!(hint("macos", "windows", "PC", true).starts_with("On the Mac"));
+        assert!(hint("linux", "windows", "PC", true).contains("Windows Firewall"));
+        assert!(hint("windows", "linux", "Box", false).contains("LOKA is open on Box"));
+        assert!(hint("windows", "linux", "Box", true).contains("same network"));
     }
 
     #[test]
@@ -1194,19 +1397,17 @@ mod tests {
         tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
-        for m in [
-            Msg::Enter { edge: Edge::Left, y: 0.0 },
-            Msg::Input(InputEvent::Key { scan: 0x1D, down: true }),
-            Msg::Leave,
-        ] {
-            send(&mut s, m).await.unwrap();
-        }
+        send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.0 }).await.unwrap();
+        send(&mut s, Msg::Input(InputEvent::Key { scan: 0x1D, down: true })).await.unwrap();
+        write_text(&mut s, "ça").await.unwrap();
+        send(&mut s, Msg::Leave).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             *got.lock().unwrap(),
             vec![
                 Injected::MoveTo { x: 991.0, y: 0.0 },
                 Injected::Key { scan: 0x1D, down: true },
+                Injected::Text { text: "ça".into() },
                 Injected::Key { scan: 0x1D, down: false },
             ]
         );
@@ -1468,6 +1669,54 @@ mod tests {
         assert!(!t.home(&key(0x1D, true), at(900)));
     }
 
+    #[test]
+    fn layout_turns_characters_into_text_but_not_shortcuts() {
+        // a German layout: Y and Z swapped, AltGr+Q = @, ^ is a dead key
+        fn german(scan: u16, shift: bool, alt: bool, caps: bool) -> Typed {
+            match (scan, alt) {
+                (0x15, false) => Typed::Text(if shift != caps { "Z" } else { "z" }.into()),
+                (0x10, true) => Typed::Text("@".into()),
+                (0x29, false) => Typed::Nothing,
+                (0x12, false) => Typed::Text("ê".into()),
+                _ => Typed::Key,
+            }
+        }
+        let key = |scan, down| InputEvent::Key { scan, down };
+        let mut t = Tune::new(1.0, false).text(true, Some(german));
+        t.mac = false;
+        assert_eq!(t.typed(&key(0x15, true)), Typed::Text("z".into()));
+        assert_eq!(t.typed(&key(0x15, false)), Typed::Nothing, "its up went as text with it");
+        assert_eq!(t.typed(&key(0x2A, true)), Typed::Key, "Shift itself still goes");
+        assert_eq!(t.typed(&key(0x15, true)), Typed::Text("Z".into()));
+        assert_eq!(t.typed(&key(0x15, false)), Typed::Nothing);
+        assert_eq!(t.typed(&key(0x2A, false)), Typed::Key);
+        // AltGr = Ctrl + right Alt on Windows
+        for e in [key(0x1D, true), key(0xE038, true)] {
+            assert_eq!(t.typed(&e), Typed::Key);
+        }
+        assert_eq!(t.typed(&key(0x10, true)), Typed::Text("@".into()));
+        for e in [key(0x10, false), key(0xE038, false)] {
+            t.typed(&e);
+        }
+        assert_eq!(t.typed(&key(0x2E, true)), Typed::Key, "Ctrl+C stays a shortcut");
+        assert_eq!(t.typed(&key(0x2E, false)), Typed::Key);
+        t.typed(&key(0x1D, false));
+        assert_eq!(t.typed(&key(0x29, true)), Typed::Nothing, "a dead key waits for the next one");
+        assert_eq!(t.typed(&key(0x29, false)), Typed::Nothing);
+        assert_eq!(t.typed(&key(0x12, true)), Typed::Text("ê".into()));
+        assert_eq!(t.typed(&key(0x1C, true)), Typed::Key, "Enter isn't a character");
+        assert_eq!(t.typed(&key(0x3A, true)), Typed::Key);
+        assert_eq!(t.typed(&key(0x15, true)), Typed::Text("Z".into()), "Caps Lock toggled while driving");
+        // plain Alt and Win are shortcuts on Windows; a Mac's Option types characters, its Ctrl doesn't
+        assert_eq!(t.typed(&key(0x38, true)), Typed::Key);
+        assert_eq!(t.typed(&key(0x10, true)), Typed::Key);
+        t.mac = true;
+        assert_eq!(t.typed(&key(0x10, true)), Typed::Text("@".into()));
+        // no layout (desktop peers) or a peer without Text frames: everything stays positional
+        assert_eq!(Tune::new(1.0, false).text(true, None).typed(&key(0x15, true)), Typed::Key);
+        assert_eq!(Tune::new(1.0, false).text(false, Some(german)).typed(&key(0x15, true)), Typed::Key);
+    }
+
     /// Device B: forwards to C once its cursor reaches x = 999 (its right edge).
     struct Hopper {
         rec: Arc<Mutex<Vec<Injected>>>,
@@ -1482,7 +1731,7 @@ mod tests {
             self.rec.lock().unwrap().push(e);
         }
         fn hop(&self, x: f64, y: f64) -> Option<Hop> {
-            (x >= 999.0).then(|| Hop { to: self.next.0, fp: self.next.1.clone(), portal: RIGHT, y: (y / 500.0) as f32 })
+            (x >= 999.0).then(|| Hop { to: self.next.0, fp: self.next.1.clone(), portal: RIGHT, y: (y / 500.0) as f32, text: true })
         }
     }
 

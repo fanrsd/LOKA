@@ -40,6 +40,16 @@ pub struct DeviceInfo {
     /// hardware address, so paired devices can wake this one (Wake-on-LAN)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// can be driven right now (`SpatialPlatformEngine::can_inject`); older versions don't say: they count as yes
+    #[serde(default = "yes")]
+    pub controllable: bool,
+    /// understands the kvm Text frame (types text whatever the layout); older versions don't
+    #[serde(default)]
+    pub text: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,14 +197,20 @@ mod tests {
             kvm_port: 3,
             proto: 2,
             mac: None,
+            controllable: false,
+            text: true,
         };
         let v: serde_json::Value = serde_json::to_value(Announcement { info, announce: true }).unwrap();
         assert_eq!(v["deviceType"], "desktop");
         assert_eq!(v["telemetryPort"], 1);
         assert_eq!(v["proto"], 2);
         assert_eq!(v["announce"], true);
+        assert_eq!(v["controllable"], false);
         let mut old = v;
         old.as_object_mut().unwrap().remove("proto");
-        assert_eq!(serde_json::from_value::<Announcement>(old).unwrap().info.proto, 0, "a v0.5 device announces no version");
+        old.as_object_mut().unwrap().remove("controllable");
+        let old = serde_json::from_value::<Announcement>(old).unwrap().info;
+        assert_eq!(old.proto, 0, "a v0.5 device announces no version");
+        assert!(old.controllable, "an older device doesn't announce it: counts as controllable");
     }
 }

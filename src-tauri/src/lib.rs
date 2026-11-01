@@ -93,7 +93,103 @@ static DRIVING: AtomicBool = AtomicBool::new(false);
 pub(crate) async fn open_service(app: &AppHandle, fingerprint: &str, service: kvm::Service) -> Result<secure::Stream, String> {
     let to = app.state::<AppState>().lock().unwrap().addr(fingerprint, |i| i.kvm_port).ok_or("that device isn't paired or isn't on the network")?;
     let tls = app.state::<Arc<Tls>>().inner().clone();
-    kvm::open(&tls, to, fingerprint, service).await.map_err(|e| e.to_string())
+    kvm::open(&tls, to, fingerprint, service).await.map_err(|e| explain(app, fingerprint, &e))
+}
+
+/// `e` from talking to device `fp`, as a message the user can act on (`kvm::explain`).
+fn explain(app: &AppHandle, fp: &str, e: &std::io::Error) -> String {
+    let (alias, os, heard) = app.state::<AppState>().lock().unwrap().who(fp);
+    kvm::explain(e, &alias, &os, &kvm::hint(std::env::consts::OS, &os, &alias, heard))
+}
+
+/// Keeps `controllable` in what discovery announces current: an Android's injector starts and dies with
+/// Wireless debugging, a Linux gets input access while LOKA runs. `on_change` runs when it flips.
+pub(crate) async fn watch_controllable(engine: Arc<dyn SpatialPlatformEngine>, me: watch::Sender<DeviceInfo>, on_change: impl Fn() + Send) {
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tick.tick().await;
+        let e = engine.clone();
+        let now = tokio::task::spawn_blocking(move || e.can_inject()).await.unwrap_or(false);
+        if me.send_if_modified(|i| std::mem::replace(&mut i.controllable, now) != now) {
+            on_change();
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct Probe {
+    ok: bool,
+    /// round trip
+    ms: Option<u32>,
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct Check {
+    kvm: Probe,
+    transfer: Probe,
+    /// what to do about a failed probe
+    hint: Option<String>,
+}
+
+/// Can this device reach `fingerprint` right now, on the input link and the file link; if not, what to do.
+#[tauri::command]
+async fn check_device(state: State<'_, AppState>, tls: State<'_, Arc<Tls>>, fingerprint: String) -> Result<Check, String> {
+    let (peer, (alias, os, heard)) = {
+        let s = state.lock().unwrap();
+        if !s.settings.is_paired(&fingerprint) && !s.peers.contains_key(&fingerprint) {
+            return Err("that device isn't paired or nearby".into());
+        }
+        (s.peers.get(&fingerprint).cloned(), s.who(&fingerprint))
+    };
+    let rtt = |port: fn(&DeviceInfo) -> u16| {
+        let (tls, fp, to) = (tls.inner().clone(), fingerprint.clone(), peer.as_ref().map(|p| SocketAddr::new(p.addr, port(&p.info))));
+        async move {
+            let to = to.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "never heard on the network"))?;
+            tokio::time::timeout(Duration::from_secs(5), tls.rtt(to, &fp)).await.unwrap_or_else(|_| Err(std::io::ErrorKind::HostUnreachable.into()))
+        }
+    };
+    let (k, t) = tokio::join!(rtt(|i| i.kvm_port), rtt(|i| i.transfer_port));
+    // another device answering says more than any network hint
+    let hint = [&k, &t].into_iter().find_map(|r| r.as_ref().err()).map(|e| {
+        if e.to_string() == secure::WRONG_DEVICE { kvm::explain(e, &alias, &os, "") } else { kvm::hint(std::env::consts::OS, &os, &alias, heard) }
+    });
+    let probe = |r: std::io::Result<Duration>| match r {
+        Ok(d) => Probe { ok: true, ms: Some(d.as_millis() as u32), error: None },
+        Err(e) if e.kind() == std::io::ErrorKind::HostUnreachable => Probe { ok: false, ms: None, error: Some("no answer".into()) },
+        Err(e) => Probe { ok: false, ms: None, error: Some(e.to_string()) },
+    };
+    Ok(Check { kvm: probe(k), transfer: probe(t), hint })
+}
+
+/// Plain-text report for support: this device, what it hears, its pairings and layout. No keys.
+#[tauri::command]
+fn diagnostics(state: State<AppState>, me: State<watch::Sender<DeviceInfo>>) -> String {
+    use std::fmt::Write;
+    let me = me.borrow().clone();
+    let s = state.lock().unwrap();
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    let mut r = format!("LOKA {} · {} {}\n", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    let _ = writeln!(r, "This device: {} ({}…), controllable: {}", me.alias, &me.fingerprint[..me.fingerprint.len().min(12)], yes(me.controllable));
+    let ips: Vec<String> = discovery::local_ipv4().iter().map(|ip| ip.to_string()).collect();
+    let _ = writeln!(r, "IPs: {}", ips.join(", "));
+    let _ = writeln!(r, "Ports (UDP): discovery {}, telemetry {}, transfer {}, kvm {}", discovery::PORT, PORTS.0, PORTS.1, PORTS.2);
+    let _ = writeln!(r, "Heard on the network:");
+    for p in s.peers.values() {
+        let (i, paired) = (&p.info, s.settings.is_paired(&p.info.fingerprint));
+        let heard = p.seen.elapsed().as_secs();
+        let _ = writeln!(r, "  {} · {} · {} · proto {} · controllable {} · {heard} s ago · {}", i.alias, i.os, p.addr, i.proto, yes(i.controllable), if paired { "paired" } else { "not paired" });
+    }
+    let offline: Vec<&str> = s.settings.paired.iter().filter(|d| s.live_peers().all(|p| p.info.fingerprint != d.fingerprint)).map(|d| d.alias.as_str()).collect();
+    let _ = writeln!(r, "Paired, offline: {}", if offline.is_empty() { "none".to_string() } else { offline.join(", ") });
+    let _ = writeln!(r, "Layout:");
+    for (fp, p) in &s.settings.portals {
+        let _ = writeln!(r, "  {}: {:?} edge", s.who(fp).0, p.edge);
+    }
+    if let Some((e, at)) = &*LAST_CROSSING.lock().unwrap() {
+        let _ = writeln!(r, "Last crossing error ({} s ago): {e}", at.elapsed().as_secs());
+    }
+    r
 }
 
 /// Where received files go: the folder the user picked, or Downloads/LOKA.
@@ -218,13 +314,13 @@ async fn control(app: AppHandle, fingerprint: String) -> Result<(), String> {
     #[cfg(mobile)]
     let portal = portal.or(Some(Portal { edge: Edge::Right, monitor: Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }, start: 0.0, end: 1.0, reach: 0.0 }));
     let portal = portal.ok_or("place that device next to a screen first")?;
-    start_session(&app, portal_label(&fingerprint), fingerprint, portal, 0.5, None).map_err(String::from)
+    start_session(&app, portal_label(&fingerprint), fingerprint, portal, 0.5, None)
 }
 
 /// The phone's touchpad: input for the computer it drives (`control`).
 #[cfg(mobile)]
 #[tauri::command]
-fn touch(event: platform::InputEvent) {
+fn touch(event: platform::Touch) {
     platform::touch(event);
 }
 
@@ -274,6 +370,15 @@ impl Shared {
 
     fn addr(&self, fp: &str, port: impl Fn(&DeviceInfo) -> u16) -> Option<SocketAddr> {
         self.paired_peer(fp).map(|p| SocketAddr::new(p.addr, port(&p.info)))
+    }
+
+    /// Name and OS of device `fp` for messages, and whether its announcements still arrive.
+    fn who(&self, fp: &str) -> (String, String, bool) {
+        if let Some(p) = self.peers.get(fp) {
+            return (p.info.alias.clone(), p.info.os.clone(), p.seen.elapsed() < discovery::STALE);
+        }
+        let alias = self.settings.paired.iter().find(|d| d.fingerprint == fp).map_or_else(|| "The other device".into(), |d| d.alias.clone());
+        (alias, String::new(), false)
     }
 }
 
@@ -332,7 +437,7 @@ async fn pair(app: AppHandle, state: State<'_, AppState>, tls: State<'_, Arc<Tls
     let show = |code: String| {
         let _ = app.emit_to(MAIN_WINDOW, "pair-code", serde_json::json!({ "fingerprint": fingerprint, "code": code }));
     };
-    let answer = kvm::request_pair(&tls, SocketAddr::new(peer.addr, peer.info.kvm_port), &fingerprint, show).await.map_err(|e| e.to_string())?;
+    let answer = kvm::request_pair(&tls, SocketAddr::new(peer.addr, peer.info.kvm_port), &fingerprint, show).await.map_err(|e| explain(&app, &fingerprint, &e))?;
     if answer == kvm::PairAnswer::Accepted {
         state.lock().unwrap().settings.pair(PairedDevice { fingerprint, alias: peer.info.alias });
         let _ = app.emit("paired", ());
@@ -442,13 +547,13 @@ async fn powershell(script: String) -> Result<std::process::Output, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Linux: let LOKA read the mouse and keyboard and send input (`/dev/input`, uinput), one password prompt.
+/// Let LOKA send input: Linux `/dev/input` + uinput (one password prompt); macOS Accessibility (prompt + its pane).
 #[tauri::command]
 async fn allow_input() -> Result<(), String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     return tauri::async_runtime::spawn_blocking(platform::allow_input).await.map_err(|e| e.to_string())?;
     #[allow(unreachable_code)]
-    Err("Only needed on Linux".into())
+    Err("Only needed on Linux and macOS".into())
 }
 
 /// This computer's name as other devices list it.
@@ -517,7 +622,7 @@ async fn ask_user(app: &AppHandle, state: &AppState, window: &str, from: &Peer, 
 // async: building a window inside a sync command deadlocks WebView2 on Windows
 #[tauri::command]
 async fn set_portal(app: AppHandle, state: State<'_, AppState>, tls: State<'_, Arc<Tls>>, fingerprint: String, portal: Option<Portal>, sync: bool) -> Result<Option<String>, String> {
-    let (to, alias) = {
+    let (to, alias, phone) = {
         let mut s = state.lock().unwrap();
         if !s.settings.is_paired(&fingerprint) {
             return Err("not paired".into());
@@ -528,7 +633,8 @@ async fn set_portal(app: AppHandle, state: State<'_, AppState>, tls: State<'_, A
         };
         s.settings.save();
         let alias = s.settings.paired.iter().find(|d| d.fingerprint == fingerprint).map(|d| d.alias.clone()).unwrap_or_default();
-        (s.addr(&fingerprint, |i| i.kvm_port), alias)
+        let phone = s.peers.get(&fingerprint).is_some_and(|p| p.info.os == "android");
+        (s.addr(&fingerprint, |i| i.kvm_port), alias, phone)
     };
     show_portal(&app, &fingerprint, portal)?;
     if !sync {
@@ -536,10 +642,13 @@ async fn set_portal(app: AppHandle, state: State<'_, AppState>, tls: State<'_, A
     }
     let Some(to) = to else { return Ok(Some(format!("{alias} is offline: place this computer on its screens there"))) };
     let edge = portal.map(|p| p.edge);
-    Ok(match tokio::time::timeout(Duration::from_secs(5), kvm::place(&tls, to, &fingerprint, edge)).await {
-        Ok(Ok(true)) => None,
-        Ok(Ok(false)) => Some(format!("{alias} has no free room on that side: place this computer on its screens there")),
-        _ => Some(format!("Couldn't update {alias}'s layout (needs LOKA 0.8): place this computer on its screens there")),
+    let placed = tokio::time::timeout(Duration::from_secs(5), kvm::place(&tls, to, &fingerprint, edge)).await;
+    Ok(match placed.unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())) {
+        Ok(true) => None,
+        // phones before 0.9.3 refused every Place; newer ones always accept
+        Ok(false) if phone => Some(format!("{alias} runs an older LOKA: update it, or set its side on the phone")),
+        Ok(false) => Some(format!("{alias} has no free room on that side: place this computer on its screens there")),
+        Err(e) => Some(explain(&app, &fingerprint, &e)),
     })
 }
 
@@ -731,7 +840,7 @@ impl kvm::Sink for EngineSink {
         s.settings.portals.iter().filter(|(fp, _)| Some(fp.as_str()) != driver).find_map(|(fp, portal)| {
             let (along, p) = portal.sample(x, y)?;
             let to = s.addr(fp, |i| i.kvm_port).filter(|_| p >= 1.0)?;
-            Some(kvm::Hop { to, fp: fp.clone(), portal: *portal, y: along })
+            Some(kvm::Hop { to, fp: fp.clone(), portal: *portal, y: along, text: s.peers.get(fp).is_some_and(|p| p.info.text) })
         })
     }
 }
@@ -835,6 +944,8 @@ pub fn run() {
             answer_pair,
             unpair,
             set_portal,
+            check_device,
+            diagnostics,
             set_cursor_prefs,
             cancel_transfer,
             reveal,
@@ -911,6 +1022,9 @@ pub fn run() {
                 kvm_port: PORTS.2,
                 proto: kvm::PROTOCOL,
                 mac: mac_address::get_mac_address().ok().flatten().map(|m| m.to_string()),
+                // a phone's injector starts later; `watch_controllable` keeps it current
+                controllable: !cfg!(target_os = "android"),
+                text: true,
             };
             let state: AppState = Arc::new(Mutex::new(Shared {
                 settings,
@@ -1003,6 +1117,10 @@ fn spawn_discovery(app: AppHandle, state: AppState, me: watch::Receiver<DeviceIn
                 }
                 s.peers.insert(peer.info.fingerprint.clone(), peer.clone())
             };
+            // the tray's "Control …" follows whether it can be driven (first sight included), not every heartbeat
+            if previous.as_ref().map(|p| p.info.controllable) != Some(peer.info.controllable) {
+                refresh_tray(&app);
+            }
             // heartbeats are frequent; only tell the UI about arrivals and changes
             if previous.map_or(true, |p| p.info != peer.info || p.addr != peer.addr || p.seen.elapsed() >= discovery::STALE) {
                 let _ = app.emit("peer", peer);
@@ -1107,7 +1225,7 @@ async fn send_files(app: AppHandle, to: SocketAddr, fp: String, files: Vec<(Path
             drop(slot);
             let _ = h.emit("transfer", match r {
                 Ok(()) => transfer::TransferEvent::Sent { id },
-                Err(e) => transfer::TransferEvent::Failed { id, outgoing: true, name, error: e.to_string() },
+                Err(e) => transfer::TransferEvent::Failed { id, outgoing: true, name, error: explain(&h, &fp, &e) },
             });
         });
     }
@@ -1272,14 +1390,21 @@ fn tray_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
     menu.append(&MenuItem::with_id(app, "open", "Open LOKA", true, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    let (devices, busy): (Vec<(String, String)>, bool) = {
+    let (devices, busy): (Vec<(String, String, bool)>, bool) = {
         let state = app.state::<AppState>();
         let s = state.lock().unwrap();
-        let devices = s.settings.paired.iter().filter(|d| s.settings.portals.contains_key(&d.fingerprint)).map(|d| (d.fingerprint.clone(), d.alias.clone())).collect();
+        let devices = s
+            .settings
+            .paired
+            .iter()
+            .filter(|d| s.settings.portals.contains_key(&d.fingerprint))
+            .map(|d| (d.fingerprint.clone(), d.alias.clone(), s.peers.get(&d.fingerprint).map_or(true, |p| p.info.controllable)))
+            .collect();
         (devices, s.session.is_some())
     };
-    for (fp, alias) in devices {
-        menu.append(&MenuItem::with_id(app, format!("control:{fp}"), format!("Control {alias}"), true, None::<&str>)?)?;
+    for (fp, alias, controllable) in devices {
+        let text = if controllable { format!("Control {alias}") } else { format!("Control {alias} (finish setup there)") };
+        menu.append(&MenuItem::with_id(app, format!("control:{fp}"), text, controllable, None::<&str>)?)?;
     }
     // only while another device drives this one: while driving, this computer's own mouse is over there,
     // so the tray can't be reached and Ctrl+Alt+Esc is the way out
@@ -1361,6 +1486,26 @@ fn mirror_portal(app: &AppHandle, fp: &str, edge: Option<Edge>) -> bool {
     true
 }
 
+/// A phone: paired device `fp` sits along the whole `edge` of its screen (`None`: taken off). `false`: not paired.
+#[cfg(mobile)]
+fn mirror_portal(app: &AppHandle, fp: &str, edge: Option<Edge>) -> bool {
+    let monitor = screens(app).first().copied().unwrap_or(Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
+    {
+        let state = app.state::<AppState>();
+        let mut s = state.lock().unwrap();
+        if !s.settings.is_paired(fp) {
+            return false;
+        }
+        match edge {
+            Some(edge) => s.settings.portals.insert(fp.to_string(), Portal { edge, monitor, start: 0.0, end: 1.0, reach: 120.0 }),
+            None => s.settings.portals.remove(fp),
+        };
+        s.settings.save();
+    }
+    let _ = app.emit("device", ());
+    true
+}
+
 /// Answers pairing requests and accepts input sessions from paired devices.
 fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: AppState, tls: Arc<Tls>) {
     tauri::async_runtime::spawn(async move {
@@ -1370,14 +1515,13 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
             (_, false) => Err(kvm::Refusal::NoInput),
             _ => Ok(()),
         };
+        let (a, me) = (app.clone(), app.state::<watch::Sender<DeviceInfo>>().inner().clone());
+        tauri::async_runtime::spawn(watch_controllable(engine.clone(), me, move || drop(a.emit("device", ()))));
         let a = app.clone();
         // the other device moved this one to its `edge` of its screens: it goes on the opposite edge here;
         // or it unpaired: forget it here too
         let on_place = move |fp: &str, l: kvm::Layout| match l {
-            #[cfg(desktop)]
             kvm::Layout::Place(edge) => mirror_portal(&a, fp, edge.map(Edge::opposite)),
-            #[cfg(mobile)]
-            kvm::Layout::Place(_) => false,
             kvm::Layout::Unpair => {
                 forget(&a, fp);
                 true
@@ -1500,23 +1644,29 @@ struct Door {
 
 /// Hand mouse & keyboard to device `fp` through `portal` (overlay `label`) at `y` along it, with a file
 /// drag going along if `drag`. Runs the session in the background.
-fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: f32, drag: Option<u64>) -> Result<(), &'static str> {
+fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: f32, drag: Option<u64>) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let (to, transfer_to, prefs, peer_is_mac, alias) = {
+    let (to, transfer_to, prefs, peer) = {
         let s = state.lock().unwrap();
         let to = s.addr(&fp, |i| i.kvm_port).ok_or("that device isn't on the network")?;
         let peer = s.peers.get(&fp);
-        let alias = peer.map_or_else(|| "The other device".into(), |p| p.info.alias.clone());
-        (to, s.addr(&fp, |i| i.transfer_port), s.settings.cursor, peer.is_some_and(|p| p.info.os == "macos"), alias)
+        // it says it can't be driven (phone not set up, Linux without input access): don't even try
+        if let Some(p) = peer.filter(|p| !p.info.controllable) {
+            return Err(kvm::not_controllable(&p.info.alias, &p.info.os));
+        }
+        (to, s.addr(&fp, |i| i.transfer_port), s.settings.cursor, peer.map(|p| (p.info.os.clone(), p.info.text)))
     };
     if DRIVING.swap(true, Ordering::SeqCst) {
-        return Err("already controlling another device");
+        return Err("already controlling another device".into());
     }
     #[cfg(desktop)]
     if let Some(t) = transfer_to {
         sync_clipboard(app.clone(), t, fp.clone());
     }
-    let tune = kvm::Tune::new(prefs.speed, prefs.swap_ctrl_cmd && peer_is_mac != cfg!(target_os = "macos"));
+    let (os, text) = peer.unwrap_or_default();
+    // an Android keymap is US only: characters go as text in this keyboard's layout; computers map keys themselves
+    let layout = platform::key_text().filter(|_| os == "android");
+    let tune = kvm::Tune::new(prefs.speed, prefs.swap_ctrl_cmd && (os == "macos") != cfg!(target_os = "macos")).text(text, layout);
     let (app, engine) = (app.clone(), app.state::<Arc<dyn SpatialPlatformEngine>>().inner().clone());
     tauri::async_runtime::spawn(async move {
         let _ = app.emit("kvm", serde_json::json!({ "active": true, "y": y, "device": fp }));
@@ -1525,11 +1675,10 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
         if let Ok(Some(batch)) = r {
             hold_drag(&app, &label, batch); // a drag came back with the cursor
         }
-        // TimedOut: the link went silent (Wi-Fi drop, sleep, crash), not a refusal or a hang-up
-        let error = r.as_ref().err().map(|e| if e.kind() == std::io::ErrorKind::TimedOut { format!("{alias} stopped answering") } else { e.to_string() });
+        let error = r.as_ref().err().map(|e| explain(&app, &fp, e));
         let _ = app.emit("kvm", serde_json::json!({ "active": false, "error": error }));
         // it unpaired while this one was away (its certificate is pinned, so it really is that device)
-        if error.as_deref() == Some(kvm::Refusal::NotPaired.text()) {
+        if r.as_ref().err().and_then(|e| e.get_ref()?.downcast_ref::<kvm::Refusal>()) == Some(&kvm::Refusal::NotPaired) {
             forget(&app, &fp);
         }
         if let Some(e) = &error {
@@ -1543,12 +1692,14 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
     Ok(())
 }
 
+/// The last crossing that failed and when, for `diagnostics`.
+static LAST_CROSSING: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
+
 /// The reason a crossing failed, as a notification: the main window showing it is usually hidden.
 /// The same reason again within 30 s stays quiet (the cursor keeps pushing the edge).
 fn crossing_failed(app: &AppHandle, error: String) {
     use tauri_plugin_notification::NotificationExt;
-    static LAST: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
+    let mut last = LAST_CROSSING.lock().unwrap();
     if last.as_ref().is_some_and(|(e, at)| *e == error && at.elapsed() < Duration::from_secs(30)) {
         return;
     }

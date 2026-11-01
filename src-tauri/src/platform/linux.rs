@@ -163,6 +163,21 @@ impl SpatialPlatformEngine for LinuxEngine {
                 Some(code) => v.keys.emit(&[ev(EventType::KEY, code, down as i32)]),
                 None => Ok(()),
             },
+            // shortcut: only US-layout characters are typed (as their keys); others are dropped, add clipboard + Ctrl+V if needed
+            Injected::Text { text } => {
+                for (code, shift) in text.chars().filter_map(us_key) {
+                    let mut key = |code: u16, down: bool| v.keys.emit(&[ev(EventType::KEY, code, down as i32)]);
+                    if shift {
+                        key(42, true)?;
+                    }
+                    key(code, true)?;
+                    key(code, false)?;
+                    if shift {
+                        key(42, false)?;
+                    }
+                }
+                Ok(())
+            }
         });
         if let Err(e) = r {
             eprintln!("uinput: {e}");
@@ -552,6 +567,20 @@ fn code_of(scan: u16) -> Option<u16> {
     KEYS.iter().find(|(_, s)| *s == scan).map(|(c, _)| *c).or(matches!(scan, 1..=88).then_some(scan).filter(|&s| !(84..=85).contains(&s)))
 }
 
+/// The US-layout key (Linux code = set-1 scancode here) and whether Shift goes with it, for `c`.
+fn us_key(c: char) -> Option<(u16, bool)> {
+    const PLAIN: &str = "1234567890-=qwertyuiop[]asdfghjkl;'`\\zxcvbnm,./";
+    const SHIFTED: &str = "!@#$%^&*()_+QWERTYUIOP{}ASDFGHJKL:\"~|ZXCVBNM<>?";
+    match c {
+        ' ' => Some((0x39, false)),
+        '\n' => Some((0x1C, false)),
+        '\t' => Some((0x0F, false)),
+        _ => [(PLAIN, false), (SHIFTED, true)]
+            .into_iter()
+            .find_map(|(chars, shift)| chars.chars().position(|x| x == c).map(|i| ([0x02, 0x10, 0x1E, 0x2B][i / 12] + (i % 12) as u16, shift))),
+    }
+}
+
 /// Give this user's apps the input devices and uinput: an `input` group rule, the user in it, and
 /// right away (no new login) an ACL. Asks for the password with pkexec unless already root.
 pub fn allow_input() -> Result<(), String> {
@@ -597,5 +626,9 @@ mod tests {
         assert_eq!(scan_of(125), Some(0xE05B)); // left Super = Win/⌘
         assert_eq!(code_of(0x45), Some(119)); // Windows' 0x45 is Pause
         assert_eq!(scan_of(85), None);
+        assert_eq!(us_key('a'), Some((0x1E, false)));
+        assert_eq!(us_key('?'), Some((0x35, true)));
+        assert_eq!(us_key('`'), Some((0x29, false)));
+        assert_eq!(us_key('é'), None);
     }
 }

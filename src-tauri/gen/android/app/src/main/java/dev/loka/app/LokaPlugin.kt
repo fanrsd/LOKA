@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -77,7 +78,23 @@ class LokaPlugin(private val activity: Activity) : Plugin(activity) {
       put("wirelessDebugging", global("adb_wifi_enabled"))
       put("paired", prefs.getBoolean("paired", false))
       put("running", injector?.isClosed == false)
+      put("batteryExempt", ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName))
     })
+  }
+
+  /** Asks to leave LOKA out of battery optimization (the system dialog), else opens that settings list. */
+  @Command
+  fun exemptBattery(invoke: Invoke) {
+    try {
+      activity.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, android.net.Uri.parse("package:${ctx.packageName}")))
+    } catch (e: Exception) {
+      try {
+        activity.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+      } catch (e: Exception) {
+        return invoke.reject("Android has no battery settings page here")
+      }
+    }
+    invoke.resolve()
   }
 
   @Command

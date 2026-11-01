@@ -4,9 +4,9 @@ import { listen } from "@tauri-apps/api/event";
 import { Wizard, useControl, type Control } from "./Control";
 import { Face, type Mood } from "./Face";
 import { AddHost } from "./Home";
-import { PairPrompt, osLabel, primaryButton, quietButton, type Device, type PairedDevice, type Peer } from "./Pairing";
-import type { Portal } from "./calibration";
-import { useUpdate } from "./About";
+import { ConnectionCheck, PairPrompt, StateBadge, deviceState, osLabel, primaryButton, quietButton, stateReason, type Device, type PairedDevice, type Peer } from "./Pairing";
+import { REACH, opposite, type Edge, type Portal } from "./calibration";
+import { About, useUpdate, type Update } from "./About";
 import { UpdatePrompt } from "./UpdatePrompt";
 
 type PairAnswer = "accepted" | "declined" | "noAnswer" | "unknown";
@@ -20,14 +20,24 @@ export function Mobile() {
   const [pairing, setPairing] = useState<Record<string, Pairing>>({});
   const [driving, setDriving] = useState<Peer | null>(null);
   const [screen, setScreen] = useState<"home" | "wizard" | "settings">("home");
+  const [about, setAbout] = useState(false);
+  // a computer was just paired: point at the setup that lets it move in
+  const [fresh, setFresh] = useState(false);
+  const pairedCount = useRef(-1);
   const [note, setNote] = useState("");
   const control = useControl();
   // once per launch, as on computers; phones can't update in place, so Download fetches the APK
   const [prompt, setPrompt] = useState(true);
   const update = useUpdate();
+  const apk = update.available && `https://github.com/fanrsd/LOKA/releases/download/${update.available.tag}/LOKA_${update.available.tag.slice(1)}_android.apk`;
   const files = useRef<HTMLInputElement>(null);
   const sendTo = useRef("");
-  const refreshDevice = () => invoke<Device>("get_device").then(setDevice);
+  const refreshDevice = () =>
+    invoke<Device>("get_device").then((d) => {
+      if (pairedCount.current >= 0 && d.paired.length > pairedCount.current) setFresh(true);
+      pairedCount.current = d.paired.length;
+      setDevice(d);
+    });
 
   useEffect(() => {
     const refreshPeers = () => invoke<Peer[]>("peers").then(setPeers);
@@ -59,7 +69,37 @@ export function Mobile() {
         }}
       />
     );
-  if (screen === "settings") return <Settings device={device} control={control} onSetup={() => setScreen("wizard")} onClose={() => setScreen("home")} onChange={refreshDevice} />;
+  if (screen === "settings")
+    return (
+      <>
+        <Settings device={device} control={control} update={update} onSetup={() => setScreen("wizard")} onAbout={() => setAbout(true)} onClose={() => setScreen("home")} onChange={refreshDevice} />
+        {about && (
+          <About
+            update={update}
+            seed={device.info.fingerprint}
+            os={device.info.os}
+            downloadUrl={apk}
+            extra={`Phone control: ${control.status ? JSON.stringify(control.status) : "unavailable"}`}
+            onClose={() => setAbout(false)}
+            onUpdate={() => setAbout(false)}
+          />
+        )}
+      </>
+    );
+  const controlCard = device.paired.length > 0 && (
+    <ControlCard
+      device={device}
+      computer={device.paired[0]}
+      control={control}
+      fresh={fresh}
+      onSetup={() => {
+        setFresh(false);
+        setScreen("wizard");
+      }}
+      onChange={refreshDevice}
+    />
+  );
+  const running = !!control.status?.running;
 
   /** Files picked with Android's picker go one by one; the web view gets their bytes, not paths. */
   const send = async (list: FileList | null) => {
@@ -84,7 +124,7 @@ export function Mobile() {
   };
 
   const isPaired = (f: string) => device.paired.some((p) => p.fingerprint === f);
-  const outdated = (p: Peer) => p.info.proto !== device.info.proto;
+  const outdated = (p: Peer) => deviceState(p, false, device.info) === "update";
   const nearby = peers.filter((p) => !isPaired(p.info.fingerprint));
 
   const pair = async (p: Peer) => {
@@ -114,6 +154,8 @@ export function Mobile() {
         </button>
       </header>
 
+      {!running && controlCard}
+
       <h1 className="mt-8 font-display text-[32px] font-extrabold leading-none tracking-[-0.035em]">Your computers</h1>
 
       {device.paired.length === 0 && nearby.length === 0 && (
@@ -127,20 +169,24 @@ export function Mobile() {
       <ul className="mt-6 space-y-3">
         {device.paired.map((d, i) => {
           const peer = peers.find((p) => p.info.fingerprint === d.fingerprint);
-          const usable = peer && !outdated(peer);
+          const state = deviceState(peer, true, device.info);
+          const usable = peer && state !== "update";
+          const reason = stateReason(state, d.alias, peer?.info.os);
           return (
             <li key={d.fingerprint} className="rise rounded-[24px] bg-raised p-4 ring-1 ring-line" style={{ "--i": i } as React.CSSProperties}>
               <div className="flex items-center gap-3">
-                <Face seed={d.fingerprint} size={44} mood={usable ? "idle" : "sad"} />
+                <Face seed={d.fingerprint} size={44} mood={state === "ready" ? "idle" : "sad"} />
                 <div className="min-w-0 flex-1">
                   <p className="truncate font-semibold">{d.alias}</p>
                   <p className="text-xs text-muted">
-                    {!peer ? "Not on this Wi-Fi" : outdated(peer) ? "Needs LOKA update" : <><span className="text-accent">Online</span> · {osLabel(peer.info.os)}</>}
+                    {!peer ? "Not on this Wi-Fi" : state === "update" ? osLabel(peer.info.os) : <><span className="text-accent">Online</span> · {osLabel(peer.info.os)}</>}
                   </p>
                 </div>
+                <StateBadge state={state} />
               </div>
+              {reason && <p className="mt-3 text-sm leading-relaxed text-muted">{reason}.</p>}
               <div className="mt-4 flex gap-2">
-                <button disabled={!usable} onClick={() => peer && setDriving(peer)} className={primaryButton + " min-h-11 flex-1"}>
+                <button disabled={state !== "ready"} onClick={() => peer && setDriving(peer)} className={primaryButton + " min-h-11 flex-1"}>
                   Use as touchpad
                 </button>
                 <button
@@ -154,6 +200,9 @@ export function Mobile() {
                   Send files
                 </button>
               </div>
+              <div className="mt-3">
+                <ConnectionCheck fingerprint={d.fingerprint} />
+              </div>
             </li>
           );
         })}
@@ -165,7 +214,7 @@ export function Mobile() {
         </p>
       )}
 
-      {device.paired.length > 0 && <ControlCard device={device} computer={device.paired[0]} control={control} onSetup={() => setScreen("wizard")} onChange={refreshDevice} />}
+      {running && controlCard}
 
       {nearby.length > 0 && (
         <>
@@ -194,29 +243,32 @@ export function Mobile() {
 
       <AddHost hosts={device.hosts} ips={device.ips} onChange={refreshDevice} />
       <PairPrompt selfSeed={device.info.fingerprint} />
-      {prompt && update.available && (
-        <UpdatePrompt
-          update={update}
-          seed={device.info.fingerprint}
-          downloadUrl={`https://github.com/fanrsd/LOKA/releases/download/${update.available.tag}/LOKA_${update.available.tag.slice(1)}_android.apk`}
-          onClose={() => setPrompt(false)}
-        />
-      )}
+      {prompt && update.available && <UpdatePrompt update={update} seed={device.info.fingerprint} downloadUrl={apk} onClose={() => setPrompt(false)} />}
     </main>
   );
 }
 
-/** Whether paired computers can move into this phone, which side of the computer it sits on, and the way to set it up. */
-function ControlCard({ device, computer, control, onSetup, onChange }: { device: Device; computer: PairedDevice; control: Control; onSetup: () => void; onChange: () => void }) {
+const SIDES: Edge[] = ["left", "top", "bottom", "right"];
+
+/** Whether paired computers can move into this phone, which side of the computer it sits on, and the way to set it up.
+ *  `fresh`: a computer was just paired, so the setup is what to do next. */
+function ControlCard({ device, computer, control, fresh, onSetup, onChange }: { device: Device; computer: PairedDevice; control: Control; fresh: boolean; onSetup: () => void; onChange: () => void }) {
   const [placeNote, setPlaceNote] = useState("");
+  const setup = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!fresh) return;
+    setup.current?.scrollIntoView({ block: "center", behavior: "smooth" });
+    setup.current?.focus({ preventScroll: true });
+  }, [fresh, control.status?.running]);
   const s = control.status;
   if (!s) return null;
   const { alias, fingerprint } = computer;
   // the phone's portal edge faces the computer: sitting left of it, the computer is off the phone's right edge
-  const side = device.portals[fingerprint]?.edge === "right" ? "left" : device.portals[fingerprint]?.edge === "left" ? "right" : null;
-  const place = async (where: "left" | "right") => {
+  const edge = device.portals[fingerprint]?.edge;
+  const side = edge ? opposite[edge] : null;
+  const place = async (where: Edge) => {
     const monitor = { x: 0, y: 0, w: Math.round(screen.width * devicePixelRatio), h: Math.round(screen.height * devicePixelRatio) };
-    const portal: Portal = { edge: where === "left" ? "right" : "left", monitor, start: 0, end: 1, reach: 120 };
+    const portal: Portal = { edge: opposite[where], monitor, start: 0, end: 1, reach: REACH };
     try {
       setPlaceNote((await invoke<string | null>("set_portal", { fingerprint, portal, sync: true })) ?? "");
     } catch (e) {
@@ -230,36 +282,67 @@ function ControlCard({ device, computer, control, onSetup, onChange }: { device:
         <p className="text-sm text-muted">
           <span className="font-semibold text-fg">{alias} can move into this phone.</span> Push its cursor past the side this phone sits on.
         </p>
-        <div className="mt-3 flex items-center gap-2" role="group" aria-label={`Where this phone sits next to ${alias}`}>
-          <span className="mr-1 text-xs text-muted">This phone sits</span>
-          {(["left", "right"] as const).map((w) => (
+        <p id="side-label" className="mt-3 text-xs text-muted">
+          This phone sits on {alias}'s
+        </p>
+        <div className="mt-2 flex flex-wrap gap-2" role="group" aria-labelledby="side-label">
+          {SIDES.map((w) => (
             <button
               key={w}
               aria-pressed={side === w}
               onClick={() => place(w)}
-              className={"min-h-11 rounded-full px-4 text-sm ring-1 ring-line transition-colors " + (side === w ? "bg-fg font-semibold text-ink" : "text-muted")}
+              className={"min-h-11 rounded-full px-4 text-sm capitalize ring-1 ring-line transition-colors " + (side === w ? "bg-fg font-semibold text-ink" : "text-muted")}
             >
-              {w === "left" ? "Left" : "Right"}
+              {w}
             </button>
           ))}
         </div>
-        {placeNote && <p className="mt-2 text-xs text-muted">{placeNote}</p>}
+        <p role="status" className="mt-2 min-h-4 text-xs text-muted">
+          {placeNote}
+        </p>
+        <Battery control={control} />
       </div>
     );
   return (
-    <div className="mt-6 rounded-[24px] bg-raised p-4 ring-1 ring-line">
-      <p className="font-semibold">{s.paired ? `${alias} can't move into this phone right now` : `Let ${alias} move into this phone`}</p>
+    <div className={"mt-6 rounded-[24px] bg-raised p-4 ring-1 transition-shadow " + (fresh ? "ring-2 ring-accent" : "ring-line")}>
+      <p className="font-semibold">{s.paired ? `${alias} can't move into this phone right now` : `${alias} can't move into this phone yet`}</p>
       <p className={"mt-1 text-sm leading-relaxed " + (control.error ? "text-danger" : "text-muted")}>
-        {s.paired ? (control.error ?? "Starting…") : "Push its cursor past the screen edge and keep working here. One-time setup in Android settings."}
+        {s.paired
+          ? (control.error ?? "Starting…")
+          : "Touchpad and Send files already work. To let its cursor move in past the screen edge, do the one-time setup in Android settings."}
       </p>
-      <button onClick={s.paired && control.error ? control.retry : onSetup} className={quietButton + " mt-3 min-h-11 text-fg ring-1 ring-line"}>
+      <button ref={setup} onClick={s.paired && control.error ? control.retry : onSetup} className={(fresh ? primaryButton : quietButton + " text-fg ring-1 ring-line") + " mt-3 min-h-11"}>
         {s.paired && control.error ? "Try again" : "Set up"}
+      </button>
+      <Battery control={control} />
+    </div>
+  );
+}
+
+/** Android's battery optimisation may stop LOKA in the background, and with it every way in. */
+function Battery({ control, className = "mt-3 border-t border-line pt-3" }: { control: Control; className?: string }) {
+  if (!control.status || control.status.batteryExempt) return null;
+  // back from Android's dialog, useControl's visibilitychange refresh picks up the answer
+  const allow = () => invoke("plugin:loka|exemptBattery").then(control.refresh, () => {});
+  return (
+    <div className={"flex items-center gap-3 " + className}>
+      <p className="flex-1 text-sm text-muted">Android may close LOKA in the background</p>
+      <button onClick={allow} className={quietButton + " min-h-11 text-fg ring-1 ring-line"}>
+        Allow
       </button>
     </div>
   );
 }
 
-function Settings({ device, control, onSetup, onClose, onChange }: { device: Device; control: Control; onSetup: () => void; onClose: () => void; onChange: () => void }) {
+function Settings({ device, control, update, onSetup, onAbout, onClose, onChange }: {
+  device: Device;
+  control: Control;
+  update: Update;
+  onSetup: () => void;
+  onAbout: () => void;
+  onClose: () => void;
+  onChange: () => void;
+}) {
   const s = control.status;
   return (
     <main className="min-h-full px-5 pb-10 pt-12">
@@ -279,6 +362,7 @@ function Settings({ device, control, onSetup, onClose, onChange }: { device: Dev
           {s?.paired ? "Set up again" : "Set up"}
         </button>
       </div>
+      <Battery control={control} className="mt-2 rounded-[20px] bg-raised p-4 ring-1 ring-line" />
 
       <p className="mt-6 px-1 text-xs text-muted">Received files</p>
       <p className="mt-2 break-all rounded-[20px] bg-raised p-4 font-mono text-xs text-muted ring-1 ring-line">{device.received}</p>
@@ -299,6 +383,15 @@ function Settings({ device, control, onSetup, onClose, onChange }: { device: Dev
           ))}
         </ul>
       )}
+
+      <button
+        onClick={onAbout}
+        className="mt-6 flex min-h-11 w-full items-center gap-3 rounded-[20px] bg-raised p-4 text-left ring-1 ring-line transition-colors hover:bg-white/[0.04] focus-visible:outline-2 focus-visible:outline-accent"
+      >
+        <span className="flex-1 text-sm font-medium">About LOKA</span>
+        {update.available && <span aria-hidden className="h-2 w-2 rounded-full bg-accent" />}
+        <span className="text-xs text-muted">{update.available ? `${update.available.name} available` : update.current ? `Version ${update.current}` : ""}</span>
+      </button>
     </main>
   );
 }
@@ -322,7 +415,12 @@ function scanOf(ch: string): [number, boolean] | null {
   return null;
 }
 
-type Input = { type: "move"; dx: number; dy: number } | { type: "button"; button: number; down: boolean } | { type: "wheel"; dx: number; dy: number } | { type: "key"; scan: number; down: boolean };
+type Input =
+  | { type: "move"; dx: number; dy: number }
+  | { type: "button"; button: number; down: boolean }
+  | { type: "wheel"; dx: number; dy: number }
+  | { type: "key"; scan: number; down: boolean }
+  | { type: "text"; text: string };
 const send = (event: Input) => invoke("touch", { event });
 const tapKey = (scan: number, shift = false) => {
   if (shift) send({ type: "key", scan: SHIFT, down: true });
@@ -334,6 +432,18 @@ const click = (button: number) => {
   send({ type: "button", button, down: true });
   send({ type: "button", button, down: false });
 };
+/** Types `text` on the computer: as text when it takes any character (its own layout can't garble it), else as US keys. Line breaks are Enter. */
+const typeText = (text: string, asText: boolean) =>
+  text.split("\n").forEach((line, i) => {
+    if (i) tapKey(ENTER);
+    if (!line) return;
+    if (asText) send({ type: "text", text: line });
+    else
+      for (const ch of line) {
+        const k = scanOf(ch);
+        if (k) tapKey(...k);
+      }
+  });
 
 /** Cursor px per CSS px of finger travel. */
 const SPEED = 2.5;
@@ -347,6 +457,8 @@ function Touchpad({ peer, onClose }: { peer: Peer; onClose: () => void }) {
   const [session, setSession] = useState<Session>({ state: "connecting" });
   const [typing, setTyping] = useState(false);
   const keys = useRef<HTMLTextAreaElement>(null);
+  /** what the box held after the last input */
+  const box = useRef(" ");
   const fingers = useRef(new Map<number, { x: number; y: number }>());
   const gesture = useRef({ start: 0, moved: 0, most: 0, rest: { x: 0, y: 0, wheel: 0 } });
   const fp = peer.info.fingerprint;
@@ -409,21 +521,25 @@ function Touchpad({ peer, onClose }: { peer: Peer; onClose: () => void }) {
   };
 
   const typed = (e: React.FormEvent<HTMLTextAreaElement>) => {
-    // the box always holds one space: a shorter value is Backspace, anything after it is typed text
-    const v = e.currentTarget.value;
-    if (v.length === 0) tapKey(BACKSPACE);
-    for (const ch of v.slice(1)) {
-      const k = scanOf(ch);
-      if (k) tapKey(...k);
-    }
-    e.currentTarget.value = " ";
+    // the box starts as one space, so Backspace still shows on an "empty" box. What changed since the last input
+    // goes out: removed characters as Backspace, new ones as typed text (so IME words, autocorrect and emoji work)
+    const t = e.currentTarget;
+    const [v, old] = [t.value, box.current];
+    let p = 0;
+    while (p < old.length && p < v.length && old[p] === v[p]) p++;
+    if (p > 0 && /[\uD800-\uDBFF]/.test(old[p - 1])) p--; // never half an emoji
+    for (const _ of old.slice(p)) tapKey(BACKSPACE);
+    typeText(v.slice(p), peer.info.text === true);
+    // a word still being composed stays in the box, so the keyboard can keep changing it
+    if ((e.nativeEvent as InputEvent).isComposing) box.current = v;
+    else t.value = box.current = " ";
   };
 
   const toggleKeys = () => {
     const t = keys.current!;
     if (typing) t.blur();
     else {
-      t.value = " ";
+      t.value = box.current = " ";
       t.focus();
     }
     setTyping(!typing);

@@ -62,7 +62,7 @@ export function useUpdate(): Update {
   return { ...s, available: latest && s.current && isNewer(latest.tag, s.current) ? latest : undefined, installable, check };
 }
 
-/** One-time permission fix per OS: Windows Firewall, Linux input devices. */
+/** One-time permission fix per OS: Windows Firewall, Linux input devices, macOS Accessibility. */
 const FIX: Record<string, { title: string; text: string; button: string; command: string; failed: string }> = {
   windows: {
     title: "Network",
@@ -78,11 +78,30 @@ const FIX: Record<string, { title: string; text: string; button: string; command
     command: "allow_input",
     failed: "Input access was not allowed",
   },
+  macos: {
+    title: "Mouse and keyboard",
+    text: "Other devices can only move the cursor and type here when LOKA is allowed under Accessibility. macOS forgets that after every LOKA update, so allow it again then.",
+    button: "Allow Accessibility",
+    command: "allow_input",
+    failed: "System Settings didn't open",
+  },
 };
 
-export function About({ update, seed, os, onClose, onUpdate }: { update: Update; seed: string; os: string; onClose: () => void; onUpdate: () => void }) {
+/** `downloadUrl`: what Download opens instead of the release page (the phone's APK). `extra`: appended to the diagnostics (the phone's control status). */
+export function About({ update, seed, os, onClose, onUpdate, downloadUrl, extra }: { update: Update; seed: string; os: string; onClose: () => void; onUpdate: () => void; downloadUrl?: string; extra?: string }) {
   const [fixed, setFixed] = useState<"idle" | "busy" | "done" | string>("idle");
+  const [copied, setCopied] = useState("");
   const fix = FIX[os];
+
+  const copy = async () => {
+    try {
+      const report = await invoke<string>("diagnostics");
+      await navigator.clipboard.writeText(extra ? `${report}\n${extra}\n` : report);
+      setCopied("Copied");
+    } catch (e) {
+      setCopied(`Couldn't copy: ${e}`);
+    }
+  };
 
   useEffect(() => {
     const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -99,9 +118,21 @@ export function About({ update, seed, os, onClose, onUpdate }: { update: Update;
     }, () => {});
   }, [os]);
 
+  // macOS: the switch lives in System Settings, so show what it says now (re-read when the user comes back)
+  useEffect(() => {
+    if (os !== "macos") return;
+    const read = () => invoke<{ info: { controllable?: boolean } }>("get_device").then((d) => d.info.controllable !== false && setFixed("done"), () => {});
+    read();
+    window.addEventListener("focus", read);
+    return () => window.removeEventListener("focus", read);
+  }, [os]);
+
   const allow = () => {
     setFixed("busy");
-    invoke(fix.command).then(() => setFixed("done"), (e) => setFixed(String(e) || fix.failed));
+    invoke(fix.command).then(
+      () => setFixed(os === "macos" ? "Turn LOKA on in the list, then come back here" : "done"),
+      (e) => setFixed(String(e) || fix.failed),
+    );
   };
 
   return (
@@ -141,7 +172,7 @@ export function About({ update, seed, os, onClose, onUpdate }: { update: Update;
                     Update now
                   </button>
                 ) : (
-                  <button onClick={() => invoke("open_url", { url: update.available!.url })} className={primaryButton}>
+                  <button onClick={() => invoke("open_url", { url: downloadUrl ?? update.available!.url })} className={primaryButton}>
                     Download
                   </button>
                 )}
@@ -178,6 +209,19 @@ export function About({ update, seed, os, onClose, onUpdate }: { update: Update;
               </div>
             </section>
           )}
+
+          <section className="mt-6">
+            <h3 className="text-xs font-medium text-faint">Troubleshooting</h3>
+            <p className="mt-2 text-sm leading-relaxed text-muted">Something not working? Copy a short report (versions, network, devices; no keys) and paste it into your problem report.</p>
+            <div className="mt-3 flex items-center gap-3">
+              <button onClick={copy} className={quietButton + " min-h-11 ring-1 ring-line"}>
+                Copy diagnostics
+              </button>
+              <span role="status" className={`text-xs ${copied === "Copied" ? "text-fg" : "text-danger"}`}>
+                {copied}
+              </span>
+            </div>
+          </section>
 
           {update.releases && update.releases.length > 0 && (
             <section className="mt-6">

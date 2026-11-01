@@ -7,7 +7,7 @@ import { About, useUpdate } from "./About";
 import { UpdatePrompt } from "./UpdatePrompt";
 import { Calibrate } from "./Calibrate";
 import { Face, type Mood } from "./Face";
-import { PairPrompt, osLabel, quietButton, type Device, type Peer } from "./Pairing";
+import { ConnectionCheck, PairPrompt, StateBadge, StateNote, deviceState, osLabel, quietButton, stateReason, type Device, type Peer } from "./Pairing";
 import { ClipHistory } from "./ClipHistory";
 import { Outbox } from "./Outbox";
 import { Pointer } from "./Pointer";
@@ -117,7 +117,8 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
   }, [kvm.error]);
 
   const isPaired = (f: string) => device.paired.some((p) => p.fingerprint === f);
-  const outdated = (p: Peer) => p.info.proto !== device.info.proto;
+  const stateOf = (p: Peer) => deviceState(p, isPaired(p.info.fingerprint), device.info);
+  const outdated = (p: Peer) => stateOf(p) === "update";
   const select = (f: string | null) => {
     setSelected(f);
     if (f) localStorage.setItem(SELECTED_KEY, f);
@@ -126,6 +127,8 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
 
   const offlinePaired = device.paired.filter((p) => !peers.some((c) => c.info.fingerprint === p.fingerprint));
   const current = peers.find((c) => c.info.fingerprint === selected && isPaired(selected) && !outdated(c));
+  const selPeer = peers.find((c) => c.info.fingerprint === selected);
+  const selState = deviceState(selPeer, true, device.info);
   const placed = (f: string) => f in device.portals;
 
   /** Resolves with whether the other device accepted. */
@@ -146,8 +149,9 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
   const view = (p: Peer): { mood: Mood; note: string; tone: "fg" | "muted" | "danger" } => {
     const f = p.info.fingerprint;
     const s = pairing[f];
-    if (outdated(p)) return { mood: "sad", note: "Needs LOKA update", tone: "muted" };
+    if (outdated(p)) return { mood: "sad", note: "", tone: "muted" };
     if (s?.state === "waiting") return { mood: "waiting", note: s.code ? `Code ${s.code}` : "Asking…", tone: "fg" };
+    if (stateOf(p) === "setup") return { mood: selected === f ? "happy" : "idle", note: "", tone: "muted" };
     if (isPaired(f)) return { mood: selected === f ? "happy" : "idle", note: placed(f) ? "Paired" : "Paired · place it", tone: selected === f ? "fg" : "muted" };
     if (s?.state === "declined") return { mood: "sad", note: "Declined", tone: "danger" };
     if (s?.state === "noAnswer") return { mood: "sad", note: "No answer", tone: "danger" };
@@ -175,7 +179,7 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
     if (outdated(p)) return [{ text: "Needs a LOKA update", enabled: false }];
     if (!isPaired(f)) return [{ text: "Pair…", enabled: pairing[f]?.state !== "waiting", action: () => void pair(p) }];
     return [
-      { text: "Control", enabled: placed(f), action: () => void invoke("control", { fingerprint: f }) },
+      { text: stateOf(p) === "setup" ? `Control: finish setup on ${p.info.alias}` : "Control", enabled: placed(f) && stateOf(p) === "ready", action: () => void invoke("control", { fingerprint: f }) },
       { text: "Send files…", action: () => void sendFiles(f) },
       placed(f) && { text: "Take off screens", action: () => void invoke("set_portal", { fingerprint: f, portal: null, sync: true }).then(onChange) },
       { item: "Separator" },
@@ -235,14 +239,20 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
                     disabled={pairing[f]?.state === "waiting" || outdated(p)}
                     onClick={() => (isPaired(f) ? select(f) : pair(p))}
                     aria-pressed={active}
-                    aria-label={`${p.info.alias}, ${osLabel(p.info.os)}. ${v.note}`}
+                    aria-label={`${p.info.alias}, ${osLabel(p.info.os)}. ${stateReason(stateOf(p), p.info.alias, p.info.os) ?? v.note}`}
                     className={`group flex w-32 flex-col items-center rounded-[22px] px-2 pb-3 pt-4 transition-[background-color,transform] duration-300 ease-[var(--ease-spring)] hover:bg-white/[0.04] active:scale-[0.96] focus-visible:outline-2 focus-visible:outline-accent ${outdated(p) ? "disabled:cursor-not-allowed" : "disabled:cursor-wait"}`}
                   >
                     <span className={`rounded-[36%] p-1 ring-2 transition-[box-shadow,transform] duration-300 ease-[var(--ease-spring)] group-hover:-translate-y-0.5 ${active ? "ring-accent" : "ring-transparent"}`}>
                       <Face seed={f} size={68} mood={v.mood} />
                     </span>
                     <span className="mt-3 w-full truncate text-center text-sm font-semibold">{p.info.alias}</span>
-                    <span className={`mt-0.5 text-xs tabular-nums ${v.tone === "danger" ? "text-danger" : v.tone === "fg" ? "text-fg" : "text-muted"}`}>{v.note}</span>
+                    {stateOf(p) === "ready" ? (
+                      <span className={`mt-0.5 text-xs tabular-nums ${v.tone === "danger" ? "text-danger" : v.tone === "fg" ? "text-fg" : "text-muted"}`}>{v.note}</span>
+                    ) : (
+                      <span className="mt-1">
+                        <StateBadge state={stateOf(p)} />
+                      </span>
+                    )}
                   </button>
                 </li>
               );
@@ -260,7 +270,9 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
                   <Face seed={p.fingerprint} size={68} mood="sad" />
                 </span>
                 <span className="mt-3 w-full truncate text-center text-sm font-semibold">{p.alias}</span>
-                <span className="mt-0.5 text-xs text-muted">Offline</span>
+                <span className="mt-1">
+                  <StateBadge state="offline" />
+                </span>
                 {device.wakeable.includes(p.fingerprint) && (
                   <button onClick={() => invoke("wake", { fingerprint: p.fingerprint })} className="mt-1 text-xs text-accent underline-offset-2 hover:underline">
                     Wake up
@@ -278,22 +290,37 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
 
       {!empty && <Calibrate device={device} peers={peers} selected={selected} onSelect={select} onPair={pair} onChange={onChange} />}
 
+      {selected && isPaired(selected) && selState !== "ready" && (
+        <div className="mt-6">
+          <StateNote
+            state={selState}
+            alias={device.paired.find((d) => d.fingerprint === selected)!.alias}
+            os={selPeer?.info.os}
+            onWake={device.wakeable.includes(selected) ? () => void invoke("wake", { fingerprint: selected }) : undefined}
+          />
+        </div>
+      )}
       {current && selected && (
         <>
           <Pointer initial={device.cursor} mac={mac} />
           <Remote key={selected} fingerprint={selected} alias={current.info.alias} mac={mac} />
-          <div className="mt-4 flex justify-end">
+        </>
+      )}
+      {selected && isPaired(selected) && (
+        <div className="mt-4 flex items-start justify-between gap-4">
+          <ConnectionCheck key={selected} fingerprint={selected} />
+          {current && (
             <button
               onClick={() => {
                 invoke("unpair", { fingerprint: selected });
                 select(null);
               }}
-              className="text-xs text-faint underline-offset-2 hover:text-danger hover:underline"
+              className="min-h-11 text-xs text-faint underline-offset-2 hover:text-danger hover:underline"
             >
               Unpair {current.info.alias}
             </button>
-          </div>
-        </>
+          )}
+        </div>
       )}
 
       {/* status toast while input is on another device, locked, or why it couldn't move */}

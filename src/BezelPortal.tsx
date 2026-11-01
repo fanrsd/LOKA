@@ -13,13 +13,57 @@ const core = (hex: string) => {
   return `rgb(${mix(n >> 16)} ${mix((n >> 8) & 255)} ${mix(n & 255)})`;
 };
 
+/** The blocked reason on a dark pill just inside the edge, along it (turned for side edges, since the window is only `reach`
+ *  deep), word-wrapped to the lines that fit and centred near the cursor `y` (0..1). */
+function drawLabel(ctx: CanvasRenderingContext2D, text: string, alpha: number, side: string, w: number, h: number, y: number) {
+  const vertical = side === "left" || side === "right";
+  const L = vertical ? h : w, D = vertical ? w : h;
+  const lh = 15, pad = 7, gap = 10;
+  ctx.font = '600 12px "Segoe UI Variable", system-ui, -apple-system, sans-serif';
+  const max = L - 2 * pad - 8;
+  const rows = Math.max(1, Math.floor((D - gap - 2 * pad) / lh));
+  const lines: string[] = [];
+  for (const word of text.split(" ")) {
+    const last = lines.length ? `${lines[lines.length - 1]} ${word}` : word;
+    if (lines.length && ctx.measureText(last).width <= max) lines[lines.length - 1] = last;
+    else lines.push(word);
+  }
+  if (lines.length > rows) {
+    lines.length = rows;
+    let end = lines[rows - 1];
+    while (end && ctx.measureText(end + "…").width > max) end = end.slice(0, -1);
+    lines[rows - 1] = end + "…";
+  }
+  const bw = Math.min(max, Math.max(...lines.map((l) => ctx.measureText(l).width))) + 2 * pad;
+  const bh = lines.length * lh + 2 * pad;
+  const along = Math.min(Math.max(y * L, bw / 2 + 4), L - bw / 2 - 4);
+  const depth = gap + bh / 2;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(side === "left" ? depth : side === "right" ? w - depth : along, side === "top" ? depth : side === "bottom" ? h - depth : along);
+  if (vertical) ctx.rotate(side === "left" ? -Math.PI / 2 : Math.PI / 2);
+  ctx.fillStyle = "rgba(5, 6, 12, 0.88)"; // ink
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(-bw / 2, -bh / 2, bw, bh, 9);
+  else ctx.rect(-bw / 2, -bh / 2, bw, bh); // WebKit before Safari 16
+  ctx.fill();
+  ctx.fillStyle = "#eceff7"; // fg
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  lines.forEach((l, i) => ctx.fillText(l, 0, -bh / 2 + pad + lh * (i + 0.5), max));
+  ctx.restore();
+}
+
 /**
  * Neon edge in the user's colour. Motion "ripple": NameDrop-style liquid line that bulges toward the
  * cursor, radiates waves while it is near and splashes when the cursor crosses or a file drops.
  * "pulse": straight line whose glow swells with proximity and flashes on crossing. "calm": steady line.
+ * `blocked`: the device behind it can't be driven (`stateReason`): dimmed, dashed, and the reason beside the edge when the cursor is close.
  */
-export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | "bottom"; event: string }) {
+export function BezelPortal({ side, event, blocked = null }: { side: "left" | "right" | "top" | "bottom"; event: string; blocked?: string | null }) {
   const canvas = useRef<HTMLCanvasElement>(null);
+  const note = useRef(blocked);
+  note.current = blocked;
 
   useEffect(() => {
     const el = canvas.current!;
@@ -39,6 +83,7 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
     // auto-hide: how near the cursor is (tracker `hover`, button or not) and how visible the glow is (-1: not yet drawn)
     const hover = { p: 0 };
     let shown = -1, applied = "";
+    let label = 0; // how visible the blocked reason is
 
     // crossing / drop / preview
     const splash = (y: number) => {
@@ -126,8 +171,13 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
       const busy = cur.p > 0.02 || ripples.length > 0 || flare > 0 || xfer.active || now - xfer.end < 900;
       const want = !look.autoHide || busy ? 1 : Math.min(1, hover.p * 1.5);
       shown = shown < 0 ? want : shown + (want - shown) * 0.12;
-      const op = (look.opacity * shown).toFixed(3); // only touch the style when it changes
+      const why = note.current;
+      const wantLabel = why && hover.p > 0.6 ? 1 : 0;
+      label = reduced ? wantLabel : label + (wantLabel - label) * 0.15;
+      // the reason stays readable even with a faint or auto-hidden glow
+      const op = Math.max(look.opacity * shown, label * 0.95).toFixed(3); // only touch the style when it changes
       if (op !== applied) el.style.opacity = applied = op;
+      const dim = why ? 0.35 : 1;
       const thick = look.width;
       const grad = vertical ? ctx.createLinearGradient(0, 0, 0, h) : ctx.createLinearGradient(0, 0, w, 0);
       // the chosen colour along the edge, a white-hot core where the cursor is
@@ -144,13 +194,15 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
       ctx.lineCap = "round";
       ctx.strokeStyle = grad;
       ctx.globalCompositeOperation = "lighter";
+      if (why) ctx.setLineDash([12 * thick, 10 * thick]);
       for (const [width, blur, alpha] of [[10, 28, 0.35], [5, 14, 0.6], [2, 4, 1]] as const) {
         ctx.lineWidth = width * thick * (1 + flare);
         ctx.shadowBlur = blur * thick * (1 + flare);
         ctx.shadowColor = look.color;
-        ctx.globalAlpha = alpha * glow;
+        ctx.globalAlpha = alpha * glow * dim;
         ctx.stroke();
       }
+      ctx.setLineDash([]);
       ctx.globalAlpha = 1;
       ctx.shadowBlur = 0;
 
@@ -170,6 +222,7 @@ export function BezelPortal({ side, event }: { side: "left" | "right" | "top" | 
         ctx.shadowBlur = 0;
       }
       ctx.globalCompositeOperation = "source-over";
+      if (why && label > 0.01) drawLabel(ctx, why, label, side, w, h, cur.y);
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);

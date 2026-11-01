@@ -16,6 +16,8 @@ mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::{allow_input, HEADLESS};
+#[cfg(target_os = "macos")]
+pub use macos::allow_input;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CursorSample {
@@ -61,12 +63,47 @@ impl Gesture {
 /// Scroll Lock (set-1), the cursor-lock key as in Synergy; a Mac's F14 maps to it.
 pub const LOCK_SCAN: u16 = 0x46;
 
-/// What the local capture hook produced.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What the local capture hook (or the phone's touchpad) produced.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Captured {
     Input(InputEvent),
+    /// Text typed on the phone's keyboard, for a peer that takes Text frames.
+    Text(String),
     /// Ctrl+Alt+Esc: always hands control back to this machine.
     Escape,
+}
+
+/// The phone's touchpad: pointer/key input, or text typed on its keyboard (`{type: "text", text}`).
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum Touch {
+    Text { text: String },
+    Input(InputEvent),
+}
+
+/// What a key-down types on this computer's active keyboard layout (driver side, see `kvm::Tune::typed`).
+#[derive(Debug, PartialEq)]
+pub enum Typed {
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))] // no layout lookup there
+    Text(String),
+    /// a dead key (it composes with the next one), or the up of a key that went as text
+    Nothing,
+    /// not a character (Enter, arrows, F-keys…): goes as its scancode
+    Key,
+}
+
+/// `(scan, shift, alt, caps) → Typed` on the active layout; `alt` = AltGr on Windows, Option on a Mac.
+pub type KeyText = fn(u16, bool, bool, bool) -> Typed;
+
+/// The driver's layout lookup, if this OS has one.
+pub fn key_text() -> Option<KeyText> {
+    #[cfg(target_os = "windows")]
+    return Some(windows::key_text);
+    #[cfg(target_os = "macos")]
+    return Some(macos::key_text);
+    // shortcut: Linux (and phones) drive positionally; add an XKB lookup if a non-US Linux drives a phone
+    #[allow(unreachable_code)]
+    None
 }
 
 static ORIGIN: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
@@ -87,13 +124,15 @@ pub fn starved() -> bool {
 }
 
 /// What a receiver asks its OS to perform. Positions are absolute physical px.
-#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Injected {
     MoveTo { x: f64, y: f64 },
     Button { button: u8, down: bool },
     Wheel { dx: i32, dy: i32 },
     Key { scan: u16, down: bool },
+    /// type this text at the cursor, whatever the layout
+    Text { text: String },
 }
 
 pub trait SpatialPlatformEngine: Send + Sync {
@@ -175,6 +214,8 @@ fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboar
 pub fn clipboard_text() -> Option<String> {
     #[cfg(desktop)]
     return with_clipboard(|c| c.get_text()).ok().filter(|t| !t.is_empty() && !clipboard_concealed());
+    #[cfg(target_os = "android")]
+    return android::clipboard_text().filter(|t| !t.is_empty());
     #[allow(unreachable_code)]
     None
 }
@@ -184,6 +225,10 @@ pub fn set_clipboard_text(text: &str) {
     #[cfg(desktop)]
     if let Err(e) = with_clipboard(|c| if c.get_text().ok().as_deref() == Some(text) { Ok(()) } else { c.set_text(text) }) {
         eprintln!("clipboard: {e}");
+    }
+    #[cfg(target_os = "android")]
+    if android::clipboard_text().as_deref() != Some(text) {
+        android::set_clipboard_text(text);
     }
 }
 
@@ -223,9 +268,12 @@ static TOUCH: std::sync::Mutex<Option<UnboundedSender<Captured>>> = std::sync::M
 
 /// Input from the app's own touchpad (the phone driving a computer); dropped while not driving.
 #[cfg_attr(desktop, allow(dead_code))]
-pub fn touch(e: InputEvent) {
+pub fn touch(e: Touch) {
     if let Some(tx) = TOUCH.lock().unwrap().as_ref() {
-        let _ = tx.send(Captured::Input(e));
+        let _ = tx.send(match e {
+            Touch::Text { text } => Captured::Text(text),
+            Touch::Input(e) => Captured::Input(e),
+        });
     }
 }
 

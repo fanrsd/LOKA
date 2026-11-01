@@ -1,5 +1,7 @@
 package dev.loka.app
 
+import android.content.ClipData
+import android.os.IBinder
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.InputEvent
@@ -8,13 +10,18 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import java.io.DataInputStream
 import java.net.Socket
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 /**
  * Started by LOKA over its own ADB connection as the shell user:
  * `CLASSPATH=<apk> app_process / dev.loka.app.Injector <port> <token>`.
  * Connects back to the app on 127.0.0.1:<port>, proves itself with <token>, then turns 9-byte frames
  * (tag, i32, i32 little-endian) into input events: 1 move to (x, y), 2 button (b, down), 3 wheel (dx, dy),
- * 4 key (set-1 scancode, down), 5 wake the screen. The shell user may inject input; apps may not.
+ * 4 key (set-1 scancode, down), 5 wake the screen. 6 type text and 7 set the clipboard are followed by `a`
+ * bytes of UTF-8; 8 is answered with the clipboard text (u32 LE length + UTF-8, 0 = none). The shell user
+ * may inject input and use the clipboard in the background; apps may not.
  */
 object Injector {
   private val inject = run {
@@ -44,6 +51,7 @@ object Injector {
     socket.tcpNoDelay = true
     socket.getOutputStream().apply { write(args[1].toByteArray()); write('\n'.code); flush() }
     val input = DataInputStream(socket.getInputStream().buffered())
+    val output = socket.getOutputStream()
     val frame = ByteArray(9)
     while (true) {
       input.readFully(frame)
@@ -55,8 +63,79 @@ object Injector {
         3 -> wheel(a, b)
         4 -> key(a, b != 0)
         5 -> tap(KeyEvent.KEYCODE_WAKEUP) // no-op when the screen is already on
+        6 -> typeText(utf8(input, a))
+        7 -> utf8(input, a).let {
+          synchronized(this) {
+            // a newer clip than the one a paste would put back
+            restore?.cancel(false)
+            saved = null
+            setClip(ClipData.newPlainText("LOKA", it))
+          }
+        }
+        8 -> {
+          val text = (synchronized(this) { saved ?: getClip() }?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString() ?: "").toByteArray()
+          val n = text.size
+          output.write(byteArrayOf(n.toByte(), (n shr 8).toByte(), (n shr 16).toByte(), (n shr 24).toByte()) + text)
+          output.flush()
+        }
       }
     }
+  }
+
+  private fun utf8(input: DataInputStream, len: Int) = ByteArray(len).also { input.readFully(it) }.toString(Charsets.UTF_8)
+
+  private val keymap by lazy { KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD) }
+
+  /** Types [text] as key events; what the keymap can't type (emoji, other scripts) is pasted from the clipboard (as scrcpy). */
+  private fun typeText(text: String) {
+    val events = keymap.getEvents(text.toCharArray())
+    if (events != null) {
+      for (e in events) inject(KeyEvent.changeTimeRepeat(e, SystemClock.uptimeMillis(), 0))
+      return
+    }
+    synchronized(this) {
+      // the user's own clip comes back once the app had time to paste ours
+      if (saved == null) saved = getClip() ?: ClipData.newPlainText("", "")
+      setClip(ClipData.newPlainText("LOKA", text))
+      restore?.cancel(false)
+      restore = later.schedule(Runnable { synchronized(this) { saved?.let { setClip(it) }; saved = null } }, 500, TimeUnit.MILLISECONDS)
+    }
+    tap(KeyEvent.KEYCODE_PASTE)
+  }
+
+  /** The clip [typeText] pasted over, until it is put back. */
+  private var saved: ClipData? = null
+  private var restore: ScheduledFuture<*>? = null
+  private val later = Executors.newSingleThreadScheduledExecutor { r -> Thread(r).apply { isDaemon = true } }
+
+  // hidden IClipboard, whose signatures change between versions: Strings = calling package (shell), then
+  // attribution tag (null); ints = user, then device id (both 0)
+  private val clipboard by lazy {
+    val binder = Class.forName("android.os.ServiceManager").getMethod("getService", String::class.java).invoke(null, "clipboard") as IBinder
+    Class.forName("android.content.IClipboard\$Stub").getMethod("asInterface", IBinder::class.java).invoke(null, binder)!!
+  }
+
+  /** A failing clipboard call (a vendor signature we don't know) must never stop input: logged, null. */
+  private fun callClipboard(name: String, clip: ClipData?): Any? = try {
+    val m = clipboard.javaClass.methods.first { it.name == name }
+    var strings = 0
+    val args = m.parameterTypes.map {
+      when (it) {
+        ClipData::class.java -> clip
+        String::class.java -> if (strings++ == 0) "com.android.shell" else null
+        else -> 0
+      }
+    }
+    m.invoke(clipboard, *args.toTypedArray())
+  } catch (e: Exception) {
+    System.err.println("LOKA clipboard $name: $e")
+    null
+  }
+
+  private fun getClip() = callClipboard("getPrimaryClip", null) as ClipData?
+
+  private fun setClip(clip: ClipData) {
+    callClipboard("setPrimaryClip", clip)
   }
 
   private fun le(f: ByteArray, at: Int) =

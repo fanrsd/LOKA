@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { deviceState, stateReason, type DeviceInfo, type DeviceState, type Peer } from "./Pairing";
 
 export type Edge = "left" | "right" | "top" | "bottom";
 export type Rect = { x: number; y: number; w: number; h: number };
@@ -83,17 +84,24 @@ export function useEdge(): Edge {
   return edge;
 }
 
-/** Whether the device behind this portal window is on the network now (the band's driver always is). */
-export function useOnline(): boolean {
-  const [online, setOnline] = useState(true);
+/** The device behind this portal window (`deviceState`; the band's driver is always ready) and, when it can't be
+ *  driven though online, the one-line reason the glow shows. */
+export function usePortalState(): { state: DeviceState; note: string | null } {
+  const [s, setS] = useState<{ state: DeviceState; note: string | null }>({ state: "ready", note: null });
   useEffect(() => {
     const label = getCurrentWebviewWindow().label;
     if (!label.startsWith("portal-")) return;
     const prefix = label.slice("portal-".length);
-    const check = () => invoke<{ info: { fingerprint: string } }[]>("peers").then((p) => setOnline(p.some((x) => x.info.fingerprint.startsWith(prefix))));
+    const me = invoke<{ info: DeviceInfo }>("get_device").then((d) => d.info);
+    const check = () =>
+      Promise.all([invoke<Peer[]>("peers"), me]).then(([peers, info]) => {
+        const peer = peers.find((x) => x.info.fingerprint.startsWith(prefix));
+        const state = deviceState(peer, true, info); // a portal only exists for a paired device
+        setS({ state, note: state === "offline" ? null : stateReason(state, peer!.info.alias, peer!.info.os) });
+      });
     check();
     const t = setInterval(check, 5000); // same pace as Home's list
     return () => clearInterval(t);
   }, []);
-  return online;
+  return s;
 }

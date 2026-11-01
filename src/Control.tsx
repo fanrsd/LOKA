@@ -3,8 +3,8 @@ import { addPluginListener, invoke } from "@tauri-apps/api/core";
 import { Face } from "./Face";
 import { primaryButton, quietButton } from "./Pairing";
 
-/** What LokaPlugin.kt reports about Wireless debugging and the injector. */
-export type ControlStatus = { sdk: number; maker: string; devOptions: boolean; wirelessDebugging: boolean; paired: boolean; running: boolean };
+/** What LokaPlugin.kt reports about Wireless debugging and the injector. `batteryExempt`: Android won't stop LOKA in the background. */
+export type ControlStatus = { sdk: number; maker: string; devOptions: boolean; wirelessDebugging: boolean; paired: boolean; running: boolean; batteryExempt: boolean };
 
 const status = () => invoke<ControlStatus>("plugin:loka|status");
 const openSettings = (page: "about" | "developer" | "wireless" | "security") => invoke("plugin:loka|openSettings", { page });

@@ -72,6 +72,8 @@ async fn serve() {
         kvm_port: kvm::PORT,
         proto: kvm::PROTOCOL,
         mac: mac_address::get_mac_address().ok().flatten().map(|m| m.to_string()),
+        controllable: true, // corrected by `watch_controllable` right away
+        text: true,
     };
     println!("LOKA {} without a desktop, as \"{}\". Ctrl+C ends it.", env!("CARGO_PKG_VERSION"), me.alias);
     println!("Pair from LOKA on another computer: pick \"{}\" there, then answer here.", me.alias);
@@ -81,7 +83,8 @@ async fn serve() {
     }
 
     let peers = Arc::new(Mutex::new(HashMap::<String, Peer>::new()));
-    let (_me, me_rx) = watch::channel(me);
+    let (me_tx, me_rx) = watch::channel(me);
+    tauri::async_runtime::spawn(crate::watch_controllable(engine.clone(), me_tx, || {}));
     let (p, st) = (peers.clone(), settings.clone());
     tauri::async_runtime::spawn(async move {
         let hosts = move || st.lock().unwrap().hosts.clone();

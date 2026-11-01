@@ -4,7 +4,7 @@ import { availableMonitors } from "@tauri-apps/api/window";
 import { type Edge, type Portal, type Rect, fit, sameRect, slot } from "./calibration";
 import { Face } from "./Face";
 import { type Look, MOTIONS, SWATCHES, loadLook, saveLook } from "./look";
-import type { Device, Peer } from "./Pairing";
+import { STATE_LABEL, StateBadge, deviceState, stateReason, type Device, type Peer } from "./Pairing";
 
 const EDGES: Edge[] = ["left", "top", "bottom", "right"];
 /** where a device clicked (or picked with the keyboard) goes first */
@@ -217,6 +217,10 @@ export function Calibrate({ device, peers, selected, onSelect, onPair, onChange 
           const { bar, tile } = layout(p, item.aspect);
           const moving = drag?.item.fingerprint === f && drag.moved;
           const screen = screens.findIndex((s) => sameRect(s, p.monitor)) + 1;
+          const info = peers.find((x) => x.info.fingerprint === f);
+          const state = deviceState(info, true, device.info);
+          const reason = stateReason(state, item.alias, info?.info.os);
+          const setup = reason ? ` ${reason}.` : "";
           return (
             <div key={f} className={moving ? "opacity-30" : ""}>
               <div
@@ -239,12 +243,17 @@ export function Calibrate({ device, peers, selected, onSelect, onPair, onChange 
                   }
                 }}
                 aria-pressed={f === sel}
-                aria-label={`${item.alias}, ${p.edge} edge of screen ${screen}. Arrow keys slide it along, Delete takes it off.`}
+                aria-label={`${item.alias}, ${p.edge} edge of screen ${screen}.${setup} Arrow keys slide it along, Delete takes it off.`}
+                title={reason ?? undefined}
                 className={`absolute flex cursor-grab flex-col items-center justify-center gap-1 overflow-hidden rounded-[12px] bg-white/[0.04] ring-1 transition-[background-color,box-shadow] duration-200 hover:bg-white/[0.08] focus-visible:outline-2 focus-visible:outline-accent active:cursor-grabbing ${f === sel ? "ring-accent" : "ring-line"}`}
                 style={tile}
               >
-                <Face seed={f} size={Math.max(16, Math.min(40, Math.min(tile.width, tile.height) * 0.55))} mood={f === sel ? "happy" : "idle"} />
+                <Face seed={f} size={Math.max(16, Math.min(40, Math.min(tile.width, tile.height) * 0.55))} mood={reason ? "sad" : f === sel ? "happy" : "idle"} />
                 {tile.height > 64 && tile.width > 48 && <span className="w-full truncate px-1 text-center text-[11px] font-semibold">{item.alias}</span>}
+                {reason && tile.height > 84 && tile.width > 48 && <span className={`w-full truncate px-1 text-center text-[10px] font-semibold ${state === "offline" ? "text-muted" : "text-danger"}`}>{STATE_LABEL[state]}</span>}
+                <span className="absolute right-1.5 top-1.5">
+                  <StateBadge dot state={state} title={reason} />
+                </span>
               </button>
             </div>
           );
