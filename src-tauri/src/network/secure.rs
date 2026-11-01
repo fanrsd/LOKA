@@ -111,6 +111,7 @@ impl Identity {
         if let Err(e) = std::fs::write(&cert_path, &id.cert).and_then(|()| std::fs::write(&key_path, id.key.secret_pkcs8_der())) {
             eprintln!("saving identity failed: {e}");
         }
+        restrict(&key_path);
         id
     }
 
@@ -127,6 +128,36 @@ impl Identity {
 /// Hex SHA-256 of a certificate.
 pub fn fingerprint(cert: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, cert).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Keep the private key readable by its owner only; the fingerprint is public, the key is the device.
+fn restrict(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+        let wide: Vec<u16> = std::fs::canonicalize(path).map(|p| p.to_string_lossy().encode_utf16().chain([0]).collect()).unwrap_or_default();
+        if wide.is_empty() {
+            return;
+        }
+        // "D:(A;;FA;;;OW)" — the file's owner, and nobody else, gets full access.
+        let sddl: Vec<u16> = "D:(A;;FA;;;OW)".encode_utf16().chain([0]).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut()) != 0 {
+                let _ = SetNamedSecurityInfoW(wide.as_ptr() as *mut _, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, std::ptr::null_mut(), std::ptr::null_mut(), sd as *mut ACL, std::ptr::null_mut());
+                let _ = GetLastError();
+                let _ = ERROR_SUCCESS;
+                windows_sys::Win32::Foundation::LocalFree(sd as *mut _);
+            }
+        }
+    }
 }
 
 /// The code both screens show while `requester` pairs with `answerer`, from both fingerprints and both

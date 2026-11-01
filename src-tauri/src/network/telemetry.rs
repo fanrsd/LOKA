@@ -1,7 +1,12 @@
 //! 60 Hz spatial telemetry: fixed 12-byte little-endian UDP packets, built on the stack.
 
 use serde::Serialize;
-use std::{io, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    io,
+    net::{IpAddr, SocketAddr},
+    time::{Duration, Instant},
+};
 use tokio::net::UdpSocket;
 
 pub const PORT: u16 = 53319;
@@ -82,12 +87,27 @@ pub async fn send(sock: &UdpSocket, to: SocketAddr, p: &SpatialPacket) {
     let _ = sock.send_to(&p.encode(), to).await; // unreliable by design; next tick supersedes
 }
 
-/// Receive packets forever; malformed datagrams are dropped silently.
+/// Fastest delivery accepted from one address: the telemetry rate is 60 Hz.
+const RATE: Duration = Duration::from_millis(8);
+/// A sender silent for this long is forgotten, so the map stays bounded.
+const STALE_SENDER: Duration = Duration::from_secs(5);
+
+/// Receive packets forever; malformed datagrams are dropped silently. One address may only deliver
+/// at the telemetry rate, so a flood cannot crowd out the device that is really driving the cursor.
 pub async fn listen(port: u16, mut on_packet: impl FnMut(SpatialPacket) + Send) -> io::Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", port)).await?;
     let mut buf = [0u8; 64];
+    let mut last: HashMap<IpAddr, Instant> = HashMap::new();
     loop {
-        let (n, _) = sock.recv_from(&mut buf).await?;
+        let (n, from) = sock.recv_from(&mut buf).await?;
+        let (ip, now) = (from.ip(), Instant::now());
+        if last.get(&ip).is_some_and(|t| now.duration_since(*t) < RATE) {
+            continue;
+        }
+        if last.len() > 64 {
+            last.retain(|_, t| now.duration_since(*t) > STALE_SENDER);
+        }
+        last.insert(ip, now);
         if let Some(p) = SpatialPacket::decode(&buf[..n]) {
             on_packet(p);
         }

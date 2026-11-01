@@ -992,6 +992,8 @@ fn spawn_discovery(app: AppHandle, state: AppState, me: watch::Receiver<DeviceIn
         let hosts_state = state.clone();
         let hosts = move || hosts_state.lock().unwrap().settings.hosts.clone();
         let r = discovery::run(me, hosts, |peer| {
+            // an unverified peer is only a name until a pinned connection proves the fingerprint
+            let verified = state.lock().unwrap().settings.is_paired(&peer.info.fingerprint);
             let previous = {
                 let mut s = state.lock().unwrap();
                 // remember paired devices' hardware addresses while they're awake, to wake them later
@@ -1005,6 +1007,10 @@ fn spawn_discovery(app: AppHandle, state: AppState, me: watch::Receiver<DeviceIn
             };
             // heartbeats are frequent; only tell the UI about arrivals and changes
             if previous.map_or(true, |p| p.info != peer.info || p.addr != peer.addr || p.seen.elapsed() >= discovery::STALE) {
+                let mut peer = peer;
+                if !verified {
+                    peer.info.mac = None; // an unverified peer's MAC is not worth waking on
+                }
                 let _ = app.emit("peer", peer);
             }
         })

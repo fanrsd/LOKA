@@ -34,6 +34,9 @@ const MAX_TEXT: u64 = 1024 * 1024;
 const MAX_NAME: usize = 259;
 /// Clipboard picture cap (PNG bytes).
 pub const MAX_IMAGE: u64 = 10 << 20;
+/// Cap on a single dropped/copied file: a peer that announces a huge file can fill the disk before
+/// anything is written (the header is read first). Generous enough for any real payload.
+pub const MAX_FILE: u64 = 64 << 30;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -313,6 +316,9 @@ async fn receive(mut s: impl AsyncRead + Unpin, dir: &Path, clip_dir: &Path, bat
     }
 
     let id = next_id();
+    if h.size > MAX_FILE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+    }
     let base = match h.clip {
         Some(b) if b.drag => drag_dir(clip_dir, b.id),
         Some(b) => clip_dir.join(b.id.to_string()),
