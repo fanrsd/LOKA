@@ -7,7 +7,7 @@ import { About, useUpdate } from "./About";
 import { UpdatePrompt } from "./UpdatePrompt";
 import { Calibrate } from "./Calibrate";
 import { Face, type Mood } from "./Face";
-import { ConnectionCheck, PairPrompt, StateBadge, StateNote, deviceState, osLabel, quietButton, stateReason, type Device, type Peer } from "./Pairing";
+import { ConnectionCheck, PairPrompt, StateBadge, StateNote, Troubleshoot, deviceState, osLabel, quietButton, stateReason, type Device, type Peer } from "./Pairing";
 import { ClipHistory } from "./ClipHistory";
 import { Outbox } from "./Outbox";
 import { Pointer } from "./Pointer";
@@ -308,7 +308,10 @@ function Devices({ device, peers, onChange }: { device: Device; peers: Peer[]; o
       )}
       {selected && isPaired(selected) && (
         <div className="mt-4 flex items-start justify-between gap-4">
-          <ConnectionCheck key={selected} fingerprint={selected} />
+          <div className="flex min-w-0 flex-1 flex-wrap items-start gap-3">
+            <ConnectionCheck key={selected} fingerprint={selected} />
+            <Troubleshoot key={"t" + selected} fingerprint={selected} alias={current?.info.alias ?? "that device"} />
+          </div>
           {current && (
             <button
               onClick={() => {

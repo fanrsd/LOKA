@@ -43,9 +43,13 @@ impl kvm::Sink for Sink {
     }
 }
 
+/// Who drives this server right now, for its report (`troubleshoot` on the driver checks it).
+static DRIVER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 impl Drop for Sink {
     fn drop(&mut self) {
         println!("{} let go.", self.alias);
+        *DRIVER.lock().unwrap() = None;
     }
 }
 
@@ -141,6 +145,7 @@ async fn serve() {
     let make = move |fp: &str, _: Edge| {
         let alias = peers.lock().unwrap().get(fp).map_or_else(|| "The other device".into(), |p| p.info.alias.clone());
         println!("{alias} is using this computer.");
+        *DRIVER.lock().unwrap() = Some(alias.clone());
         Some(Sink { engine: engine.clone(), alias })
     };
     // shortcut: no services (terminal, files, sound) and no file transfers without a desktop; add them if servers need them.
@@ -158,7 +163,8 @@ async fn serve() {
     let on_service = |_: kvm::Service, _: String, mut stream: crate::network::secure::Stream| {
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            let text = format!("LOKA {} headless · {}\nLog (UTC):\n{}\n", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, crate::journal::tail(300));
+            let driven = DRIVER.lock().unwrap().as_ref().map_or("no".into(), |a| format!("by {a}"));
+            let text = format!("LOKA {} headless · {}\nBeing driven: {driven}\nLog (UTC):\n{}\n", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH, crate::journal::tail(300));
             if stream.write_all(text.as_bytes()).await.is_ok() {
                 let _ = stream.shutdown().await;
             }

@@ -118,6 +118,45 @@ export function ConnectionCheck({ fingerprint }: { fingerprint: string }) {
   );
 }
 
+/** `troubleshoot`: one step of it; `fixed` = was wrong, put right on this computer. */
+type Step = { title: string; result: "ok" | "fixed" | "failed"; detail: string };
+const MARK = { ok: "✓", fixed: "↻", failed: "✕" } as const;
+
+/** "Troubleshoot" for a paired device: checks every reason the cursor might not cross, fixes what it can here,
+ *  then crosses for real through the portal and back. */
+export function Troubleshoot({ fingerprint, alias }: { fingerprint: string; alias: string }) {
+  const [busy, setBusy] = useState(false);
+  const [steps, setSteps] = useState<Step[] | null>(null);
+  const run = () => {
+    setBusy(true);
+    setSteps(null);
+    invoke<Step[]>("troubleshoot", { fingerprint })
+      .then(setSteps, (e) => setSteps([{ title: "Troubleshoot", result: "failed", detail: String(e) }]))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div className="min-w-0">
+      <button onClick={run} disabled={busy} className={quietButton + " min-h-11 ring-1 ring-line disabled:opacity-50"}>
+        {busy ? "Checking…" : "Troubleshoot"}
+      </button>
+      <div role="status" className="px-1 text-xs leading-relaxed text-muted">
+        {busy && <p className="mt-2">Your cursor goes into {alias} for a moment and comes back.</p>}
+        {steps && (
+          <ul className="mt-2 space-y-1">
+            {steps.map((s, i) => (
+              <li key={i} className={s.result === "failed" ? "text-danger" : s.result === "fixed" ? "text-fg" : ""}>
+                <span aria-hidden="true">{MARK[s.result]} </span>
+                <span className="sr-only">{s.result}: </span>
+                {s.title}: {s.detail}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** Primary action: a white pill, like the rest of the system. */
 export const primaryButton =
   "rounded-full bg-fg px-5 py-2.5 text-sm font-semibold text-ink transition-[transform,background-color] duration-200 ease-out hover:bg-white active:scale-[0.97] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent disabled:opacity-50";

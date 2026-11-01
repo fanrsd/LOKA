@@ -197,6 +197,9 @@ fn report(app: &AppHandle) -> String {
     }
     let driven = s.session.as_ref().map_or("no".into(), |(fp, _)| format!("by {} (session loop ran {} ms ago)", s.who(fp).0, kvm::beat_age().as_millis()));
     let _ = writeln!(r, "Being driven: {driven} · driving another device: {} · cursor lock: {}", yes(DRIVING.load(Ordering::SeqCst)), yes(kvm::LOCKED.load(Ordering::SeqCst)));
+    if let Some(c) = app.state::<Arc<dyn SpatialPlatformEngine>>().cursor() {
+        let _ = writeln!(r, "Cursor: {:.0}, {:.0}", c.x, c.y);
+    }
     let _ = writeln!(r, "Start with computer: {}", yes(!s.settings.manual_start));
     if let Some((e, at)) = &*LAST_CROSSING.lock().unwrap() {
         let _ = writeln!(r, "Last crossing error ({} s ago): {e}", at.elapsed().as_secs());
@@ -218,20 +221,175 @@ async fn diagnostics(app: AppHandle) -> String {
         s.settings.paired.iter().filter(|d| s.live_peers().any(|p| p.info.fingerprint == d.fingerprint)).map(|d| (d.fingerprint.clone(), d.alias.clone())).collect()
     };
     for (fp, alias) in others {
-        let theirs = async {
-            use tokio::io::AsyncReadExt;
-            let s = open_service(&app, &fp, kvm::Service::Diagnostics).await?;
-            let mut buf = Vec::new();
-            s.take(4 << 20).read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
-            Ok::<_, String>(String::from_utf8_lossy(&buf).into_owned())
-        };
-        match tokio::time::timeout(Duration::from_secs(8), theirs).await {
-            Ok(Ok(text)) => r.push_str(&format!("\n===== {alias} =====\n{text}")),
-            Ok(Err(e)) => r.push_str(&format!("\n===== {alias}: no report ({e}; LOKA before 0.9.4 doesn't send one) =====\n")),
-            Err(_) => r.push_str(&format!("\n===== {alias}: no report (no answer in 8 s) =====\n")),
+        match peer_report(&app, &fp).await {
+            Ok(text) => r.push_str(&format!("\n===== {alias} =====\n{text}")),
+            Err(e) => r.push_str(&format!("\n===== {alias}: no report ({e}; LOKA before 0.9.4 doesn't send one) =====\n")),
         }
     }
     r
+}
+
+/// Paired device `fp`'s `report` (Diagnostics service, 0.9.4+), within 8 s.
+async fn peer_report(app: &AppHandle, fp: &str) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let theirs = async {
+        let s = open_service(app, fp, kvm::Service::Diagnostics).await?;
+        let mut buf = Vec::new();
+        s.take(4 << 20).read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(8), theirs).await.unwrap_or_else(|_| Err("no answer in 8 s".into()))
+}
+
+#[cfg(desktop)]
+#[derive(serde::Serialize)]
+struct Step {
+    title: &'static str,
+    /// "ok", "fixed" (was wrong, put right here) or "failed"
+    result: &'static str,
+    detail: String,
+}
+
+/// "Troubleshoot": every reason the cursor might not cross into `fingerprint`, putting right what can be
+/// put right here, then a real crossing through its portal (tracker path), confirmed by the other side.
+/// Stops at the first failure.
+#[cfg(desktop)]
+#[tauri::command]
+async fn troubleshoot(app: AppHandle, fingerprint: String) -> Vec<Step> {
+    use tauri::Listener;
+    let fp = fingerprint;
+    let state = app.state::<AppState>().inner().clone();
+    let mut steps = Vec::new();
+    let mut step = |title: &'static str, result: &'static str, detail: String| {
+        journal!("troubleshoot: {title}: {result}, {detail}");
+        steps.push(Step { title, result, detail });
+        result != "failed"
+    };
+    let ((alias, os, heard), paired, peer, portal, delay) = {
+        let s = state.lock().unwrap();
+        let peer = s.live_peers().find(|p| p.info.fingerprint == fp).map(|p| (p.info.clone(), p.addr));
+        (s.who(&fp), s.settings.is_paired(&fp), peer, s.settings.portals.get(&fp).copied(), s.settings.cursor.edge_delay_ms)
+    };
+    journal!("troubleshoot: {alias}");
+    let ok = 'checks: {
+        if !step("Paired", if paired { "ok" } else { "failed" }, if paired { format!("{alias} is paired with this computer") } else { "pair with it first".into() }) {
+            break 'checks false;
+        }
+        let Some((info, addr)) = peer else {
+            break 'checks step("On the network", "failed", format!("{alias} isn't heard on this network: {}", kvm::hint(std::env::consts::OS, &os, &alias, heard)));
+        };
+        step("On the network", "ok", format!("heard at {addr}"));
+        if info.proto != kvm::PROTOCOL {
+            break 'checks step("Same LOKA protocol", "failed", format!("{alias} runs a LOKA that doesn't match this one: update both to the newest"));
+        }
+        if !info.controllable {
+            break 'checks step("Can be controlled", "failed", kvm::not_controllable(&alias, &os));
+        }
+        step("Can be controlled", "ok", format!("{alias} accepts mouse and keyboard"));
+        match check_device(app.state(), app.state(), fp.clone()).await {
+            Ok(c) if c.kvm.ok => step("Connection", "ok", format!("answers in {} ms", c.kvm.ms.unwrap_or(0))),
+            Ok(c) => break 'checks step("Connection", "failed", format!("{} {}", c.kvm.error.unwrap_or_default(), c.hint.unwrap_or_default())),
+            Err(e) => break 'checks step("Connection", "failed", e),
+        };
+        match free_driven(&app, &state) {
+            Some(by) => step("This computer is free", "fixed", format!("it was still being controlled by {by}, which blocks every crossing from here: freed it")),
+            None => step("This computer is free", "ok", "not being controlled by another device".into()),
+        };
+        if kvm::LOCKED.swap(false, Ordering::SeqCst) {
+            let _ = app.emit("lock", false);
+            step("Cursor lock", "fixed", "cursor lock was on (Scroll Lock / F14): turned it off".into());
+        } else {
+            step("Cursor lock", "ok", "off".into());
+        }
+        let Some(portal) = portal else {
+            break 'checks step("Portal", "failed", format!("{alias} isn't placed next to a screen: drag it to an edge on the layout map"));
+        };
+        if !screens(&app).contains(&portal.monitor) {
+            break 'checks step("Portal", "failed", format!("{alias}'s portal is on a screen that isn't connected now: place it again on the layout map"));
+        }
+        let _ = place_overlay(&app, &portal_label(&fp), &portal);
+        let m = portal.monitor;
+        step("Portal", "ok", format!("{:?} edge of the screen at {},{} ({}×{})", portal.edge, m.x, m.y, m.w, m.h));
+        if DRIVING.load(Ordering::SeqCst) {
+            break 'checks step("Crossing", "failed", "this computer is controlling a device right now: come back first".into());
+        }
+        // the real path: the tracker sees the cursor resting on the portal's edge pixel and crosses
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let id = app.listen("kvm", move |e| {
+            let _ = tx.send(serde_json::from_str(e.payload()).unwrap_or_default());
+        });
+        let since = std::time::Instant::now();
+        *PROBE.lock().unwrap() = Some(portal.point(0.5, 0.0));
+        async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>, secs: u64) -> Option<serde_json::Value> {
+            tokio::time::timeout(Duration::from_secs(secs), rx.recv()).await.ok().flatten()
+        }
+        let entered = next(&mut rx, u64::from(delay) / 1000 + 3).await;
+        *PROBE.lock().unwrap() = None;
+        let ok = match entered {
+            Some(v) if v["active"] == true => {
+                // ask the other side while the session runs; it may also end first (an error, or the mouse moved back)
+                let (mut confirmed, mut ended) = (None::<Result<String, String>>, None::<serde_json::Value>);
+                let until = std::time::Instant::now() + Duration::from_secs(3);
+                while confirmed.is_none() && ended.is_none() && std::time::Instant::now() < until {
+                    tokio::select! {
+                        v = rx.recv() => ended = Some(v.unwrap_or_default()),
+                        r = peer_report(&app, &fp) => match r {
+                            Ok(t) => {
+                                let line = |k: &str| t.lines().find_map(|l| l.strip_prefix(k)).map(str::to_string);
+                                if line("Being driven: ").is_some_and(|d| d.starts_with("by ")) {
+                                    confirmed = Some(Ok(line("Cursor: ").map_or(String::new(), |c| format!(", its cursor at {c}"))));
+                                } else {
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                            }
+                            Err(e) => confirmed = Some(Err(e)),
+                        },
+                    }
+                }
+                match ended {
+                    Some(v) if v["error"].is_string() => step("Crossing", "failed", v["error"].as_str().unwrap_or_default().into()),
+                    // only the other side sends the cursor back: it was controlled
+                    Some(_) => step("Crossing", "ok", format!("the cursor went into {alias} and came back by itself (the mouse moved back)")),
+                    None => {
+                        let crossed = match confirmed {
+                            Some(Ok(at)) => step("Crossing", "ok", format!("the cursor went into {alias}, which confirms this computer controls it{at}")),
+                            Some(Err(e)) => step("Crossing", "ok", format!("the cursor went into {alias} ({alias} couldn't confirm: {e})")),
+                            None => step("Crossing", "failed", format!("the cursor left this computer, but {alias} doesn't see itself controlled")),
+                        };
+                        kvm::end_sessions();
+                        let back = match next(&mut rx, 3).await {
+                            Some(v) if v["error"].is_string() => step("Coming back", "failed", v["error"].as_str().unwrap_or_default().into()),
+                            Some(_) => step("Coming back", "ok", "the cursor came back to this computer".into()),
+                            None => step("Coming back", "failed", "the session didn't end within 3 s: use the tray's Disconnect, or Ctrl+Alt+Esc".into()),
+                        };
+                        crossed && back
+                    }
+                }
+            }
+            _ => {
+                let e = LAST_CROSSING.lock().unwrap().as_ref().filter(|(_, at)| at.elapsed() <= since.elapsed() + Duration::from_secs(30)).map(|(e, _)| e.clone());
+                step("Crossing", "failed", e.unwrap_or_else(|| format!("the cursor at {alias}'s edge didn't cross: copy the diagnostics (About) and send them")))
+            }
+        };
+        app.unlisten(id);
+        ok
+    };
+    journal!("troubleshoot: {}", if ok { "everything works" } else { "stopped at a failure" });
+    steps
+}
+
+/// Clears a driven session (a stuck one holds the cursor: only the way back counts). The driver's alias, if any.
+fn free_driven(app: &AppHandle, state: &AppState) -> Option<String> {
+    let (fp, _) = state.lock().unwrap().session.take()?;
+    kvm::end_sessions();
+    if let Some(engine) = app.try_state::<Arc<dyn SpatialPlatformEngine>>() {
+        engine.show_cursor(false);
+    }
+    if let Some(w) = app.get_webview_window(BAND) {
+        let _ = w.hide();
+    }
+    refresh_tray(app);
+    Some(state.lock().unwrap().who(&fp).0)
 }
 
 /// Where received files go: the folder the user picked, or Downloads/LOKA.
@@ -993,6 +1151,8 @@ pub fn run() {
             set_portal,
             check_device,
             diagnostics,
+            #[cfg(desktop)]
+            troubleshoot,
             set_cursor_prefs,
             cancel_transfer,
             reveal,
@@ -1813,6 +1973,10 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
 /// The last crossing that failed and when, for `diagnostics`.
 static LAST_CROSSING: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
 
+/// `troubleshoot`'s live test: while set, the tracker sees the cursor at this point (button up) instead of the real one.
+#[cfg(desktop)]
+static PROBE: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
 /// Every 2 s: logs what changed (devices heard, screens, cursor lock), follows screen changes with the
 /// portals, and clears a driven session whose loop stopped running, so a stuck one can't hold the cursor.
 fn spawn_watchdog(app: AppHandle, state: AppState) {
@@ -1821,18 +1985,10 @@ fn spawn_watchdog(app: AppHandle, state: AppState) {
         let (mut heard, mut shown, mut lock) = (HashMap::<String, (String, IpAddr)>::new(), Vec::<Rect>::new(), false);
         loop {
             tick.tick().await;
-            if kvm::beat_age() > Duration::from_secs(10) {
-                let gone = state.lock().unwrap().session.take();
-                if let Some((fp, _)) = gone {
-                    journal!("watchdog: cleared the session driven by {}: its loop hasn't run for {} s", state.lock().unwrap().who(&fp).0, kvm::beat_age().as_secs());
-                    kvm::end_sessions();
-                    if let Some(engine) = app.try_state::<Arc<dyn SpatialPlatformEngine>>() {
-                        engine.show_cursor(false);
-                    }
-                    if let Some(w) = app.get_webview_window(BAND) {
-                        let _ = w.hide();
-                    }
-                    refresh_tray(&app);
+            if kvm::beat_age() > Duration::from_secs(10) && state.lock().unwrap().session.is_some() {
+                let age = kvm::beat_age().as_secs();
+                if let Some(by) = free_driven(&app, &state) {
+                    journal!("watchdog: cleared the session driven by {by}: its loop hasn't run for {age} s");
                 }
             }
             let now: HashMap<String, (String, IpAddr)> = state.lock().unwrap().live_peers().map(|p| (p.info.fingerprint.clone(), (p.info.alias.clone(), p.addr))).collect();
@@ -1955,7 +2111,8 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
             shown_lock = locked;
             let _ = app.emit("lock", locked);
         }
-        let Some(c) = engine.cursor() else { continue };
+        let probe = PROBE.lock().unwrap().map(|(x, y)| platform::CursorSample { x, y, button_down: false });
+        let Some(c) = probe.or_else(|| engine.cursor()) else { continue };
         if driving {
             continue;
         }
