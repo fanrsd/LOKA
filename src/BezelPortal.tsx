@@ -76,7 +76,14 @@ export function BezelPortal({ side, event, blocked = null }: { side: "left" | "r
     let motion = reduced ? "calm" : look.motion;
     let lastEmit = 0;
     let flash = -1e9;
-    let raf = 0;
+    let raf = 0, nap = 0;
+    // an idle glow redraws at 10 fps (1 fps hidden) instead of 60; any event wakes it
+    const wake = () => {
+      if (!nap) return;
+      clearTimeout(nap);
+      nap = 0;
+      raf = requestAnimationFrame(frame);
+    };
     // file transfer progress drawn along the edge, summed over files in flight; `end` starts the fade-out
     const xfer = { pct: 0, end: -1e9, active: false };
     const files = new Map<number, [number, number]>();
@@ -100,13 +107,16 @@ export function BezelPortal({ side, event, blocked = null }: { side: "left" | "r
           target.p = payload.proximity;
         }
         if (payload.kind === "drop") splash(payload.normalizedY);
+        wake();
       }),
       getCurrentWebviewWindow().listen<[number, number]>("hover", ({ payload }) => {
         hover.p = payload[1];
+        wake();
       }),
-      listen<{ active: boolean; y?: number }>("kvm", ({ payload }) => payload.active && splash(payload.y ?? cur.y)),
+      listen<{ active: boolean; y?: number }>("kvm", ({ payload }) => payload.active && (splash(payload.y ?? cur.y), wake())),
       listen<{ type: string; id?: number; done?: number; total?: number }>("transfer", ({ payload: e }) => {
         if (e.type === "text") return;
+        wake();
         if (e.type === "progress") files.set(e.id!, [e.done!, e.total!]);
         else if (files.delete(e.id!) && e.type !== "failed") Object.assign(xfer, { pct: 1 });
         let done = 0, total = 0;
@@ -120,6 +130,7 @@ export function BezelPortal({ side, event, blocked = null }: { side: "left" | "r
         look = payload;
         motion = reduced ? "calm" : look.motion;
         if (preview) splash(cur.y);
+        wake();
       }),
     ];
 
@@ -223,11 +234,14 @@ export function BezelPortal({ side, event, blocked = null }: { side: "left" | "r
       }
       ctx.globalCompositeOperation = "source-over";
       if (why && label > 0.01) drawLabel(ctx, why, label, side, w, h, cur.y);
-      raf = requestAnimationFrame(frame);
+      const idle = !busy && target.p < 0.01 && Math.abs(want - shown) < 0.01 && Math.abs(wantLabel - label) < 0.01;
+      if (idle) nap = window.setTimeout(() => ((nap = 0), (raf = requestAnimationFrame(frame))), shown < 0.01 ? 1000 : 100);
+      else raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
     return () => {
       cancelAnimationFrame(raf);
+      clearTimeout(nap);
       unlisteners.forEach((u) => u.then((f) => f()));
     };
   }, [side, event]);
