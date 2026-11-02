@@ -13,6 +13,8 @@ mod linux;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "windows")]
+pub mod lockscreen;
 
 #[cfg(target_os = "linux")]
 pub use linux::{allow_input, HEADLESS};
@@ -130,6 +132,14 @@ pub static LEAKED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None
 pub fn secure_desktop() -> bool {
     #[cfg(target_os = "windows")]
     return windows::secure_desktop();
+    #[allow(unreachable_code)]
+    false
+}
+
+/// The lock screen is up and LOKA can type on it anyway (Windows, `lockscreen` service installed from About).
+pub fn secure_input() -> bool {
+    #[cfg(target_os = "windows")]
+    return lockscreen::available();
     #[allow(unreachable_code)]
     false
 }

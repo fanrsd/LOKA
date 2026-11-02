@@ -46,7 +46,7 @@ static TYPIST: std::sync::LazyLock<std::sync::mpsc::Sender<(INPUT, bool)>> = std
     let (tx, rx) = std::sync::mpsc::channel::<(INPUT, bool)>();
     std::thread::spawn(move || {
         for (input, paced) in rx {
-            unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+            send(&input);
             if paced {
                 std::thread::sleep(std::time::Duration::from_millis(15));
             }
@@ -54,6 +54,13 @@ static TYPIST: std::sync::LazyLock<std::sync::mpsc::Sender<(INPUT, bool)>> = std
     });
     tx
 });
+
+/// Every injected input; while the lock screen is up, through the lock screen helper when it's installed.
+fn send(input: &INPUT) {
+    if !(secure_desktop() && super::lockscreen::send(input)) {
+        unsafe { SendInput(1, input, size_of::<INPUT>() as i32) };
+    }
+}
 
 struct Capture {
     out: UnboundedSender<Captured>,
@@ -354,7 +361,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                             if dx != 0 {
                                 mi.dwFlags = MOUSEEVENTF_HWHEEL;
                                 mi.mouseData = dx as _;
-                                SendInput(1, &input, size_of::<INPUT>() as i32);
+                                send(&input);
                             }
                             if dy == 0 {
                                 return;
@@ -367,7 +374,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                     }
                 }
             }
-            SendInput(1, &input, size_of::<INPUT>() as i32);
+            send(&input);
         }
     }
 

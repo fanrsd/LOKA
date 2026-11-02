@@ -150,7 +150,7 @@ impl Refusal {
             Refusal::NotPaired => "the other device isn't paired with this one, pair them again",
             Refusal::NoScreen => "the other device has no screen to show the cursor on",
             Refusal::NoInput => "the other device doesn't let LOKA use its mouse and keyboard yet: there, open About → Allow input access (or run `sudo loka --allow-input`)",
-            Refusal::Secure => "the other device shows its lock screen or an administrator prompt: use its own mouse and keyboard there",
+            Refusal::Secure => "the other device shows its lock screen or an administrator prompt: use its own mouse and keyboard there (its About → Lock screen lets LOKA type on the lock screen)",
         }
     }
 }
@@ -171,7 +171,7 @@ pub fn explain(e: &io::Error, alias: &str, os: &str, hint: &str) -> String {
         Some(Refusal::NotPaired) => format!("{alias} isn't paired with this device anymore: pair them again"),
         Some(Refusal::NoScreen) => format!("{alias} has no screen to show the cursor on"),
         Some(Refusal::NoInput) => not_controllable(alias, os),
-        Some(Refusal::Secure) => format!("{alias} shows its lock screen or an administrator prompt: use its own mouse and keyboard there"),
+        Some(Refusal::Secure) => format!("{alias} shows its lock screen or an administrator prompt: use its own mouse and keyboard there (its About → Lock screen lets LOKA type on the lock screen)"),
         None => match e.kind() {
             io::ErrorKind::HostUnreachable => format!("Can't reach {alias}: {hint}"),
             io::ErrorKind::TimedOut => format!("{alias} stopped answering (Wi-Fi dropped, it went to sleep, or LOKA closed)"),

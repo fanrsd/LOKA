@@ -91,6 +91,8 @@ const FIX: Record<string, { title: string; text: string; button: string; command
 export function About({ update, seed, os, onClose, onUpdate, downloadUrl, extra }: { update: Update; seed: string; os: string; onClose: () => void; onUpdate: () => void; downloadUrl?: string; extra?: string }) {
   const [fixed, setFixed] = useState<"idle" | "busy" | "done" | string>("idle");
   const [copied, setCopied] = useState("");
+  // Windows: lock screen service installed? undefined while unknown, a string = last error
+  const [lockScreen, setLockScreen] = useState<boolean | "busy" | string>();
   const fix = FIX[os];
 
   const copy = async () => {
@@ -118,6 +120,16 @@ export function About({ update, seed, os, onClose, onUpdate, downloadUrl, extra 
       if (s === "blocked") setFixed("A Windows Firewall rule blocks LOKA: allowing replaces it");
     }, () => {});
   }, [os]);
+
+  useEffect(() => {
+    if (os === "windows") invoke<boolean>("lock_screen").then(setLockScreen, () => {});
+  }, [os]);
+
+  const toggleLockScreen = () => {
+    const on = lockScreen !== true;
+    setLockScreen("busy");
+    invoke<boolean>("lock_screen", { on }).then(setLockScreen, (e) => setLockScreen(String(e)));
+  };
 
   // macOS: the switch lives in System Settings, so show what it says now (re-read when the user comes back)
   useEffect(() => {
@@ -206,6 +218,23 @@ export function About({ update, seed, os, onClose, onUpdate, downloadUrl, extra 
                 </button>
                 <span role="status" className={`text-xs ${fixed === "done" ? "text-fg" : "text-danger"}`}>
                   {fixed === "done" ? "Allowed" : fixed === "idle" || fixed === "busy" ? "" : fixed}
+                </span>
+              </div>
+            </section>
+          )}
+
+          {os === "windows" && lockScreen !== undefined && (
+            <section className="mt-6">
+              <h3 className="text-xs font-medium text-faint">Lock screen</h3>
+              <p className="mt-2 text-sm leading-relaxed text-muted">
+                Let paired devices use this computer's lock screen too, so you can type its password from the other keyboard. This adds a small Windows service, and Windows asks for an administrator once. Administrator prompts still need this computer's own mouse.
+              </p>
+              <div className="mt-3 flex items-center gap-3">
+                <button onClick={toggleLockScreen} disabled={lockScreen === "busy"} className={quietButton + " ring-1 ring-line"}>
+                  {lockScreen === true ? "Turn off" : "Turn on"}
+                </button>
+                <span role="status" className={`text-xs ${lockScreen === true ? "text-fg" : "text-danger"}`}>
+                  {lockScreen === true ? "On" : typeof lockScreen === "string" && lockScreen !== "busy" ? lockScreen : ""}
                 </span>
               </div>
             </section>

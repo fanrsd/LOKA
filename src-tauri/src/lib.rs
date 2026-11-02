@@ -737,6 +737,44 @@ async fn firewall_status() -> Result<String, String> {
     Err("Only needed on Windows".into())
 }
 
+/// Windows: the lock screen service (`platform::lockscreen`). `on` installs (or refreshes) / removes it, one UAC
+/// prompt; returns whether it's installed now.
+#[tauri::command]
+async fn lock_screen(on: Option<bool>) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use base64::Engine;
+        let target = platform::lockscreen::installed_exe();
+        if let Some(on) = on {
+            let q = |p: &std::path::Path| p.display().to_string().replace('\'', "''");
+            let (svc, exe, dir) = (platform::lockscreen::SERVICE, q(&target), q(target.parent().unwrap()));
+            let script = if on {
+                let src = q(&std::env::current_exe().map_err(|e| e.to_string())?);
+                format!(
+                    "$ErrorActionPreference = 'Stop'; Stop-Service {svc} -EA 0; New-Item -ItemType Directory -Force '{dir}' | Out-Null; Copy-Item -Force '{src}' '{exe}'; \
+                     if (-not (Get-Service {svc} -EA 0)) {{ New-Service {svc} -BinaryPathName '\"{exe}\" --secure-service' -DisplayName 'LOKA lock screen input' -StartupType Automatic | Out-Null }}; Start-Service {svc}"
+                )
+            } else {
+                format!("Stop-Service {svc} -EA 0; sc.exe delete {svc} | Out-Null; Start-Sleep 1; Remove-Item -Recurse -Force '{dir}' -EA 0; exit 0")
+            };
+            let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let b64 = base64::engine::general_purpose::STANDARD.encode(utf16);
+            // Start-Process throws when the UAC prompt is declined
+            powershell(format!("$p = Start-Process powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-EncodedCommand','{b64}'; exit $p.ExitCode")).await?;
+            journal!("lock screen service {}: now {}", if on { "install" } else { "removal" }, if target.exists() { "installed" } else { "absent" });
+            if target.exists() != on {
+                return Err(if on { "Lock screen control was not turned on" } else { "Lock screen control was not turned off" }.into());
+            }
+        }
+        return Ok(target.exists());
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = on;
+        Err("Only on Windows".into())
+    }
+}
+
 #[cfg(target_os = "windows")]
 async fn powershell(script: String) -> Result<std::process::Output, String> {
     use std::os::windows::process::CommandExt;
@@ -1079,6 +1117,16 @@ fn install_send_to() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--secure-service") {
+            return platform::lockscreen::service();
+        }
+        if args.iter().any(|a| a == "--secure-helper") {
+            return platform::lockscreen::helper();
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         let args: Vec<String> = std::env::args().collect();
@@ -1166,6 +1214,7 @@ pub fn run() {
             remove_host,
             allow_firewall,
             firewall_status,
+            lock_screen,
             allow_input,
             open_url,
             #[cfg(desktop)]
@@ -1776,7 +1825,7 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
             (false, _) => Err(kvm::Refusal::NotPaired),
             (_, false) => Err(kvm::Refusal::NoInput),
             // a lock screen or UAC prompt has the input: the driver stays home and is told why
-            _ if platform::secure_desktop() => Err(kvm::Refusal::Secure),
+            _ if platform::secure_desktop() && !platform::secure_input() => Err(kvm::Refusal::Secure),
             _ => Ok(()),
         };
         let (a, me) = (app.clone(), app.state::<watch::Sender<DeviceInfo>>().inner().clone());
@@ -2137,8 +2186,8 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
         ticks = ticks.wrapping_add(1);
         if busy && ticks % 6 == 0 {
             // every 100 ms: the lock screen or a UAC prompt; input can neither reach it nor be taken from it, so it goes home
-            // (a driven session tells its driver why: Refuse Secure)
-            let sec = platform::secure_desktop();
+            // (a driven session tells its driver why: Refuse Secure), unless the lock screen service types on it for us
+            let sec = platform::secure_desktop() && (driving || !platform::secure_input());
             if sec {
                 if !secure {
                     journal!("lock screen or administrator prompt up: ending sessions");
