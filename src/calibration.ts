@@ -21,6 +21,8 @@ export function freeSpans(screens: Rect[], m: Rect, edge: Edge, taken: Portal[])
   const vertical = edge === "left" || edge === "right";
   const [lo, len] = vertical ? [m.y, m.h] : [m.x, m.w];
   const blocked: [number, number][] = taken.filter((p) => p.edge === edge && sameRect(p.monitor, m)).map((p) => [p.start, p.end]);
+  const c = CORNER / len;
+  blocked.push([0, c], [1 - c, 1]);
   for (const n of screens) {
     if (sameRect(n, m)) continue;
     const touches = { left: n.x + n.w === m.x, right: n.x === m.x + m.w, top: n.y + n.h === m.y, bottom: n.y === m.y + m.h }[edge];
@@ -36,6 +38,9 @@ export function freeSpans(screens: Rect[], m: Rect, edge: Edge, taken: Portal[])
   }
   return free;
 }
+
+/** px kept free at each end of every edge (caption buttons, Start, Show desktop). Mirrors `platform::CORNER`. */
+export const CORNER = 150;
 
 /** Shortest a portal may be (fraction of its edge). */
 export const MIN_LENGTH = 0.05;

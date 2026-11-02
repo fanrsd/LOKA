@@ -51,8 +51,8 @@ static LAST_SHARED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(Non
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Msg {
-    /// Sender's portal edge and position along it.
-    Enter { edge: Edge, y: f32 },
+    /// Sender's portal edge and position along it; `dwell` = its edge delay in ms (the way back and on wait as long).
+    Enter { edge: Edge, y: f32, dwell: u16 },
     Input(InputEvent),
     /// Receiver → sender: cursor left through the entry edge at `y` (fraction along that edge).
     Return { y: f32 },
@@ -140,6 +140,8 @@ pub enum Refusal {
     NotPaired = 1,
     NoScreen = 2,
     NoInput = 3,
+    /// a lock screen or UAC prompt has the input there: nothing can be injected
+    Secure = 4,
 }
 
 impl Refusal {
@@ -148,6 +150,7 @@ impl Refusal {
             Refusal::NotPaired => "the other device isn't paired with this one, pair them again",
             Refusal::NoScreen => "the other device has no screen to show the cursor on",
             Refusal::NoInput => "the other device doesn't let LOKA use its mouse and keyboard yet: there, open About → Allow input access (or run `sudo loka --allow-input`)",
+            Refusal::Secure => "the other device shows its lock screen or an administrator prompt: use its own mouse and keyboard there",
         }
     }
 }
@@ -168,6 +171,7 @@ pub fn explain(e: &io::Error, alias: &str, os: &str, hint: &str) -> String {
         Some(Refusal::NotPaired) => format!("{alias} isn't paired with this device anymore: pair them again"),
         Some(Refusal::NoScreen) => format!("{alias} has no screen to show the cursor on"),
         Some(Refusal::NoInput) => not_controllable(alias, os),
+        Some(Refusal::Secure) => format!("{alias} shows its lock screen or an administrator prompt: use its own mouse and keyboard there"),
         None => match e.kind() {
             io::ErrorKind::HostUnreachable => format!("Can't reach {alias}: {hint}"),
             io::ErrorKind::TimedOut => format!("{alias} stopped answering (Wi-Fi dropped, it went to sleep, or LOKA closed)"),
@@ -218,9 +222,10 @@ impl Msg {
         let mut b = [0u8; FRAME];
         let mut put = |at: usize, bytes: &[u8]| b[at..at + bytes.len()].copy_from_slice(bytes);
         match *self {
-            Msg::Enter { edge, y } => {
+            Msg::Enter { edge, y, dwell } => {
                 put(0, &[1, edge_byte(edge)]);
                 put(2, &y.to_le_bytes());
+                put(6, &dwell.to_le_bytes());
             }
             Msg::Input(InputEvent::Move { dx, dy }) => {
                 put(0, &[2]);
@@ -273,7 +278,8 @@ impl Msg {
         let i32_at = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let f32_at = |at: usize| Some(f32::from_le_bytes(b[at..at + 4].try_into().unwrap())).filter(|v| (0.0..=1.0).contains(v));
         Some(match b[0] {
-            1 => Msg::Enter { edge: byte_edge(b[1])?, y: f32_at(2)? },
+            // dwell: 0 from drivers before 0.9.6 (the frame's spare bytes)
+            1 => Msg::Enter { edge: byte_edge(b[1])?, y: f32_at(2)?, dwell: u16::from_le_bytes([b[6], b[7]]) },
             2 => Msg::Input(InputEvent::Move { dx: i32_at(1), dy: i32_at(5) }),
             3 if (1..=5).contains(&b[1]) => Msg::Input(InputEvent::Button { button: b[1], down: b[2] != 0 }),
             4 => Msg::Input(InputEvent::Wheel { dx: i32_at(1), dy: i32_at(5) }),
@@ -289,6 +295,7 @@ impl Msg {
                 1 => Refusal::NotPaired,
                 2 => Refusal::NoScreen,
                 3 => Refusal::NoInput,
+                4 => Refusal::Secure,
                 _ => return None,
             }),
             12 => Msg::Lock { on: b[1] != 0 },
@@ -365,6 +372,9 @@ async fn read_clipboard(r: &mut (impl AsyncRead + Unpin), len: u32) -> io::Resul
     Ok(String::from_utf8(b).ok())
 }
 
+/// No crossing this soon after the last one, either way: the end of a push doesn't bounce straight back.
+pub const COOLDOWN: Duration = Duration::from_millis(250);
+
 /// Receiver-side cursor: absolute position on `screens` (all of the receiver's monitors), entered through
 /// `edge` of their bounding box.
 pub struct Receiver {
@@ -380,6 +390,12 @@ pub struct Receiver {
     locked: bool,
     /// a file drag here is going back to the Main with the cursor (transfer batch)
     drag_out: Option<u64>,
+    /// when the cursor last came in (from the driver or back out of a further device): `COOLDOWN` from there
+    arrived: Instant,
+    /// since when the driver pushes through the way back
+    pushing: Option<Instant>,
+    /// the driver's edge delay: a push crosses (back, or on to a further device) once it lasted this long
+    pub dwell: Duration,
 }
 
 #[derive(Debug, PartialEq)]
@@ -420,10 +436,12 @@ impl Receiver {
         let area = bounds(&screens);
         let (x, y) = edge_point(area, edge, y as f64, ENTER_INSET);
         let (x, y) = nearest(&screens, x, y);
-        (Self { screens, area, edge, x, y, buttons: 0, keys: Vec::new(), locked: false, drag_out: None }, Injected::MoveTo { x, y })
+        let me = Self { screens, area, edge, x, y, buttons: 0, keys: Vec::new(), locked: false, drag_out: None, arrived: Instant::now(), pushing: None, dwell: Duration::ZERO };
+        (me, Injected::MoveTo { x, y })
     }
 
-    pub fn apply(&mut self, e: InputEvent) -> Applied {
+    /// `now`: the event's time (cooldown and dwell).
+    pub fn apply(&mut self, e: InputEvent, now: Instant) -> Applied {
         match e {
             InputEvent::Move { dx, dy } => {
                 let (nx, ny) = (self.x + dx as f64, self.y + dy as f64);
@@ -437,8 +455,13 @@ impl Receiver {
                 (self.x, self.y) = nearest(&self.screens, nx, ny);
                 // never hand back mid-drag (the button-up would land on the wrong machine) unless the drag
                 // itself goes along, and never while locked
-                if crossed && (self.buttons == 0 || self.drag_out.is_some()) && !self.locked {
-                    return Applied::Return(self.along());
+                if crossed && (self.buttons == 0 || self.drag_out.is_some()) && !self.locked && self.settled(now) {
+                    let since = *self.pushing.get_or_insert(now);
+                    if now.saturating_duration_since(since) >= self.dwell {
+                        return Applied::Return(self.along());
+                    }
+                } else {
+                    self.pushing = None;
                 }
                 Applied::Inject(Injected::MoveTo { x: self.x, y: self.y })
             }
@@ -472,7 +495,19 @@ impl Receiver {
     /// Put the cursor at `(x, y)` (back from a device further along the chain).
     fn place(&mut self, x: f64, y: f64) -> Injected {
         (self.x, self.y) = nearest(&self.screens, x, y);
+        self.arrived = Instant::now();
         Injected::MoveTo { x: self.x, y: self.y }
+    }
+
+    /// Past the cooldown since the cursor came in.
+    fn settled(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.arrived) >= COOLDOWN
+    }
+
+    /// Handing back: off the entry edge, where the cursor would sit on our own portal to the driver and cross straight back.
+    fn off_edge(&mut self) -> Injected {
+        let (x, y) = edge_point(self.area, self.edge, self.along() as f64, ENTER_INSET);
+        self.place(x, y)
     }
 
     /// Key/button ups for everything still held, so nothing sticks when the session ends.
@@ -519,6 +554,8 @@ pub fn gesture_keys(g: Gesture, mac: bool) -> Vec<Injected> {
 /// Cursor lock (Scroll Lock / F14): the pointer stays on the device it is on. Set at home by the
 /// tracker, while driving by `send_session` from `Tune`; any session end clears it.
 pub static LOCKED: AtomicBool = AtomicBool::new(false);
+/// Being driven with the driver's cursor lock on: this computer's own mouse doesn't take the cursor back either.
+pub static DRIVEN_LOCKED: AtomicBool = AtomicBool::new(false);
 
 /// Sender-side shaping of captured input before it goes out.
 pub struct Tune {
@@ -541,6 +578,8 @@ pub struct Tune {
     caps: bool,
     /// keys whose down went as text: their ups go nowhere
     typed: Vec<u16>,
+    /// this computer's edge delay (ms): the driven side waits as long on its way back and on to further devices
+    pub dwell: u16,
 }
 
 /// Both Ctrl taps of the "come home" double tap within this.
@@ -562,6 +601,7 @@ impl Tune {
             held: Vec::new(),
             caps: false,
             typed: Vec::new(),
+            dwell: 0,
         }
     }
 
@@ -714,7 +754,7 @@ pub async fn send_session(
     tokio::pin!(ended);
     ended.as_mut().enable();
     let result: io::Result<()> = async {
-        timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Enter { edge: portal.edge, y })).await??;
+        timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Enter { edge: portal.edge, y, dwell: tune.dwell })).await??;
         if let Some(batch) = drag {
             timeout(WRITE_TIMEOUT, send(&mut wr, Msg::Drag { batch })).await??;
         }
@@ -930,8 +970,8 @@ async fn layout(tls: &Tls, to: SocketAddr, expect: &str, m: Msg) -> io::Result<b
     Ok(timeout(Duration::from_secs(5), s.read_u8()).await?? == 1)
 }
 
-/// A driver's connection waiting for the screen: stream, its fingerprint, entry edge and position.
-type Incoming = (Stream, String, Edge, f32);
+/// A driver's connection waiting for the screen: stream, its fingerprint, entry edge and position, edge delay (ms).
+type Incoming = (Stream, String, Edge, f32, u16);
 
 /// Receiving side. Every stream is handled on its own: a pairing request (answered by `ask_pair` with
 /// the address and fingerprint of the asking device and the code to show), a service (`allow_service`,
@@ -967,9 +1007,9 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
                         let answer = ask_pair(from.ip(), who, code).await;
                         let _ = send(&mut s, Msg::PairResponse(answer)).await;
                     }
-                    Msg::Enter { edge, y } => match allow_session(&who) {
+                    Msg::Enter { edge, y, dwell } => match allow_session(&who) {
                         Ok(()) => {
-                            let _ = tx.send((s, who, edge, y)).await;
+                            let _ = tx.send((s, who, edge, y, dwell)).await;
                         }
                         Err(r) => {
                             journal!("kvm: refused a session from {}… ({r:?})", &who[..who.len().min(12)]);
@@ -997,7 +1037,7 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
     });
     let mut next = None;
     loop {
-        let (s, who, edge, y) = match next.take() {
+        let (s, who, edge, y, dwell) = match next.take() {
             Some(i) => i,
             None => rx.recv().await.ok_or_else(|| io::Error::other("kvm listener stopped"))?,
         };
@@ -1005,7 +1045,7 @@ pub async fn serve<S: Sink, F: Future<Output = PairAnswer> + Send + 'static>(
             tokio::spawn(refuse(s, Refusal::NoScreen));
             continue;
         };
-        match session(s, &mut sink, edge, y, &tls, &mut rx).await {
+        match session(s, &mut sink, edge, y, dwell, &tls, &mut rx).await {
             Ok(Some(taken)) => {
                 journal!("kvm: driven session handed over to {}…", &taken.1[..taken.1.len().min(12)]);
                 next = Some(taken)
@@ -1048,11 +1088,11 @@ enum Back {
     Gone,
 }
 
-async fn start_relay(tls: &Tls, hop: Hop, clipboard: Option<String>) -> io::Result<Relay> {
+async fn start_relay(tls: &Tls, hop: Hop, clipboard: Option<String>, dwell: Duration) -> io::Result<Relay> {
     let (c, _) = tls.connect(hop.to, Some(&hop.fp)).await?;
     let (mut rd, mut wr) = tokio::io::split(c);
     timeout(WRITE_TIMEOUT, async {
-        send(&mut wr, Msg::Enter { edge: hop.portal.edge, y: hop.y }).await?;
+        send(&mut wr, Msg::Enter { edge: hop.portal.edge, y: hop.y, dwell: dwell.as_millis() as u16 }).await?;
         write_clipboard(&mut wr, clipboard).await
     })
     .await??;
@@ -1098,6 +1138,7 @@ async fn session(
     sink: &mut impl Sink,
     edge: Edge,
     y: f32,
+    dwell: u16,
     tls: &Tls,
     waiting: &mut mpsc::Receiver<Incoming>,
 ) -> io::Result<Option<Incoming>> {
@@ -1111,6 +1152,9 @@ async fn session(
     beat();
     let mut ticks = tokio::time::interval(Duration::from_secs(1));
     let (mut rcv, first) = Receiver::enter(sink.screens(), edge, y);
+    rcv.dwell = Duration::from_millis(dwell.into());
+    // since when the cursor pushes into one of our own portals (on to a further device)
+    let mut hop_since = None::<Instant>;
     sink.inject(first);
     DRAG_OUT.store(0, Ordering::SeqCst);
     // hand the clipboard back only if it changed here, so the driver's own (maybe an image) survives
@@ -1138,6 +1182,8 @@ async fn session(
             Ev::Waiting(None) => break Err(io::Error::other("kvm listener stopped")),
             // another device takes over, or the user ended it here: the cursor goes back to its driver
             Ev::Waiting(Some(i)) => break hand_back(&mut s, sink, &seen, None, rcv.along()).await.map(|()| Some(i)),
+            // a lock screen or UAC prompt here: the driver gets its cursor back and is told why
+            Ev::End if crate::platform::secure_desktop() => break send(&mut s, Msg::Refuse(Refusal::Secure)).await.map(|()| None),
             Ev::End => break hand_back(&mut s, sink, &seen, None, rcv.along()).await.map(|()| None),
             Ev::Beat => {
                 beat();
@@ -1159,6 +1205,7 @@ async fn session(
                 Msg::Input(_) | Msg::Lock { .. } => {
                     if let Msg::Lock { on } = m {
                         rcv.locked = on;
+                        DRIVEN_LOCKED.store(on, Ordering::SeqCst);
                     }
                     matches!(timeout(WRITE_TIMEOUT, send(&mut r.wr, m)).await, Ok(Ok(())))
                 }
@@ -1197,16 +1244,22 @@ async fn session(
                 if out != 0 {
                     rcv.drag_out = Some(out);
                 }
-                match rcv.apply(e) {
+                match rcv.apply(e, Instant::now()) {
                     Applied::Inject(i) => {
                         let at = if let Injected::MoveTo { x, y } = i { Some((x, y)) } else { None };
                         sink.inject(i);
                         let Some((x, y)) = at else { continue };
-                        if rcv.buttons != 0 || rcv.locked || Instant::now() < retry_at {
+                        if rcv.buttons != 0 || rcv.locked || Instant::now() < retry_at || !rcv.settled(Instant::now()) {
+                            hop_since = None;
                             continue;
                         }
-                        if let Some(hop) = sink.hop(x, y) {
-                            match start_relay(tls, hop, sink.clipboard()).await {
+                        let Some(hop) = sink.hop(x, y) else {
+                            hop_since = None;
+                            continue;
+                        };
+                        if hop_since.get_or_insert_with(Instant::now).elapsed() >= rcv.dwell {
+                            hop_since = None;
+                            match start_relay(tls, hop, sink.clipboard(), rcv.dwell).await {
                                 Ok(r) => relay = Some(r),
                                 Err(e) => {
                                     journal!("kvm chain: {e}");
@@ -1216,7 +1269,10 @@ async fn session(
                         }
                     }
                     Applied::Many(all) => all.into_iter().for_each(|i| sink.inject(i)),
-                    Applied::Return(y) => break hand_back(&mut s, sink, &seen, rcv.drag_out, y).await.map(|()| None),
+                    Applied::Return(y) => {
+                        sink.inject(rcv.off_edge());
+                        break hand_back(&mut s, sink, &seen, rcv.drag_out, y).await.map(|()| None);
+                    }
                 }
             }
             Msg::Clipboard { len } => match read_clipboard(&mut s, len).await {
@@ -1233,7 +1289,10 @@ async fn session(
                 Err(e) => break Err(e),
             },
             Msg::Leave => break Ok(None),
-            Msg::Lock { on } => rcv.locked = on,
+            Msg::Lock { on } => {
+                rcv.locked = on;
+                DRIVEN_LOCKED.store(on, Ordering::SeqCst);
+            }
             Msg::Drag { batch } => {
                 rcv.buttons |= 1; // the driver's button is still held: no return until it's released
                 sink.drag(batch);
@@ -1241,6 +1300,7 @@ async fn session(
             _ => {}
         }
     };
+    DRIVEN_LOCKED.store(false, Ordering::SeqCst);
     for i in rcv.release_all() {
         sink.inject(i);
     }
@@ -1257,7 +1317,7 @@ mod tests {
     #[test]
     fn frames_round_trip_and_reject_garbage() {
         let all = [
-            Msg::Enter { edge: Edge::Bottom, y: 0.25 },
+            Msg::Enter { edge: Edge::Bottom, y: 0.25, dwell: 150 },
             Msg::Input(InputEvent::Move { dx: -7, dy: 300 }),
             Msg::Input(InputEvent::Button { button: 5, down: true }),
             Msg::Input(InputEvent::Wheel { dx: 0, dy: -240 }),
@@ -1329,13 +1389,30 @@ mod tests {
     fn enters_on_opposite_edge_and_returns_through_it() {
         // sender's portal is its right edge → we enter on our left edge
         let (mut r, first) = Receiver::enter(vec![AREA], Edge::Right, 0.5);
+        let t = Instant::now() + COOLDOWN;
         assert_eq!(first, Injected::MoveTo { x: 8.0, y: 250.0 });
         // jitter back toward the edge right after entering must not hand control back
-        assert_eq!(r.apply(InputEvent::Move { dx: -3, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 5.0, y: 250.0 }));
-        assert_eq!(r.apply(InputEvent::Move { dx: 95, dy: -50 }), Applied::Inject(Injected::MoveTo { x: 100.0, y: 200.0 }));
+        assert_eq!(r.apply(InputEvent::Move { dx: -3, dy: 0 }, t), Applied::Inject(Injected::MoveTo { x: 5.0, y: 250.0 }));
+        assert_eq!(r.apply(InputEvent::Move { dx: 95, dy: -50 }, t), Applied::Inject(Injected::MoveTo { x: 100.0, y: 200.0 }));
         // pushing past the right edge just clamps
-        assert_eq!(r.apply(InputEvent::Move { dx: 5000, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 999.0, y: 200.0 }));
-        assert_eq!(r.apply(InputEvent::Move { dx: -5000, dy: 0 }), Applied::Return(0.4));
+        assert_eq!(r.apply(InputEvent::Move { dx: 5000, dy: 0 }, t), Applied::Inject(Injected::MoveTo { x: 999.0, y: 200.0 }));
+        assert_eq!(r.apply(InputEvent::Move { dx: -5000, dy: 0 }, t), Applied::Return(0.4));
+    }
+
+    #[test]
+    fn the_way_back_waits_for_the_cooldown_and_the_drivers_dwell() {
+        let (mut r, _) = Receiver::enter(vec![AREA], Edge::Right, 0.5);
+        r.dwell = Duration::from_millis(150);
+        let t = Instant::now();
+        let push = InputEvent::Move { dx: -50, dy: 0 };
+        assert_eq!(r.apply(push, t), Applied::Inject(Injected::MoveTo { x: 0.0, y: 250.0 }), "the end of the flick that brought it in");
+        let t = t + COOLDOWN;
+        assert!(matches!(r.apply(push, t + Duration::from_millis(100)), Applied::Inject(_)), "a push during the cooldown doesn't count: this one starts it");
+        // a move off the edge starts the push over
+        r.apply(InputEvent::Move { dx: 5, dy: 0 }, t + Duration::from_millis(110));
+        assert!(matches!(r.apply(push, t + Duration::from_millis(200)), Applied::Inject(_)));
+        assert!(matches!(r.apply(push, t + Duration::from_millis(300)), Applied::Inject(_)), "100 ms of push");
+        assert_eq!(r.apply(push, t + Duration::from_millis(350)), Applied::Return(0.5));
     }
 
     #[test]
@@ -1343,21 +1420,23 @@ mod tests {
         // a wide screen and a taller one to its right; the sender sits to our right
         let screens = vec![AREA, Rect { x: 1000.0, y: 0.0, w: 800.0, h: 1000.0 }];
         let (mut r, first) = Receiver::enter(screens, Edge::Left, 0.75);
+        let t = Instant::now() + COOLDOWN;
         assert_eq!(first, Injected::MoveTo { x: 1791.0, y: 750.0 });
         // moving left below the short screen stops at the tall one's edge, not in the empty corner
-        assert_eq!(r.apply(InputEvent::Move { dx: -900, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 1000.0, y: 750.0 }));
-        assert_eq!(r.apply(InputEvent::Move { dx: -500, dy: -600 }), Applied::Inject(Injected::MoveTo { x: 500.0, y: 150.0 }));
+        assert_eq!(r.apply(InputEvent::Move { dx: -900, dy: 0 }, t), Applied::Inject(Injected::MoveTo { x: 1000.0, y: 750.0 }));
+        assert_eq!(r.apply(InputEvent::Move { dx: -500, dy: -600 }, t), Applied::Inject(Injected::MoveTo { x: 500.0, y: 150.0 }));
         // the way back is the right edge of the whole desk
-        assert_eq!(r.apply(InputEvent::Move { dx: 2000, dy: 0 }), Applied::Return(0.15));
+        assert_eq!(r.apply(InputEvent::Move { dx: 2000, dy: 0 }, t), Applied::Return(0.15));
     }
 
     #[test]
     fn no_return_while_dragging_and_release_all_unsticks() {
         let (mut r, _) = Receiver::enter(vec![AREA], Edge::Right, 0.5);
-        r.apply(InputEvent::Key { scan: 0x1D, down: true });
-        r.apply(InputEvent::Key { scan: 0x2E, down: true });
-        r.apply(InputEvent::Button { button: 1, down: true });
-        assert_eq!(r.apply(InputEvent::Move { dx: -10, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 0.0, y: 250.0 }));
+        let t = Instant::now() + COOLDOWN;
+        r.apply(InputEvent::Key { scan: 0x1D, down: true }, t);
+        r.apply(InputEvent::Key { scan: 0x2E, down: true }, t);
+        r.apply(InputEvent::Button { button: 1, down: true }, t);
+        assert_eq!(r.apply(InputEvent::Move { dx: -10, dy: 0 }, t), Applied::Inject(Injected::MoveTo { x: 0.0, y: 250.0 }));
         assert_eq!(
             r.release_all(),
             vec![
@@ -1371,10 +1450,12 @@ mod tests {
     #[test]
     fn locked_receiver_keeps_the_cursor_until_unlocked() {
         let (mut r, _) = Receiver::enter(vec![AREA], Edge::Right, 0.5);
+        let t = Instant::now() + COOLDOWN;
         r.locked = true;
-        assert_eq!(r.apply(InputEvent::Move { dx: -50, dy: 0 }), Applied::Inject(Injected::MoveTo { x: 0.0, y: 250.0 }));
+        assert_eq!(r.apply(InputEvent::Move { dx: -50, dy: 0 }, t), Applied::Inject(Injected::MoveTo { x: 0.0, y: 250.0 }));
         r.locked = false;
-        assert_eq!(r.apply(InputEvent::Move { dx: -1, dy: 0 }), Applied::Return(0.5));
+        assert_eq!(r.apply(InputEvent::Move { dx: -1, dy: 0 }, t), Applied::Return(0.5));
+        assert_eq!(r.off_edge(), Injected::MoveTo { x: 8.0, y: 250.0 }, "handed back off the edge, not on our portal to the driver");
     }
 
     #[test]
@@ -1429,7 +1510,7 @@ mod tests {
         tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
-        send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.0 }).await.unwrap();
+        send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.0, dwell: 0 }).await.unwrap();
         send(&mut s, Msg::Input(InputEvent::Key { scan: 0x1D, down: true })).await.unwrap();
         write_text(&mut s, "ça").await.unwrap();
         send(&mut s, Msg::Leave).await.unwrap();
@@ -1464,7 +1545,7 @@ mod tests {
         tokio::spawn(serve(them, port, allow, ask, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(g.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let to: SocketAddr = ([127, 0, 0, 1], port).into();
-        let enter = Msg::Enter { edge: Edge::Left, y: 0.0 };
+        let enter = Msg::Enter { edge: Edge::Left, y: 0.0, dwell: 0 };
 
         let mut s = dial(&me, port).await;
         send(&mut s, enter).await.unwrap();
@@ -1638,9 +1719,9 @@ mod tests {
         tokio::spawn(serve(them, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Clip { own: o.clone() })));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, port).await;
-        send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.5 }).await.unwrap();
+        send(&mut s, Msg::Enter { edge: Edge::Left, y: 0.5, dwell: 0 }).await.unwrap();
         write_clipboard(&mut s, text.map(String::from)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await; // past the receiver's cooldown
         if let Some(c) = copy_on_client {
             *own.lock().unwrap() = Some(c.into()); // user copies something on the Client
         }
@@ -1780,7 +1861,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut s = dial(&me, b_port).await;
         let step = |ms| tokio::time::sleep(Duration::from_millis(ms));
-        send(&mut s, Msg::Enter { edge: Edge::Right, y: 0.5 }).await.unwrap(); // A's right edge → B's left
+        send(&mut s, Msg::Enter { edge: Edge::Right, y: 0.5, dwell: 0 }).await.unwrap(); // A's right edge → B's left
+        step(300).await; // past B's cooldown
         send(&mut s, Msg::Input(InputEvent::Move { dx: 5000, dy: 0 })).await.unwrap(); // across B into C
         step(300).await;
         send(&mut s, Msg::Input(InputEvent::Key { scan: 0x1E, down: true })).await.unwrap();
@@ -1808,11 +1890,11 @@ mod tests {
         tokio::spawn(serve(b, port, |_| Ok(()), |_, _, _| async { PairAnswer::Declined }, |_, _| false, |_, _, _| {}, |_, _| false, move |_, _| Some(Recorder(r.clone()))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut one = dial(&first, port).await;
-        send(&mut one, Msg::Enter { edge: Edge::Right, y: 0.5 }).await.unwrap();
+        send(&mut one, Msg::Enter { edge: Edge::Right, y: 0.5, dwell: 0 }).await.unwrap();
         send(&mut one, Msg::Input(InputEvent::Key { scan: 0x2A, down: true })).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut two = dial(&second, port).await;
-        send(&mut two, Msg::Enter { edge: Edge::Bottom, y: 0.25 }).await.unwrap();
+        send(&mut two, Msg::Enter { edge: Edge::Bottom, y: 0.25, dwell: 0 }).await.unwrap();
         let back = timeout(Duration::from_secs(2), read_msg(&mut one)).await.unwrap().unwrap();
         assert_eq!(back, Msg::Return { y: 0.5 });
         tokio::time::sleep(Duration::from_millis(100)).await;

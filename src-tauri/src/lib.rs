@@ -1020,11 +1020,17 @@ impl Drop for EngineSink {
     }
 }
 
+/// Where the driver last put this computer's cursor: the tracker tells this computer's own mouse from it.
+static PLACED: Mutex<(f64, f64)> = Mutex::new((f64::NAN, f64::NAN));
+
 impl kvm::Sink for EngineSink {
     fn screens(&self) -> Vec<Rect> {
         self.screens.clone()
     }
     fn inject(&mut self, e: Injected) {
+        if let Injected::MoveTo { x, y } = e {
+            *PLACED.lock().unwrap() = (x, y);
+        }
         self.engine.inject(e);
     }
     fn clipboard(&self) -> Option<String> {
@@ -1769,6 +1775,8 @@ fn spawn_kvm_receiver(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, st
         let allow = move |fp: &str| match (st.lock().unwrap().settings.is_paired(fp), e.can_inject()) {
             (false, _) => Err(kvm::Refusal::NotPaired),
             (_, false) => Err(kvm::Refusal::NoInput),
+            // a lock screen or UAC prompt has the input: the driver stays home and is told why
+            _ if platform::secure_desktop() => Err(kvm::Refusal::Secure),
             _ => Ok(()),
         };
         let (a, me) = (app.clone(), app.state::<watch::Sender<DeviceInfo>>().inner().clone());
@@ -1938,7 +1946,8 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
     let (os, text) = peer.unwrap_or_default();
     // an Android keymap is US only: characters go as text in this keyboard's layout; computers map keys themselves
     let layout = platform::key_text().filter(|_| os == "android");
-    let tune = kvm::Tune::new(prefs.speed, prefs.swap_ctrl_cmd && (os == "macos") != cfg!(target_os = "macos")).text(text, layout);
+    let mut tune = kvm::Tune::new(prefs.speed, prefs.swap_ctrl_cmd && (os == "macos") != cfg!(target_os = "macos")).text(text, layout);
+    tune.dwell = prefs.edge_delay_ms.min(u16::MAX.into()) as u16;
     let (app, engine) = (app.clone(), app.state::<Arc<dyn SpatialPlatformEngine>>().inner().clone());
     tauri::async_runtime::spawn(async move {
         let _ = app.emit("kvm", serde_json::json!({ "active": true, "y": y, "device": fp }));
@@ -1952,6 +1961,19 @@ fn start_session(app: &AppHandle, label: String, fp: String, portal: Portal, y: 
         }
         if let Ok(Some(batch)) = r {
             hold_drag(&app, &label, batch); // a drag came back with the cursor
+        }
+        // another app's input hook got in front of ours this session: say which, once per launch
+        if let Some(apps) = platform::LEAKED.lock().unwrap().take() {
+            static TOLD: AtomicBool = AtomicBool::new(false);
+            if !TOLD.swap(true, Ordering::SeqCst) {
+                use tauri_plugin_notification::NotificationExt;
+                let body = if apps.is_empty() {
+                    "Another app on this computer also grabs the mouse and keyboard, so some input slipped through. Close input, macro or remote tools if crossings misbehave.".to_string()
+                } else {
+                    format!("{apps} also grabs the mouse and keyboard, so some input slipped through. Close it if crossings misbehave.")
+                };
+                let _ = app.notification().builder().title("LOKA").body(body).show();
+            }
         }
         let error = r.as_ref().err().map(|e| explain(&app, &fp, e));
         let _ = app.emit("kvm", serde_json::json!({ "active": false, "error": error }));
@@ -2022,8 +2044,13 @@ fn spawn_watchdog(app: AppHandle, state: AppState) {
                         .portals
                         .iter_mut()
                         .filter_map(|(fp, p)| {
-                            p.monitor = platform::refit(p.monitor, &screens)?;
-                            Some((fp.clone(), *p))
+                            let refit = platform::refit(p.monitor, &screens);
+                            if let Some(m) = refit {
+                                p.monitor = m;
+                            }
+                            // portals saved before 0.9.6 may sit over the corners
+                            let cut = screens.contains(&p.monitor) && platform::off_corners(p);
+                            (refit.is_some() || cut).then(|| (fp.clone(), *p))
                         })
                         .collect();
                     if !moved.is_empty() {
@@ -2033,7 +2060,7 @@ fn spawn_watchdog(app: AppHandle, state: AppState) {
                     (moved.into_iter().map(|(fp, p)| (s.who(&fp).0, fp, p)).collect(), lost)
                 };
                 for (alias, fp, p) in &moved {
-                    journal!("portal to {alias} follows its screen: now {:?}", p.monitor);
+                    journal!("portal to {alias} moved: now {:?} {:.2}–{:.2}", p.monitor, p.start, p.end);
                     let _ = place_overlay(&app, &portal_label(fp), p);
                 }
                 for alias in lost {
@@ -2077,6 +2104,10 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
     let mut hovering = None::<String>;
     // why the cursor at an edge doesn't cross (device, reason), logged once each time it changes
     let mut stuck = None::<(String, &str)>;
+    // when a session last started or ended either way (cooldown), the button last tick, whether it went down
+    // inside a portal (a click there, not a drag coming in), the lock screen seen while in a session
+    let (mut changed, mut was_busy, mut was_down, mut pressed_inside, mut secure) = (std::time::Instant::now(), false, false, false, false);
+    let mut ticks = 0u32;
     loop {
         tick.tick().await;
         let (doors, prefs) = {
@@ -2098,6 +2129,28 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
             continue;
         }
         let driving = remote.load(Ordering::SeqCst);
+        let busy = driving || doors[0].band;
+        if busy != was_busy {
+            was_busy = busy;
+            changed = std::time::Instant::now();
+        }
+        ticks = ticks.wrapping_add(1);
+        if busy && ticks % 6 == 0 {
+            // every 100 ms: the lock screen or a UAC prompt; input can neither reach it nor be taken from it, so it goes home
+            // (a driven session tells its driver why: Refuse Secure)
+            let sec = platform::secure_desktop();
+            if sec {
+                if !secure {
+                    journal!("lock screen or administrator prompt up: ending sessions");
+                    if driving {
+                        use tauri_plugin_notification::NotificationExt;
+                        let _ = app.notification().builder().title("LOKA").body("Back here for the lock screen or administrator prompt").show();
+                    }
+                }
+                kvm::end_sessions();
+            }
+            secure = sec;
+        }
         if !doors[0].band {
             // at home the lock key is read here; while driving, the capture hook swallows it and Tune toggles
             let down = engine.lock_key_down();
@@ -2124,6 +2177,10 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
             }
         }
         let hit = doors.iter().find_map(|d| d.portal.sample(c.x, c.y).map(|(y, p)| (d, y, p)));
+        if c.button_down && !was_down {
+            pressed_inside = hit.is_some();
+        }
+        was_down = c.button_down;
         // within a pixel: a Mac reports points, so ×2 on Retina its cursor can stop a pixel short of the right/bottom edge
         let at_edge = hit.is_some_and(|(d, _, p)| (1.0 - p as f64) * d.portal.reach < 1.5);
         let on_edge = at_edge && !locked;
@@ -2163,10 +2220,25 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
                     }
                 }
             }
+            // this computer's own mouse (not where the driver put the cursor) pushing the way back takes the cursor home
+            if door.band && !c.button_down && !kvm::DRIVEN_LOCKED.load(Ordering::SeqCst) {
+                let (px, py) = *PLACED.lock().unwrap();
+                if (c.x - px).abs() > 3.0 || (c.y - py).abs() > 3.0 {
+                    let since = *resting.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= Duration::from_millis(prefs.edge_delay_ms.into()) {
+                        resting = None;
+                        journal!("this computer's own mouse pushed the way back: handing the cursor home");
+                        kvm::end_sessions();
+                    }
+                    continue;
+                }
+            }
             // resting against the edge (no drag, not locked) hands mouse & keyboard to the device behind it
             if let (false, true) = (door.band, !c.button_down || drag.is_some()) {
                 let since = *resting.get_or_insert_with(std::time::Instant::now);
-                if drag.is_some() || since.elapsed() >= Duration::from_millis(prefs.edge_delay_ms.into()) {
+                // no new crossing right after one either way: the end of a push doesn't bounce straight back
+                let settled = changed.elapsed() >= kvm::COOLDOWN;
+                if drag.is_some() || (settled && since.elapsed() >= Duration::from_millis(prefs.edge_delay_ms.into())) {
                     resting = None;
                     if let Err(e) = start_session(&app, door.label.clone(), door.fp.clone(), door.portal, y, drag) {
                         if !DRIVING.load(Ordering::SeqCst) {
@@ -2188,8 +2260,9 @@ async fn track(app: AppHandle, engine: Arc<dyn SpatialPlatformEngine>, state: Ap
             let _ = app.emit_to(&gone, "hover", (0.5, 0.0));
         }
         hovering = near.map(|(l, ..)| l);
-        // only a drag (button held) inside a portal may make its overlay catch input
-        let catching = hit.filter(|_| c.button_down);
+        // only a drag (button held, pressed outside) inside a portal may make its overlay catch input: a click
+        // there (a window's close button under the portal) goes to the window
+        let catching = hit.filter(|_| c.button_down && !pressed_inside);
         let want = catching.map(|(d, _, _)| d.label.clone());
         if want != interactive {
             for (label, ignore) in [(interactive.as_ref(), true), (want.as_ref(), false)] {

@@ -30,7 +30,8 @@ pub struct CursorPrefs {
 
 impl Default for CursorPrefs {
     fn default() -> Self {
-        Self { speed: 1.0, edge_delay_ms: 0, swap_ctrl_cmd: true }
+        // a short dwell: the end of a flick, or a cursor thrown at an edge to click something, doesn't cross
+        Self { speed: 1.0, edge_delay_ms: 150, swap_ctrl_cmd: true }
     }
 }
 

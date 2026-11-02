@@ -64,6 +64,71 @@ struct Capture {
 
 static CAPTURE: Mutex<Option<Capture>> = Mutex::new(None);
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
+/// times input leaked past our hooks this capture (read by `stop_capture`)
+static LEAKS: AtomicU32 = AtomicU32::new(0);
+
+/// Running apps known to put their own low-level mouse/keyboard hook in front of ours (exe name fragments, lowercase).
+/// shortcut: a known list (Windows can't say who owns a hook from user mode), add names as users report them
+const HOOKERS: &[(&str, &str)] = &[
+    ("xmousebuttoncontrol", "X-Mouse Button Control"),
+    ("autohotkey", "AutoHotkey"),
+    ("lghub", "Logitech G Hub"),
+    ("logioptions", "Logitech Options"),
+    ("razer", "Razer Synapse"),
+    ("steelseries", "SteelSeries GG"),
+    ("icue", "Corsair iCUE"),
+    ("mousewithoutborders", "Mouse Without Borders"),
+    ("keyboardmanager", "PowerToys Keyboard Manager"),
+    ("synergy", "Synergy"),
+    ("barrier", "Barrier"),
+    ("input-leap", "Input Leap"),
+    ("sharemouse", "ShareMouse"),
+    ("teamviewer", "TeamViewer"),
+    ("anydesk", "AnyDesk"),
+];
+
+/// Names of `HOOKERS` running now.
+fn hookers() -> Vec<&'static str> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS},
+    };
+    let mut found = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return found;
+        }
+        let mut e: PROCESSENTRY32W = zeroed();
+        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut e) != 0;
+        while ok {
+            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            let exe = String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase();
+            for (frag, name) in HOOKERS {
+                if exe.contains(frag) && !found.contains(name) {
+                    found.push(*name);
+                }
+            }
+            ok = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    found
+}
+
+/// No input desktop we may open: the lock screen or a UAC prompt is up.
+pub fn secure_desktop() -> bool {
+    use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, OpenInputDesktop, DESKTOP_READOBJECTS};
+    unsafe {
+        let d = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+        if d.is_null() {
+            return true;
+        }
+        CloseDesktop(d);
+        false
+    }
+}
 
 pub struct WindowsEngine;
 
@@ -147,6 +212,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                     UnhookWindowsHookEx(keys);
                     keys = SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_proc), module, 0);
                     key_fixes += 1;
+                    LEAKS.fetch_add(1, Ordering::SeqCst);
                     if let Some(c) = CAPTURE.lock().unwrap().as_ref() {
                         let held = |vk: u16| down[vk as usize];
                         if held(VK_ESCAPE) && (c.ctrl || held(VK_CONTROL)) && (c.alt || held(VK_MENU)) {
@@ -161,6 +227,7 @@ impl SpatialPlatformEngine for WindowsEngine {
                     UnhookWindowsHookEx(mouse);
                     mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
                     mouse_fixes += 1;
+                    LEAKS.fetch_add(1, Ordering::SeqCst);
                 }
             }
             UnhookWindowsHookEx(mouse);
@@ -196,6 +263,11 @@ impl SpatialPlatformEngine for WindowsEngine {
             SetCursorPos(warp_to.0 as i32, warp_to.1 as i32);
             show_cursors();
             journal!("capture stopped, cursors restored, at ({}, {})", warp_to.0 as i32, warp_to.1 as i32);
+        }
+        if LEAKS.swap(0, Ordering::SeqCst) > 0 {
+            let apps = hookers();
+            journal!("input leaked past our hooks; known input apps running: {apps:?}");
+            *super::LEAKED.lock().unwrap() = Some(apps.join(", "));
         }
     }
 

@@ -123,6 +123,17 @@ pub fn starved() -> bool {
     now_ms().saturating_sub(FED.load(std::sync::atomic::Ordering::Relaxed)) > 1500
 }
 
+/// Input leaked past the capture hooks in the last session: the known input apps running ("" = none known). Windows only.
+pub static LEAKED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The lock screen or a UAC prompt has the input (Windows' secure desktop): no app can inject or capture there.
+pub fn secure_desktop() -> bool {
+    #[cfg(target_os = "windows")]
+    return windows::secure_desktop();
+    #[allow(unreachable_code)]
+    false
+}
+
 /// What a receiver asks its OS to perform. Positions are absolute physical px.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -399,6 +410,8 @@ pub fn free_spans(screens: &[Rect], m: Rect, edge: Edge, taken: &[Portal]) -> Ve
     let vertical = matches!(edge, Edge::Left | Edge::Right);
     let (lo, len) = if vertical { (m.y, m.h) } else { (m.x, m.w) };
     let mut blocked: Vec<(f64, f64)> = taken.iter().filter(|p| p.edge == edge && p.monitor == m).map(|p| (p.start, p.end)).collect();
+    let c = CORNER / len;
+    blocked.extend([(0.0, c), (1.0 - c, 1.0)]);
     for n in screens.iter().filter(|n| **n != m) {
         let touches = match edge {
             Edge::Left => n.x + n.w == m.x,
@@ -440,6 +453,25 @@ pub fn fit(screens: &[Rect], edge: Edge, taken: &[Portal]) -> Option<Portal> {
     }
     let start = (0.5 - len / 2.0).clamp(a, b - len);
     Some(Portal { edge, monitor, start, end: start + len, reach: 120.0 })
+}
+
+/// px kept free at each end of every edge: caption buttons, Start, Show desktop live in the corners, and a
+/// cursor thrown there to click them must not cross.
+pub const CORNER: f64 = 150.0;
+
+/// Move a saved portal off the corners (`CORNER`), keeping its length when it fits; true if it changed.
+/// shortcut: may overlap another portal on the same edge after shrinking; re-place it in the layout if so
+pub fn off_corners(p: &mut Portal) -> bool {
+    let len = if matches!(p.edge, Edge::Left | Edge::Right) { p.monitor.h } else { p.monitor.w };
+    let c = CORNER / len;
+    let (lo, hi) = (c, 1.0 - c);
+    if p.start >= lo - 1e-9 && p.end <= hi + 1e-9 {
+        return false;
+    }
+    let l = (p.end - p.start).min(hi - lo);
+    p.start = p.start.max(lo).min(hi - l); // not clamp: hi - l can round a hair below lo
+    p.end = p.start + l;
+    true
 }
 
 /// The screen a portal saved on `monitor` belongs to now that its resolution changed: the current screen
@@ -531,17 +563,33 @@ mod tests {
         let a = Rect { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 };
         let b = Rect { x: 1920.0, y: 540.0, w: 1920.0, h: 1080.0 }; // lower half of a's right edge touches b
         let screens = [a, b];
-        assert_eq!(free_spans(&screens, a, Edge::Right, &[]), vec![(0.0, 0.5)]);
-        assert_eq!(free_spans(&screens, b, Edge::Left, &[]), vec![(0.5, 1.0)]);
+        let c = CORNER / 1080.0;
+        assert_eq!(free_spans(&screens, a, Edge::Right, &[]), vec![(c, 0.5)]);
+        assert_eq!(free_spans(&screens, b, Edge::Left, &[]), vec![(0.5, 1.0 - c)]);
         let taken = [Portal { edge: Edge::Right, monitor: b, start: 0.35, end: 0.65, reach: 120.0 }];
-        assert_eq!(free_spans(&screens, b, Edge::Right, &taken), vec![(0.0, 0.35), (0.65, 1.0)]);
+        assert_eq!(free_spans(&screens, b, Edge::Right, &taken), vec![(c, 0.35), (0.65, 1.0 - c)]);
         // longest stretch wins (first on a tie), as near the middle as it fits
         let p = fit(&screens, Edge::Right, &taken).unwrap();
-        assert!(p.monitor == a && (p.start - 0.2).abs() < 1e-9 && (p.end - 0.5).abs() < 1e-9);
+        assert!(p.monitor == a && p.start >= c && (p.end - p.start - 0.3).abs() < 1e-9 && p.end <= 0.5);
         let p = fit(&[b], Edge::Right, &taken).unwrap();
-        assert!((p.start - 0.05).abs() < 1e-9 && (p.end - 0.35).abs() < 1e-9);
+        assert!((p.start - c).abs() < 1e-9 && (p.end - 0.35).abs() < 1e-9);
         // a full edge has no room
         let full = [Portal { start: 0.0, end: 1.0, ..taken[0] }];
         assert_eq!(fit(&[b], Edge::Right, &full), None);
+    }
+
+    #[test]
+    fn saved_portals_move_off_the_corners() {
+        let m = Rect { x: 0.0, y: 0.0, w: 1366.0, h: 768.0 };
+        let c = CORNER / 1366.0;
+        // Yusuf's laptop: top edge 0.64–0.94 sat over the caption buttons
+        let mut p = Portal { edge: Edge::Top, monitor: m, start: 0.64, end: 0.94, reach: 120.0 };
+        assert!(off_corners(&mut p));
+        assert!((p.end - (1.0 - c)).abs() < 1e-9 && (p.end - p.start - 0.3).abs() < 1e-9);
+        assert!(!off_corners(&mut p), "already clear");
+        // a whole edge shrinks to what's left between the corners
+        let mut p = Portal { start: 0.0, end: 1.0, ..p };
+        assert!(off_corners(&mut p));
+        assert!((p.start - c).abs() < 1e-9 && (p.end - (1.0 - c)).abs() < 1e-9);
     }
 }
