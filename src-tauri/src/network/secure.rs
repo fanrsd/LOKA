@@ -106,6 +106,9 @@ impl Identity {
     pub fn load_or_create(dir: &Path) -> Self {
         let (cert_path, key_path) = (dir.join("identity.crt"), dir.join("identity.key"));
         if let (Ok(cert), Ok(key)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+            // an identity saved by an older build may still be world-readable: tighten it now,
+            // or those installs would keep the loose mode they were created with
+            restrict(&key_path);
             return Self { cert: cert.into(), key: key.into() };
         }
         let id = Self::generate();
@@ -113,6 +116,7 @@ impl Identity {
         if let Err(e) = std::fs::write(&cert_path, &id.cert).and_then(|()| std::fs::write(&key_path, id.key.secret_pkcs8_der())) {
             journal!("saving identity failed: {e}");
         }
+        restrict(&key_path);
         id
     }
 
@@ -129,6 +133,18 @@ impl Identity {
 /// Hex SHA-256 of a certificate.
 pub fn fingerprint(cert: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, cert).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Keep the private key readable by its owner only; the fingerprint is public, the key is the device.
+/// On Windows `%APPDATA%` is already per-user, so there is nothing to tighten there.
+fn restrict(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// The code both screens show while `requester` pairs with `answerer`, from both fingerprints and both
