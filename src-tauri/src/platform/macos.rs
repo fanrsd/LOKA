@@ -241,6 +241,7 @@ fn set_cursor_hidden(hide: bool) {
 /// Everything `stop_capture` undoes except the warp; idempotent, any thread.
 fn release() {
     *CAPTURE.lock().unwrap() = None;
+    *MOTION.lock().unwrap() = (0.0, 0.0);
     TAP.store(null_mut(), Ordering::SeqCst);
     let rl = RUN_LOOP.swap(null_mut(), Ordering::SeqCst);
     unsafe {
@@ -514,8 +515,12 @@ unsafe extern "C" fn tap_callback(_proxy: Ref, ty: u32, event: Ref, _info: Ref) 
     let flags = CGEventGetFlags(event);
     let input = match ty {
         MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED => {
-            let (dx, dy) = (field(DELTA_X) as i32, field(DELTA_Y) as i32);
-            (dx != 0 || dy != 0).then_some(InputEvent::Move { dx, dy })
+            // a trackpad moves in fractions of a point: the integer field reads 0 for slow strokes, so sum the doubles
+            let mut rest = MOTION.lock().unwrap();
+            let (fx, fy) = (rest.0 + CGEventGetDoubleValueField(event, DELTA_X), rest.1 + CGEventGetDoubleValueField(event, DELTA_Y));
+            let (dx, dy) = (fx.trunc(), fy.trunc());
+            *rest = (fx - dx, fy - dy);
+            (dx != 0.0 || dy != 0.0).then_some(InputEvent::Move { dx: dx as i32, dy: dy as i32 })
         }
         LEFT_DOWN => Some(InputEvent::Button { button: 1, down: true }),
         LEFT_UP => Some(InputEvent::Button { button: 1, down: false }),
@@ -550,6 +555,9 @@ unsafe extern "C" fn tap_callback(_proxy: Ref, ty: u32, event: Ref, _info: Ref) 
 
 /// Swipe progress summed over one Dock swipe and its motion; pinch amount since the last zoom step.
 static SWIPE: Mutex<(f64, i64, f64)> = Mutex::new((0.0, 0, 0.0));
+
+/// Sub-point motion (x, y) not sent yet.
+static MOTION: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
 /// A Spaces/Mission Control swipe (when it ends) or a pinch (every step) as a portable gesture.
 unsafe fn gesture(event: Ref, field: impl Fn(u32) -> i64) -> Option<InputEvent> {
