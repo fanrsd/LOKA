@@ -380,9 +380,12 @@ impl Portal {
             Edge::Top => ((x - m.x) / m.w, y - m.y),
             Edge::Bottom => ((x - m.x) / m.w, m.y + m.h - 1.0 - y),
         };
-        if dist < 0.0 || dist > self.reach || along < self.start || along > self.end {
+        // a Retina Mac's cursor stops at a fraction of a point short of the width: ×2 that is up to a pixel past
+        // the last one, which still is the edge
+        if dist < -1.0 || dist > self.reach || along < self.start || along > self.end {
             return None;
         }
+        let dist = dist.max(0.0);
         let ny = (along - self.start) / (self.end - self.start);
         Some((ny as f32, (1.0 - dist / self.reach) as f32))
     }
@@ -545,6 +548,12 @@ mod tests {
         assert_eq!(P.sample(4378.0, 720.0), None); // 101 px away
         assert_eq!(P.sample(4479.0, 300.0), None); // above segment
         assert_eq!(P.sample(4481.0, 720.0), None); // past the monitor
+    }
+
+    #[test]
+    fn retina_cursor_a_fraction_past_the_last_pixel_is_on_the_edge() {
+        // a Mac stops the cursor at 2239.98 pt: ×2 that is 4479.96 px
+        assert_eq!(P.sample(4479.96, 720.0), Some((0.5, 1.0)));
     }
 
     #[test]

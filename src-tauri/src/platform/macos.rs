@@ -615,11 +615,15 @@ unsafe fn display_scale(id: u32) -> f64 {
 
 /// Backing scale of the display under `p`; matches tao's `position = points * scale`.
 unsafe fn scale_at(p: CGPoint) -> f64 {
-    let (mut id, mut n) = (0u32, 0u32);
-    if CGGetDisplaysWithPoint(p, 1, &mut id, &mut n) != 0 || n == 0 {
-        return 1.0;
+    // pushed against the right/bottom edge the cursor can sit at x == width (or y == height), just outside every
+    // display's bounds: look a point inward there, or the ×1 fallback puts it half a Retina screen from the portal
+    for (dx, dy) in [(0.0, 0.0), (-1.0, 0.0), (0.0, -1.0), (-1.0, -1.0)] {
+        let (mut id, mut n) = (0u32, 0u32);
+        if CGGetDisplaysWithPoint(CGPoint { x: p.x + dx, y: p.y + dy }, 1, &mut id, &mut n) == 0 && n > 0 {
+            return display_scale(id);
+        }
     }
-    display_scale(id)
+    1.0
 }
 
 #[cfg(test)]
